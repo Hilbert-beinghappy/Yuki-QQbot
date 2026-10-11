@@ -11,7 +11,7 @@
 | 本地与支持镜像 | Windows全套1514 passed、69 skipped；终审必要回归另记。SQLite3.46.1真实迁移、DDL/metadata、原完整行及claim/wait验证通过，FTS30组合完整ID/顺序一致。 |
 | SELF补修 | 69f756a6；[PR #302](https://github.com/YuanYeYouTao/Yuki/pull/302)合并为2e7458ace3cac4dc28c8893d9714724060a0e61f。 |
 | 补修验证 | SELF35项、来源/检查点/付费请求风险组合20项、SQLite3.46.1九个实际WAL/双领取探针通过；不对重叠套件求和。定向Ruff、mypy、diff检查通过。 |
-| 补修Quality | [PR38174381545](https://github.com/YuanYeYouTao/Yuki/actions/runs/38174381545)、[main38174423678](https://github.com/YuanYeYouTao/Yuki/actions/runs/38174423678)在05:08 +08:00仍运行中；此前绿色不代替此次结果。 |
+| 补修Quality | [PR38174381545](https://github.com/YuanYeYouTao/Yuki/actions/runs/38174381545)、[main38174423678](https://github.com/YuanYeYouTao/Yuki/actions/runs/38174423678)均completed/success，各1532 passed、63 skipped；pytest分别945.82s/990.08s，不累加。 |
 
 ## 首次迁移与实际异常
 
@@ -35,14 +35,14 @@
 | 镜像 | `ghcr.io/yuanyeyoutao/yuki-qqbot:ops-2e7458ac`，OCI revision为2e7458ace3cac4dc28c8893d9714724060a0e61f，image ID `sha256:93bc57b4b87a7b8edb4850e700e67bb43fc4819662aec143f5bfe2d401f6ca2e`。 |
 | 构建/上传 | 本地direct构建，SQLite3.46.1、Code Mode=false、无Monty；两个补修文件镜像hash与源码一致。265359729B归档SHA256 `0d559f8cd7a0e1648ee07f3cbdcaaddcba234c1b65be2bf3b943725cb2057d52`，服务器核对并加载成功。 |
 | Bot | `93f18f5fd1b931bff0417a46458c9d9bdf089addb7356d99aa6c6027e0a8d6bf`，StartedAt `2026-10-11T21:05:08.496028593Z`。 |
-| 服务核验 | 05:08:07 +08:00：running/healthy，health/database=ok、OneBot connected、RestartCount=0、schema0107；退役override=0、环境键不存在。 |
+| 服务核验 | 05:08:07及05:16:04 +08:00：running/healthy，health/database=ok、OneBot connected、RestartCount=0、schema0107；退役override=0、环境键不存在。 |
 | SELF观察 | 05:08:55 +08:00：水位96615等于当时最大event，processing run为0；启动以来读取日志未见SELF scan/cycle失败、startup失败或SQLite锁错误。没有新入站时水位不变，不当作新来源处理验收。 |
 | SnowLuma | 两轮均未操作；ID `cbdabcdf7c2fff6763d3688b10f606b26c6be06ffce98cfba8bccd2032850d89`与StartedAt `2026-10-09T05:10:47.99332112Z`前后一致。 |
 | 真实QQ功能 | 本轮未额外执行响应、等待续跑和工具读取测试，保持待验收。健康/连接不代替功能或自然延迟验收。 |
 
 启动前旧Bot曾一次HTTP health15s超时；资源快照为Bot382MiB/CPU94%、SnowLuma197MiB、服务器available596MiB，没有据此归因内存泄漏。新Bot05:08:55快照285MiB/CPU34%；不同生命周期的单次快照不能证明内存优化量、持续延迟或无泄漏。
 
-OneBot adapter仍为2.4.6；项目删外层250ms取消不等于上游迟到/重复echo竞争已修复，Q03结论保留未决。3.9.0仍为草案，本次没有tag或GitHub Release。
+OneBot adapter仍为2.4.6；项目删外层250ms取消不等于上游迟到/重复echo竞争已修复，Q03结论保留未决。3.9.0仍为草案，本次没有tag或GitHub Release。PR #303文档合并78e65707及后续状态补录的src/tests/migrations与已部署2e7458ac相同；文档触发的新CI不等待，不冒称已绿。核验后仅删除本轮两份已加载上传归档，共530720184B；镜像、数据库恢复点和操作脚本保留。
 
 ## 当前数据保全与回退
 
