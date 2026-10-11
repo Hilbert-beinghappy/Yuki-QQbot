@@ -30,8 +30,6 @@ def validate_timezone(value: str) -> str:
     """Normalize and verify an IANA timezone identifier."""
 
     normalized = value.strip()
-    if not normalized or len(normalized) > 64:
-        raise ValueError("时区名称不能为空且不能超过 64 个字符")
     try:
         ZoneInfo(normalized)
     except (ZoneInfoNotFoundError, ValueError) as exc:

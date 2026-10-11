@@ -1698,7 +1698,6 @@ class AutomationModel(Base):
     run_count: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
     max_runs: Mapped[int | None] = mapped_column(Integer, nullable=True)
     consecutive_failures: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
-    misfire_grace_seconds: Mapped[int] = mapped_column(Integer, nullable=False, default=1800)
     claimed_by: Mapped[str | None] = mapped_column(String(64), nullable=True)
     claimed_until: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
@@ -1751,6 +1750,16 @@ class AutomationVersionModel(Base):
     version: Mapped[int] = mapped_column(Integer, nullable=False)
     script_json: Mapped[str] = mapped_column(Text, nullable=False)
     script_hash: Mapped[str] = mapped_column(String(64), nullable=False)
+    authority_snapshot_json: Mapped[str | None] = mapped_column(Text, nullable=True)
+    canonical_target_person_id: Mapped[str | None] = mapped_column(
+        String(36), ForeignKey("persons.id", onupdate="RESTRICT", ondelete="RESTRICT")
+    )
+    canonical_target_space_id: Mapped[str | None] = mapped_column(
+        String(36), ForeignKey("spaces.id", onupdate="RESTRICT", ondelete="RESTRICT")
+    )
+    canonical_presence_id: Mapped[str | None] = mapped_column(
+        String(36), ForeignKey("presences.id", onupdate="RESTRICT", ondelete="RESTRICT")
+    )
     updated_by: Mapped[str] = mapped_column(String(64), nullable=False)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
 
@@ -1770,11 +1779,21 @@ class AutomationRunModel(Base):
             name="ck_automation_runs_status",
         ),
         Index("ix_automation_runs_automation_created", "automation_id", "created_at"),
+        Index(
+            "ix_automation_runs_running",
+            "automation_id",
+            "scheduled_for",
+            "id",
+            sqlite_where=text("status = 'running'"),
+        ),
     )
 
     id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
     automation_id: Mapped[int] = mapped_column(
         ForeignKey("automations.id", ondelete="CASCADE"), nullable=False
+    )
+    version_id: Mapped[int | None] = mapped_column(
+        ForeignKey("automation_versions.id", ondelete="RESTRICT"), nullable=True
     )
     scheduled_for: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
     actual_started_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
@@ -1798,7 +1817,7 @@ class AutomationRunModel(Base):
 
 
 class AutomationStepRunModel(Base):
-    """A redacted audit record for one executed DSL step."""
+    """A retained legacy step audit; new executions use their original durable cursor."""
 
     __tablename__ = "automation_step_runs"
     __table_args__ = (Index("ix_automation_step_runs_run_step", "run_id", "step_id"),)

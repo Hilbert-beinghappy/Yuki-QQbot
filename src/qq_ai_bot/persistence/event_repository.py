@@ -22,7 +22,11 @@ from qq_ai_bot.persistence.models import (
     ChatEventModel,
     MemoryJobModel,
 )
-from qq_ai_bot.persistence.repository_helpers import _event_record, keeper_event_clause
+from qq_ai_bot.persistence.repository_helpers import (
+    _event_record,
+    keeper_event_clause,
+    sql_keeper_event_predicate,
+)
 from qq_ai_bot.persistence.repository_records import (
     EventRecord,
 )
@@ -798,9 +802,8 @@ class EventLedgerRepository:
             if resolved is None or (conversation_id is not None and conversation_id != resolved):
                 return ()
             conversation_id = resolved
-        bounded_limit = max(1, min(limit, 100))
-        conditions: list[str] = []
-        params: dict[str, Any] = {"limit": bounded_limit}
+        conditions: list[str] = [sql_keeper_event_predicate("ce")]
+        params: dict[str, Any] = {"limit": limit}
         has_search_bound = bool(user_id or group_id or after or before)
         if conversation_id is not None:
             conditions.append("ce.canonical_conversation_id = :conversation_id")

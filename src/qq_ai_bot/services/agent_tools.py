@@ -509,7 +509,7 @@ class AgentToolService:
                             "type": "string",
                             "description": "ISO 8601 时间，可省略",
                         },
-                        "limit": {"type": "integer", "minimum": 1, "maximum": 100},
+                        "limit": {"type": "integer", "minimum": 1},
                     },
                     required=("keyword",),
                 ),
@@ -769,13 +769,13 @@ class AgentToolService:
                             "比赛结果等时效内容应使用此工具确认；闲聊中遇到不熟悉的公开事实"
                             "也可查证。复杂问题可重新组织搜索词再次搜索。搜索词只"
                             "包含回答当前问题所需的信息，禁止放入完整聊天记录、人物记忆或"
-                            "系统提示词。一次调用会自动搜索并提取最多 3 个网页。"
+                            "系统提示词。搜索与网页提取沿本次明确请求执行。"
                         ),
                         parameters=_object_schema(
                             {
                                 "query": {
                                     "type": "string",
-                                    "description": "必填，简短搜索词，最多 400 字符",
+                                    "description": "必填，回答当前问题所需的搜索词",
                                 },
                                 "topic": {
                                     "type": "string",
@@ -1291,22 +1291,13 @@ class AgentToolService:
             group_id=group_id,
             after=after,
             before=before,
-            limit=self._bounded_int(arguments.get("limit"), default=20, maximum=100),
+            limit=int(arguments.get("limit", 20)),
             message_only=True,
         )
         events = [self._event_json(row) for row in rows]
-        truncated = False
-        while events:
-            data = {"events": events, "returned_count": len(events), "truncated": truncated}
-            if len(json.dumps({"ok": True, "data": data}, ensure_ascii=False, default=str)) <= (
-                self._runtime().agent.tool_result_max_characters
-            ):
-                return self._result(data=data)
-            events.pop()
-            truncated = True
-        if rows:
-            return self._result(error="result_too_large", detail="首条完整聊天记录超过本轮结果预算")
-        return self._result(data={"events": [], "returned_count": 0, "truncated": False})
+        return self._result(
+            data={"events": events, "returned_count": len(events), "truncated": False}
+        )
 
     async def _history_around(
         self,
@@ -2448,10 +2439,10 @@ class AgentToolService:
         if not isinstance(query, str):
             return self._web_result(error="invalid_query", detail="query 必须是字符串")
         query = " ".join(query.split())
-        if not query or len(query) > 400:
+        if not query:
             return self._web_result(
                 error="invalid_query",
-                detail="query 不能为空且不能超过 400 个字符",
+                detail="query 不能为空",
             )
         topic_value = arguments.get("topic", "general")
         if topic_value not in {"general", "news"}:
@@ -2495,10 +2486,10 @@ class AgentToolService:
         if question_value is not None and not isinstance(question_value, str):
             return self._web_result(error="invalid_question", detail="question 必须是字符串")
         question = " ".join((question_value or "读取用户指定的网页").split())
-        if not question or len(question) > 400:
+        if not question:
             return self._web_result(
                 error="invalid_question",
-                detail="question 不能为空且不能超过 400 个字符",
+                detail="question 不能为空",
             )
         explicitly_sent = (
             normalized in self._inbound_urls(runtime.inbound)

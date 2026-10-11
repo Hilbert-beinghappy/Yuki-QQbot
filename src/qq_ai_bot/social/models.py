@@ -45,7 +45,7 @@ class SocialEmoji(BaseModel):
 class SocialMessage(BaseModel):
     model_config = ConfigDict(frozen=True, extra="forbid")
 
-    text: str = Field(default="", max_length=12000, repr=False)
+    text: str = Field(default="", repr=False)
     artifact_id: UUID | None = None
     attachment_kind: Literal["image", "file"] | None = None
     emoji: SocialEmoji | None = None

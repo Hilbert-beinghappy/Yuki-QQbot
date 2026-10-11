@@ -46,11 +46,11 @@ def _task_intent_schema() -> dict[str, object]:
         "type": "object",
         "additionalProperties": False,
         "required": ["name", "goal", "trigger"],
-        "description": "高层任务意图。后端选择策略、计算预算并编译为 DSL。",
+        "description": "高层任务意图。后端按声明策略编译为 DSL。",
         "properties": {
             "version": {"type": "integer", "const": 1},
-            "name": {"type": "string", "minLength": 1, "maxLength": 128},
-            "goal": {"type": "string", "minLength": 1, "maxLength": 2500},
+            "name": {"type": "string", "minLength": 1},
+            "goal": {"type": "string", "minLength": 1},
             "trigger": {
                 "oneOf": [
                     {
@@ -62,7 +62,6 @@ def _task_intent_schema() -> dict[str, object]:
                             "seconds": {
                                 "type": "integer",
                                 "minimum": 1,
-                                "maximum": 31_536_000,
                             },
                         },
                     },
@@ -73,7 +72,7 @@ def _task_intent_schema() -> dict[str, object]:
                         "properties": {
                             "type": {"const": "once"},
                             "local_datetime": {"type": "string"},
-                            "timezone": {"type": "string", "maxLength": 64},
+                            "timezone": {"type": "string"},
                         },
                     },
                     {
@@ -84,7 +83,7 @@ def _task_intent_schema() -> dict[str, object]:
                             "type": {"const": "daily"},
                             "hour": {"type": "integer", "minimum": 0, "maximum": 23},
                             "minute": {"type": "integer", "minimum": 0, "maximum": 59},
-                            "timezone": {"type": "string", "maxLength": 64},
+                            "timezone": {"type": "string"},
                         },
                     },
                     {
@@ -96,12 +95,11 @@ def _task_intent_schema() -> dict[str, object]:
                             "weekdays": {
                                 "type": "array",
                                 "minItems": 1,
-                                "maxItems": 7,
                                 "items": {"type": "integer", "minimum": 1, "maximum": 7},
                             },
                             "hour": {"type": "integer", "minimum": 0, "maximum": 23},
                             "minute": {"type": "integer", "minimum": 0, "maximum": 59},
-                            "timezone": {"type": "string", "maxLength": 64},
+                            "timezone": {"type": "string"},
                         },
                     },
                     {
@@ -113,13 +111,12 @@ def _task_intent_schema() -> dict[str, object]:
                             "seconds": {
                                 "type": "integer",
                                 "minimum": 1,
-                                "maximum": 31_536_000,
                             },
                         },
                     },
                 ]
             },
-            "timezone": {"type": "string", "minLength": 1, "maxLength": 64},
+            "timezone": {"type": "string", "minLength": 1},
             "strategy": {
                 "type": "string",
                 "enum": ["auto", "static", "agentic"],
@@ -127,7 +124,6 @@ def _task_intent_schema() -> dict[str, object]:
             },
             "constraints": {
                 "type": "array",
-                "maxItems": 12,
                 "items": {"type": "string"},
             },
             "context": {
@@ -139,7 +135,7 @@ def _task_intent_schema() -> dict[str, object]:
                         "enum": ["none", "creator_private", "current_group"],
                     },
                     "include_memories": {"type": "boolean"},
-                    "history_limit": {"type": "integer", "minimum": 0, "maximum": 30},
+                    "history_limit": {"type": "integer", "minimum": 0},
                 },
             },
             "delivery": {
@@ -154,7 +150,11 @@ def _task_intent_schema() -> dict[str, object]:
                             "不会投递；auto 由创建时会话选择目标。SELF 没有私人目标。"
                         ),
                     },
-                    "text": {"type": "string", "minLength": 1, "maxLength": 12000},
+                    "text": {
+                        "type": "string",
+                        "minLength": 1,
+                        "description": "static 任务的发送正文。",
+                    },
                 },
             },
         },
@@ -235,8 +235,8 @@ class AutomationToolService:
             ChatTool(
                 name="automation_list_history",
                 description=(
-                    "单独列出当前执行主体已完成、取消、失败或阻塞的任务历史，"
-                    "每条任务显示稳定的 automation_id。"
+                    "列出当前执行主体最近的终态历史；每条显示稳定 automation_id。"
+                    "全局终态目录用 automation_list(status=terminal)，沿 cursor 继续读。"
                 ),
                 parameters=_object_schema(
                     {"limit": {"type": "integer", "minimum": 1, "maximum": 100}}
@@ -300,14 +300,12 @@ class AutomationToolService:
                 name="time_set_timezone",
                 description="设置当前执行主体自己的 IANA 时区。",
                 parameters=_object_schema(
-                    {"timezone": {"type": "string", "maxLength": 64}},
+                    {"timezone": {"type": "string"}},
                     required=("timezone",),
                 ),
             ),
         )
-        if self._service.enabled:
-            return definitions
-        return tuple(tool for tool in definitions if tool.name.startswith("time_"))
+        return definitions
 
     async def execute(
         self, name: str, arguments_json: str, runtime: ToolRuntime
@@ -543,7 +541,6 @@ def _record(
     }
     if plan is not None:
         payload["compiled_strategy"] = plan.strategy
-        payload["warnings"] = plan.warnings
     if persisted:
         payload["confirmation"] = "persisted"
     return payload

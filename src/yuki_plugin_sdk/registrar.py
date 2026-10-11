@@ -57,7 +57,7 @@ class ToolMetadata(StrictModel):
     allowed_origins: frozenset[TurnOrigin] = Field(
         default_factory=lambda: frozenset({TurnOrigin.USER_MESSAGE})
     )
-    timeout_seconds: float = Field(default=10, gt=0, le=600)
+    timeout_seconds: float | None = Field(default=None, gt=0)
     retry_policy: RetryPolicy = RetryPolicy.NONE
 
     @field_validator("namespace")

@@ -69,9 +69,6 @@ class DeliveryBackend(StubAgentBackend):
     def finalize(self, text, runtime):
         return text
 
-    def exhausted(self, runtime):
-        raise AssertionError("unexpected exhaustion")
-
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("protocol", ["responses", "chat_completions"])

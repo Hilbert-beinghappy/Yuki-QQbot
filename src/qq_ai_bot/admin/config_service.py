@@ -531,19 +531,6 @@ class RuntimeConfigService:
             "automation.enabled": "automation_enabled",
             "automation.poll_seconds": "automation_poll_seconds",
             "automation.lease_seconds": "automation_lease_seconds",
-            "automation.max_active_per_superuser": "automation_max_active_per_superuser",
-            "automation.max_active_per_user": "automation_max_active_per_user",
-            "automation.max_steps": "automation_max_steps",
-            "automation.max_llm_calls_per_run": "automation_max_llm_calls_per_run",
-            "automation.max_tool_calls_per_run": "automation_max_tool_calls_per_run",
-            "automation.max_messages_per_run": "automation_max_messages_per_run",
-            "automation.max_runtime_seconds": "automation_max_runtime_seconds",
-            "automation.min_interval_seconds": "automation_min_interval_seconds",
-            "automation.default_misfire_grace_seconds": (
-                "automation_default_misfire_grace_seconds"
-            ),
-            "automation.max_consecutive_failures": "automation_max_consecutive_failures",
-            "automation.run_retention_days": "automation_run_retention_days",
         }
         updates: dict[str, object] = {}
         for key, field_name in mapping.items():
@@ -1460,8 +1447,6 @@ class RuntimeConfigService:
                 mode=self._settings.web.mode.value,
                 search_max_results=int(cast(int, value("web.search_max_results"))),
                 extract_max_results=int(cast(int, value("web.extract_max_results"))),
-                max_calls_per_turn=int(cast(int, value("web.max_calls_per_turn"))),
-                tool_result_max_characters=int(cast(int, value("web.tool_result_max_characters"))),
                 source_retention_days=int(cast(int, value("web.source_retention_days"))),
                 source_max_runs_per_conversation=int(
                     cast(int, value("web.source_max_runs_per_conversation"))

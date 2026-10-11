@@ -40,7 +40,7 @@ def strip_internal_history_markers(text: str) -> str:
     return _MAIN_AGENT_EVENT_PREFIX.sub("", cleaned)
 
 
-def sanitize_model_output(text: str, *, max_characters: int) -> str:
+def sanitize_model_output(text: str, *, max_characters: int | None = None) -> str:
     """Remove only control characters and internal prompt envelopes."""
     from yuki_participation.self_report import extract_tail
 

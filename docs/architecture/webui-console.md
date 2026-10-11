@@ -192,7 +192,8 @@ transport target 或子任务 brief/result。等待条件只返回审核字段�
 `read_automation` 返回原定义与版本；删除原固定 20 run/200 step 快照。
 `list_automation_runs` 与 `list_automation_steps` 按原内部记录 ID 分页，游标绑定
 自动化及所选执行；步骤查询核验执行属于该自动化，不按平台目标重新推断归属。
-页面可选择一次执行查看步骤，也可浏览全部步骤。
+步骤页只读升级前已有的 step 审计记录，新 run 不再写独立 step 审计。
+新执行的实际结果沿原游标、Work journal、Social 回执和预算查看；空审计页不表示未执行。
 
 历史元数据独立使用 `control.automation.read`，不需要脚本正文权限。
 SQL 只读取状态、时间、能力、计数和错误类别，不加载 authority snapshot、私有

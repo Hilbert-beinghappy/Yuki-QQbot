@@ -128,10 +128,7 @@ async def resolve_control_context(
         provenance=CreationProvenance(
             creator_user_id=owner_binding.external_account_id if owner_binding else "",
             bot_user_id=presence.external_account_id,
-            message_id="",
-            original_text="",
             current_group_id=group_id,
-            mentioned_user_ids=(),
             permission=permission,
         ),
         conversation_id=conversation.id,

@@ -40,30 +40,25 @@ def next_run_at(schedule: Schedule, after_utc: datetime, script_timezone: str) -
         raise ValueError("一次性 schedule 没有下一次执行时间")
     if isinstance(schedule, IntervalSchedule):
         return after + timedelta(seconds=schedule.seconds)
-    zone_name = schedule.timezone or script_timezone
-    validate_timezone(zone_name)
+    zone_name = validate_timezone(schedule.timezone or script_timezone)
     zone = ZoneInfo(zone_name)
     local_after = after.astimezone(zone)
-    if isinstance(schedule, DailySchedule):
-        for offset in range(0, 370):
+    day = local_after.date()
+    while True:
+        if isinstance(schedule, DailySchedule):
             candidate = _resolve_wall_time(
-                local_after.date() + timedelta(days=offset),
+                day,
                 schedule.hour,
                 schedule.minute,
                 zone_name,
             )
             if candidate > after:
                 return candidate
-    else:
-        allowed = frozenset(schedule.weekdays)
-        for offset in range(0, 370 * 2):
-            day = local_after.date() + timedelta(days=offset)
-            if day.isoweekday() not in allowed:
-                continue
+        elif day.isoweekday() in schedule.weekdays:
             candidate = _resolve_wall_time(day, schedule.hour, schedule.minute, zone_name)
             if candidate > after:
                 return candidate
-    raise ValueError("无法在允许范围内计算下一次执行时间")
+        day += timedelta(days=1)
 
 
 def schedule_after_completion(
@@ -81,10 +76,11 @@ def schedule_after_completion(
 
 
 def _resolve_local(value: datetime, timezone: str) -> datetime:
-    validate_timezone(timezone)
+    timezone = validate_timezone(timezone)
     if value.tzinfo is not None:
         return value.astimezone(UTC)
-    return _resolve_wall_time(value.date(), value.hour, value.minute, timezone, value.second)
+    aware = value.replace(tzinfo=ZoneInfo(timezone), fold=0)
+    return aware.astimezone(UTC)
 
 
 def _resolve_wall_time(
@@ -92,19 +88,10 @@ def _resolve_wall_time(
     hour: int,
     minute: int,
     timezone: str,
-    second: int = 0,
 ) -> datetime:
     """Resolve ambiguous time once and move nonexistent wall times forward."""
 
-    zone = ZoneInfo(timezone)
-    naive = datetime.combine(day, time(hour=hour, minute=minute, second=second))
-    for offset in range(0, 181):
-        attempted = naive + timedelta(minutes=offset)
-        aware = attempted.replace(tzinfo=zone, fold=0)
-        round_trip = aware.astimezone(UTC).astimezone(zone).replace(tzinfo=None)
-        if round_trip == attempted:
-            return aware.astimezone(UTC)
-    raise ValueError("本地时间无法转换为有效 UTC 时间")
+    return _resolve_local(datetime.combine(day, time(hour=hour, minute=minute)), timezone)
 
 
 def _as_utc(value: datetime) -> datetime:

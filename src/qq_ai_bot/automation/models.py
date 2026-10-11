@@ -19,41 +19,39 @@ class StrictModel(BaseModel):
 
 class AfterSchedule(StrictModel):
     type: Literal["after"]
-    seconds: int = Field(ge=1, le=31_536_000)
+    seconds: int = Field(ge=1)
 
 
 class OnceSchedule(StrictModel):
     type: Literal["once"]
     local_datetime: datetime
-    timezone: str | None = Field(default=None, max_length=64)
+    timezone: str | None = None
 
 
 class DailySchedule(StrictModel):
     type: Literal["daily"]
     hour: int = Field(ge=0, le=23)
     minute: int = Field(ge=0, le=59)
-    timezone: str | None = Field(default=None, max_length=64)
+    timezone: str | None = None
 
 
 class WeeklySchedule(StrictModel):
     type: Literal["weekly"]
-    weekdays: tuple[int, ...] = Field(min_length=1, max_length=7)
+    weekdays: tuple[int, ...] = Field(min_length=1)
     hour: int = Field(ge=0, le=23)
     minute: int = Field(ge=0, le=59)
-    timezone: str | None = Field(default=None, max_length=64)
+    timezone: str | None = None
 
     @model_validator(mode="after")
     def _valid_weekdays(self) -> WeeklySchedule:
         if any(day < 1 or day > 7 for day in self.weekdays):
             raise ValueError("weekdays 必须使用星期一=1 到星期日=7")
-        if len(set(self.weekdays)) != len(self.weekdays):
-            raise ValueError("weekdays 不能重复")
         return self
 
 
 class IntervalSchedule(StrictModel):
     type: Literal["interval"]
-    seconds: int = Field(ge=1, le=31_536_000)
+    seconds: int = Field(ge=1)
 
 
 Schedule = Annotated[
@@ -65,34 +63,34 @@ Schedule = Annotated[
 class AutomationContext(StrictModel):
     scene: Literal["none", "creator_private", "current_group"] = "none"
     include_memories: bool = False
-    history_limit: int = Field(default=0, ge=0, le=30)
+    history_limit: int = Field(default=0, ge=0)
 
 
 class AutomationStep(StrictModel):
-    id: str = Field(pattern=r"^[a-z][a-z0-9_]{0,31}$")
-    call: str = Field(min_length=1, max_length=128)
+    id: str = Field(pattern=r"^[a-z][a-z0-9_]*$")
+    call: str = Field(min_length=1)
     arguments: dict[str, Any]
-    save_as: str | None = Field(default=None, pattern=r"^[a-z][a-z0-9_]{0,31}$")
+    save_as: str | None = Field(default=None, pattern=r"^[a-z][a-z0-9_]*$")
 
 
 class AutomationLimits(StrictModel):
     agent_budget_managed: bool = False
-    max_steps: int = Field(default=3, ge=1, le=16)
-    max_llm_calls: int = Field(default=1, ge=0, le=10)
-    max_tool_calls: int = Field(default=3, ge=1, le=16)
-    max_messages: int = Field(default=1, ge=0, le=10)
-    timeout_seconds: int = Field(default=60, ge=1, le=600)
+    max_steps: int | None = Field(default=None, ge=1)
+    max_llm_calls: int | None = Field(default=None, ge=0)
+    max_tool_calls: int | None = Field(default=None, ge=1)
+    max_messages: int | None = Field(default=None, ge=0)
+    timeout_seconds: int | None = Field(default=None, ge=1)
 
 
 class AutomationScript(StrictModel):
     """Versioned JSON-only automation declaration accepted from the Agent."""
 
     version: Literal[1]
-    name: str = Field(min_length=1, max_length=128)
-    timezone: str = Field(default="Asia/Shanghai", min_length=1, max_length=64)
+    name: str = Field(min_length=1)
+    timezone: str = Field(default="Asia/Shanghai", min_length=1)
     schedule: Schedule
     context: AutomationContext = Field(default_factory=AutomationContext)
-    steps: tuple[AutomationStep, ...] = Field(min_length=1, max_length=16)
+    steps: tuple[AutomationStep, ...] = Field(min_length=1)
     limits: AutomationLimits = Field(default_factory=AutomationLimits)
 
     @property
@@ -111,7 +109,7 @@ class AutomationScript(StrictModel):
         aliases = [step.save_as for step in self.steps if step.save_as]
         if len(set(aliases)) != len(aliases):
             raise ValueError("save_as 不能重复")
-        if len(self.steps) > self.limits.max_steps:
+        if self.limits.max_steps is not None and len(self.steps) > self.limits.max_steps:
             raise ValueError("步骤数量超过脚本 limits.max_steps")
         return self
 
@@ -150,6 +148,7 @@ class RetryPolicy(StrEnum):
 
 class AutomationRecord(StrictModel):
     id: int
+    version_id: int | None = None
     claimed_by: str | None = None
     creator_kind: Literal["person", "self"] = "person"
     creator_user_id: str
@@ -167,7 +166,6 @@ class AutomationRecord(StrictModel):
     run_count: int
     max_runs: int | None
     consecutive_failures: int
-    misfire_grace_seconds: int
     created_at: datetime
     updated_at: datetime
     canonical_creator_person_id: str | None = None
@@ -194,6 +192,7 @@ class AutomationDirectoryEntry(StrictModel):
 
 class AutomationRunRecord(StrictModel):
     id: int
+    version_id: int | None = None
     automation_id: int
     scheduled_for: datetime
     actual_started_at: datetime

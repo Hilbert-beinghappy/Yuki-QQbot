@@ -260,7 +260,6 @@ class WebModule:
             state=BridgeState(settings.web_search_bridge_state_path),
             fallback=self._tavily() if settings.tavily_api_key else None,
             invocations=self._invocations,
-            summary_max_characters=settings.web_tool_result_max_characters,
         )
 
     def _default_provider(

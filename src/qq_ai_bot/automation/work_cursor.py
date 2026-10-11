@@ -47,12 +47,24 @@ async def save(
     async with database.immediate_session() as session:
         if expected_owner is not None:
             from qq_ai_bot.automation.executor import AutomationExecutionError
-            from qq_ai_bot.persistence.models import AutomationModel, AutomationRunModel
+            from qq_ai_bot.persistence.models import (
+                AutomationModel,
+                AutomationRunModel,
+                AutomationVersionModel,
+            )
 
             owner = await session.scalar(
                 select(AutomationModel.claimed_by)
                 .join(AutomationRunModel, AutomationRunModel.automation_id == AutomationModel.id)
-                .where(AutomationRunModel.id == run_id, AutomationModel.script_hash == script_hash)
+                .join(
+                    AutomationVersionModel,
+                    AutomationVersionModel.id == AutomationRunModel.version_id,
+                )
+                .where(
+                    AutomationRunModel.id == run_id,
+                    AutomationVersionModel.script_hash == script_hash,
+                    AutomationRunModel.status == "running",
+                )
             )
             if owner != expected_owner:
                 raise AutomationExecutionError("automation_lease_lost")

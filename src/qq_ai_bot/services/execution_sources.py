@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import json
 from dataclasses import dataclass, field
 from typing import Any, Literal
 
@@ -21,7 +20,7 @@ from qq_ai_bot.identity.db_models import (
     SpaceBindingModel,
 )
 from qq_ai_bot.persistence.database import Database
-from qq_ai_bot.persistence.models import AutomationModel, AutomationRunModel, ChatEventModel
+from qq_ai_bot.persistence.models import AutomationRunModel, ChatEventModel
 from qq_ai_bot.runtime.origin import TurnOrigin
 from qq_ai_bot.runtime.trigger import SelfInitiativeTrigger
 
@@ -154,12 +153,17 @@ async def recover_automation_source(
     request_id: str,
     settings: Settings | None,
 ) -> AutomationTaskSource:
+    from qq_ai_bot.automation.repository import AutomationRepository
     from qq_ai_bot.runtime.work_recovery_schema import invocations
     from qq_ai_bot.runtime.work_schema_v1 import work
 
     async with database.sessions() as session:
         run = await session.get(AutomationRunModel, source.get("automation_run_id"))
-        owner = await session.get(AutomationModel, run.automation_id) if run else None
+        owner = (
+            await AutomationRepository(database).get_for_run(run.id, session=session)
+            if run
+            else None
+        )
         conversation = await session.get(CanonicalConversationModel, conversation_id)
         cursor = (
             (await session.execute(select(invocations).where(invocations.c.run_id == run.id)))
@@ -199,7 +203,7 @@ async def recover_automation_source(
         actor_person = owner.canonical_creator_person_id
         actor_user = ""
         if owner.creator_kind == "self":
-            scene = json.loads(owner.authority_snapshot_json)
+            scene = owner.authority_snapshot
             if (
                 actor_person is not None
                 or source.get("actor_user_id")

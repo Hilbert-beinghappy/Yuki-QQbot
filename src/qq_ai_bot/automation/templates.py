@@ -6,9 +6,9 @@ import re
 from collections.abc import Mapping
 from typing import Any
 
-_REFERENCE = re.compile(r"^\$\{([a-z][a-z0-9_]{0,31})(\.[a-zA-Z0-9_]+)+\}$")
-_BUILTIN = re.compile(r"^\$([a-z][a-z0-9_]{0,63})$")
-_INLINE_REFERENCE = re.compile(r"\$\{([a-z][a-z0-9_]{0,31})(\.[a-zA-Z0-9_]+)+\}")
+_REFERENCE = re.compile(r"^\$\{([a-z][a-z0-9_]*)(\.[a-zA-Z0-9_]+)+\}$")
+_BUILTIN = re.compile(r"^\$([a-z][a-z0-9_]*)$")
+_INLINE_REFERENCE = re.compile(r"\$\{([a-z][a-z0-9_]*)(\.[a-zA-Z0-9_]+)+\}")
 _ALLOWED_BUILTINS = frozenset(
     {
         "creator_user_id",
@@ -106,8 +106,6 @@ def _resolve_reference(reference: str, step_outputs: Mapping[str, Any]) -> Any:
         if not isinstance(current, Mapping) or part not in current:
             raise TemplateError(f"模板字段不存在：{reference}")
         current = current[part]
-    if isinstance(current, dict | list):
-        raise TemplateError("模板字段必须是标量，不能展开对象或数组")
     return current
 
 

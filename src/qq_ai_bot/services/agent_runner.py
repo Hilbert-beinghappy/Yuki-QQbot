@@ -120,10 +120,11 @@ class AgentRuntime:
     runtime_config: RuntimeConfigSnapshot
     current_time: TimeContext
     allowed_capabilities: frozenset[str]
-    max_tool_calls: int
-    max_model_requests: int
+    max_tool_calls: int | None
+    max_model_requests: int | None
     prompt_diagnostics: PromptRequestDiagnostics | None = None
     before_model_request: Callable[[], Awaitable[None]] | None = None
+    admit_model_request: Callable[[], Awaitable[None]] | None = None
     canonical_conversation_id: str | None = None
     dynamic_context_prepared: bool = False
     work_control: WorkControl | None = None
@@ -171,8 +172,6 @@ class AgentToolBackend(CoordinatedToolBackend, Protocol):
 
     def finalize(self, content: str, runtime: AgentRuntime) -> str: ...
 
-    def exhausted(self, runtime: AgentRuntime) -> str: ...
-
     async def prepare(self, runtime: AgentRuntime) -> None:
         """Prepare authorized local exposure before the first request."""
 
@@ -202,12 +201,6 @@ class AgentToolBackend(CoordinatedToolBackend, Protocol):
 
     async def observe_response(self, response: ChatResponse, runtime: AgentRuntime) -> None:
         pass
-
-    def has_visible_effects(self) -> bool:
-        return False
-
-    def allow_silent_final(self, runtime: AgentRuntime) -> bool:
-        return False
 
 
 @dataclass(slots=True)
@@ -477,12 +470,30 @@ class AgentRunner:
 
         receipts = ExecutionReceipts()
         runtime = replace(runtime, auxiliary_requests=[runtime.preparation_model_requests])
+        self._record_failure_usage(
+            tools, tool_calls=0, model_requests=runtime.preparation_model_requests
+        )
         token = current_receipts.set(receipts)
         control = runtime.work_control
+        if control is not None:
+            runtime = replace(
+                runtime,
+                max_model_requests=(
+                    runtime.max_model_requests
+                    if runtime.max_model_requests is not None
+                    else runtime.runtime_config.agent.max_model_requests
+                ),
+                max_tool_calls=(
+                    runtime.max_tool_calls
+                    if runtime.max_tool_calls is not None
+                    else runtime.runtime_config.agent.max_tool_calls
+                ),
+            )
         if control is not None:
             for _ in range(runtime.preparation_model_requests):
                 await control.reserve_request(auxiliary=True)
         if control is not None:
+            assert runtime.max_model_requests is not None
             control.segment_model_limit = runtime.max_model_requests
         try:
             try:
@@ -635,7 +646,7 @@ class AgentRunner:
         tools: AgentToolBackend | None,
         runtime: AgentRuntime,
         *,
-        remaining_calls: int,
+        remaining_calls: int | None,
         max_parallel_calls: int,
         reusable_results: dict[tuple[str, str], ReusableToolResult],
         cacheable_names: frozenset[str],
@@ -842,6 +853,7 @@ class AgentRunner:
             )
 
         agent = runtime.runtime_config.agent
+        assert runtime.max_tool_calls is not None
         return CodeHost(
             control=control,
             api=api,
@@ -900,7 +912,7 @@ class AgentRunner:
         tools: AgentToolBackend | None,
         runtime: AgentRuntime,
         *,
-        remaining_calls: int,
+        remaining_calls: int | None,
         max_parallel_calls: int,
         reusable_results: dict[tuple[str, str], ReusableToolResult],
         cacheable_names: frozenset[str],
@@ -964,7 +976,11 @@ class AgentRunner:
                     calls[index:end],
                     tools,
                     runtime,
-                    remaining_calls=max(0, remaining_calls - mixed_executed),
+                    remaining_calls=(
+                        None
+                        if remaining_calls is None
+                        else max(0, remaining_calls - mixed_executed)
+                    ),
                     max_parallel_calls=max_parallel_calls,
                     reusable_results=reusable_results,
                     cacheable_names=cacheable_names,

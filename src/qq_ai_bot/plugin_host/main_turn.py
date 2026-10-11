@@ -358,8 +358,12 @@ async def _execute_plugin_main_turn(
                             tool_runtime,
                             current_time=runtime.current_time,
                             allowed_capabilities=runtime.allowed_capabilities,
-                            max_tool_calls=runtime.max_tool_calls,
-                            max_model_requests=runtime.max_model_requests,
+                            max_tool_calls=runtime.max_tool_calls
+                            if runtime.max_tool_calls is not None
+                            else runtime.runtime_config.agent.max_tool_calls,
+                            max_model_requests=runtime.max_model_requests
+                            if runtime.max_model_requests is not None
+                            else runtime.runtime_config.agent.max_model_requests,
                         ),
                         delegated_authority=runtime.delegated_authority,
                         invocation_goal=instruction,
@@ -485,9 +489,12 @@ async def resume_plugin_work(
                     actor_is_superuser=runtime.actor_is_superuser
                     and source.get("actor_is_superuser", False),
                     max_model_requests=min(
-                        runtime.max_model_requests, source["max_model_requests"]
+                        runtime.runtime_config.agent.max_model_requests,
+                        source["max_model_requests"],
                     ),
-                    max_tool_calls=min(runtime.max_tool_calls, source["max_tool_calls"]),
+                    max_tool_calls=min(
+                        runtime.runtime_config.agent.max_tool_calls, source["max_tool_calls"]
+                    ),
                 ),
                 tools=None,
             )

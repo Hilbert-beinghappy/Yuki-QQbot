@@ -3,6 +3,7 @@
 import asyncio
 import json
 import time
+from datetime import UTC, datetime, timedelta
 from uuid import uuid4
 
 import pytest
@@ -11,10 +12,18 @@ from alembic.config import Config
 from sqlalchemy import select, text
 from tests.support.social_identity_cases import social_env
 
+from qq_ai_bot.automation.authority import DelegatedAuthority, PermissionLevel
+from qq_ai_bot.automation.models import AutomationScript
+from qq_ai_bot.automation.repository import AutomationRepository
+from qq_ai_bot.automation.validator import canonical_script_hash
+from qq_ai_bot.control_plane.paging import PageRequest
+from qq_ai_bot.persistence.control_automation_query import ControlAutomationQueryAdapter
 from qq_ai_bot.persistence.database import Database
+from qq_ai_bot.persistence.models import AutomationVersionModel
 from qq_ai_bot.runtime.subagent_repository import SubagentRepository
 from qq_ai_bot.runtime.subagent_schema import children
-from qq_ai_bot.runtime.work_budget_schema import budgets
+from qq_ai_bot.runtime.work_budget_schema import automation_budgets, budgets
+from qq_ai_bot.runtime.work_recovery_schema import invocations
 from qq_ai_bot.runtime.work_repository import WorkRepository
 from qq_ai_bot.runtime.work_schema_v1 import effects, journal, work
 from qq_ai_bot.runtime.work_tree import budget_root_id
@@ -135,7 +144,7 @@ def test_fresh_and_0104_upgrade_preserve_work_identity_source_receipts_and_budge
         try:
             async with database.sessions() as session:
                 assert (
-                    await session.scalar(text("SELECT version_num FROM alembic_version")) == "0105"
+                    await session.scalar(text("SELECT version_num FROM alembic_version")) == "0106"
                 )
                 columns = {
                     row[1] for row in await session.execute(text("PRAGMA table_info(runtime_work)"))
@@ -200,3 +209,251 @@ def test_fresh_and_0104_upgrade_preserve_work_identity_source_receipts_and_budge
             await database.close()
 
     asyncio.run(verify_current())
+
+
+def test_0105_upgrade_keeps_missing_original_version_and_new_admission_freezes_current_facts(
+    tmp_path, monkeypatch
+):
+    url = f"sqlite+aiosqlite:///{(tmp_path / 'automation-migration.db').as_posix()}"
+    monkeypatch.setenv("DATABASE_URL", url)
+    config = Config("alembic.ini")
+    command.upgrade(config, "0105")
+    original_work_id = str(uuid4())
+    started = datetime.now(UTC) - timedelta(days=40)
+    script = AutomationScript.model_validate(
+        {
+            "version": 1,
+            "name": "retained definition",
+            "timezone": "UTC",
+            "schedule": {"type": "interval", "seconds": 60},
+            "steps": [
+                {
+                    "id": "original_agent",
+                    "call": "yuki.agent",
+                    "arguments": {"instruction": "original target"},
+                }
+            ],
+            "limits": {
+                "max_steps": 1,
+                "max_llm_calls": 8,
+                "max_tool_calls": 12,
+                "max_messages": 10,
+                "timeout_seconds": 600,
+            },
+        }
+    )
+    script_hash = canonical_script_hash(script)
+    cursor = json.dumps(
+        {"next_step": 0, "work_id": original_work_id, "llm_calls": 2, "tool_calls": 3}
+    )
+    receipt = json.dumps({"original_call": "unknown", "run_id": 1})
+
+    async def seed():
+        database = Database(url)
+        try:
+            env = await social_env(database, tmp_path)
+            authority = DelegatedAuthority(
+                creator_user_id="10001",
+                bot_user_id="80001",
+                created_from_message_id="1",
+                created_at=started.isoformat(),
+                permission_level=PermissionLevel.USER,
+                granted_capabilities=("yuki.agent",),
+                capability_schema_versions={"yuki.agent": 1},
+                current_group_id="20001",
+                canonical_creator_person_id=env.person,
+                canonical_conversation_id=env.context.conversation_id,
+                conversation_generation=1,
+                canonical_presence_id=env.presence,
+                canonical_space_id=env.space,
+            )
+            async with database.immediate_session() as writer:
+                await writer.execute(
+                    text(
+                        "INSERT INTO automations (id, creator_kind, creator_user_id, bot_user_id, "
+                        "name, status, timezone, schedule_json, script_json, script_hash, "
+                        "required_capabilities_json, authority_snapshot_json, "
+                        "created_from_message_id, creation_source_key, next_run_at, run_count, "
+                        "max_runs, consecutive_failures, misfire_grace_seconds, created_at, "
+                        "updated_at, canonical_creator_person_id, canonical_target_space_id, "
+                        "canonical_presence_id) VALUES (1, 'person', '10001', '80001', "
+                        "'retained definition', 'active', 'UTC', :schedule, :script, :hash, "
+                        "'[\"yuki.agent\"]', :authority, '1', 'original-create', "
+                        ":future, 3, NULL, 0, 1800, :started, :started, :person, :space, :presence)"
+                    ),
+                    {
+                        "schedule": script.schedule.model_dump_json(),
+                        "script": script.model_dump_json(),
+                        "hash": script_hash,
+                        "authority": authority.model_dump_json(),
+                        "future": (datetime.now(UTC) + timedelta(minutes=1)).isoformat(),
+                        "started": started.isoformat(),
+                        "person": env.person,
+                        "space": env.space,
+                        "presence": env.presence,
+                    },
+                )
+                await writer.execute(
+                    text(
+                        "INSERT INTO automation_versions (id, automation_id, version, "
+                        "script_json, script_hash, updated_by, created_at) "
+                        "VALUES (1, 1, 1, :script, :hash, '10001', :started)"
+                    ),
+                    {
+                        "script": script.model_dump_json(),
+                        "hash": script_hash,
+                        "started": started.isoformat(),
+                    },
+                )
+                await writer.execute(
+                    text(
+                        "INSERT INTO automation_runs (id, automation_id, scheduled_for, "
+                        "actual_started_at, finished_at, status, idempotency_key, "
+                        "steps_completed, llm_calls, tool_calls, messages_sent, "
+                        "result_summary_json, created_at) VALUES (1, 1, :started, :started, "
+                        ":started, 'succeeded', 'original-slot', 1, 2, 3, 0, '{}', :started)"
+                    ),
+                    {"started": started.isoformat()},
+                )
+                await writer.execute(
+                    text(
+                        "INSERT INTO runtime_automation_budgets "
+                        "(run_id, models, tools, model_limit, tool_limit) VALUES (1, 2, 3, 8, 12)"
+                    )
+                )
+                await writer.execute(
+                    text(
+                        "INSERT INTO runtime_automation_cursors "
+                        "(run_id, script_hash, phase, payload_json, updated) "
+                        "VALUES (1, :hash, 'ready', :cursor, :updated)"
+                    ),
+                    {"hash": script_hash, "cursor": cursor, "updated": started.timestamp()},
+                )
+                await writer.execute(
+                    text(
+                        "INSERT INTO runtime_work (id, conversation_id, generation, source_key, "
+                        "source_json, goal, state, model_requests, tool_calls, checkpoint_json, "
+                        "created, updated) VALUES (:id, :conversation, 1, 'original-work', "
+                        ":source, 'retained target', 'waiting_user', 2, 3, '{}', "
+                        ":updated, :updated)"
+                    ),
+                    {
+                        "id": original_work_id,
+                        "conversation": env.context.conversation_id,
+                        "source": json.dumps(
+                            {"owner": "automation", "automation_id": 1, "automation_run_id": 1}
+                        ),
+                        "updated": started.timestamp(),
+                    },
+                )
+                await writer.execute(
+                    text(
+                        "INSERT INTO runtime_work_effects (effect_key, work_id, kind, state, "
+                        "receipt_json, created, updated) VALUES ('original-effect', :id, 'tool', "
+                        "'unknown', :receipt, :updated, :updated)"
+                    ),
+                    {"id": original_work_id, "receipt": receipt, "updated": started.timestamp()},
+                )
+                await writer.execute(
+                    text(
+                        "INSERT INTO automation_step_runs (id, run_id, step_id, capability, "
+                        "status, input_summary_json, output_summary_json, started_at, finished_at) "
+                        "VALUES (1, 1, 'original_agent', 'yuki.agent', 'succeeded', '{}', '{}', "
+                        ":started, :started)"
+                    ),
+                    {"started": started.isoformat()},
+                )
+            async with database.sessions() as reader:
+                return dict(
+                    (await reader.execute(text("SELECT * FROM automation_runs WHERE id=1")))
+                    .mappings()
+                    .one()
+                )
+        finally:
+            await database.close()
+
+    original_run = asyncio.run(seed())
+    command.upgrade(config, "head")
+
+    async def verify():
+        database = Database(url)
+        repository = AutomationRepository(database)
+        try:
+            async with database.sessions() as reader:
+                migrated = dict(
+                    (await reader.execute(text("SELECT * FROM automation_runs WHERE id=1")))
+                    .mappings()
+                    .one()
+                )
+                assert migrated.pop("version_id") is None and migrated == original_run
+                old_version = await reader.get(AutomationVersionModel, 1)
+                assert old_version.authority_snapshot_json is None
+                assert old_version.canonical_target_space_id is None
+                assert await reader.scalar(select(invocations.c.payload_json)) == cursor
+                assert await reader.scalar(select(effects.c.receipt_json)) == receipt
+                assert await reader.scalar(select(effects.c.state)) == "unknown"
+                old_budget = dict(
+                    (await reader.execute(select(automation_budgets))).mappings().one()
+                )
+                assert old_budget == {
+                    "run_id": 1,
+                    "models": 2,
+                    "tools": 3,
+                    "model_limit": 8,
+                    "tool_limit": 12,
+                }
+                assert not list(await reader.execute(text("PRAGMA foreign_key_check")))
+            assert await repository.get_for_run(1) is None
+            current = await repository.get(1)
+            admitted = await repository.create_run(
+                1, scheduled_for=current.next_run_at, actual_started_at=datetime.now(UTC)
+            )
+            accepted = await repository.get_for_run(admitted.id)
+            assert admitted.version_id != 1 and accepted.script == script
+            assert accepted.canonical_target_space_id == current.canonical_target_space_id
+            assert accepted.authority_snapshot == current.authority_snapshot
+            async with database.sessions() as reader:
+                assert (await reader.get(AutomationVersionModel, 1)).authority_snapshot_json is None
+                assert (
+                    await reader.scalar(text("SELECT version_id FROM automation_runs WHERE id=1"))
+                    is None
+                )
+                assert (
+                    dict(
+                        (
+                            await reader.execute(
+                                select(automation_budgets).where(automation_budgets.c.run_id == 1)
+                            )
+                        )
+                        .mappings()
+                        .one()
+                    )
+                    == old_budget
+                )
+                new_budget = (
+                    (
+                        await reader.execute(
+                            select(automation_budgets).where(
+                                automation_budgets.c.run_id == admitted.id
+                            )
+                        )
+                    )
+                    .mappings()
+                    .one()
+                )
+                assert (
+                    new_budget["models"],
+                    new_budget["tools"],
+                    new_budget["model_limit"],
+                    new_budget["tool_limit"],
+                ) == (0, 0, 8, 12)
+            audits = await ControlAutomationQueryAdapter(database.sessions).list_automation_steps(
+                PageRequest(), automation_id=1
+            )
+            assert [item.resource_id for item in audits.items] == ["1"]
+            assert audits.items[0].fields["run_id"] == 1
+            assert (await repository.get(1)).run_count == 3
+        finally:
+            await database.close()
+
+    asyncio.run(verify())

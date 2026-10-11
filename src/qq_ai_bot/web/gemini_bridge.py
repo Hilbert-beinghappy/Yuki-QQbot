@@ -23,6 +23,7 @@ from qq_ai_bot.domain.messages import (
     NativeToolType,
 )
 from qq_ai_bot.llm.base import LLMError, LLMProvider
+from qq_ai_bot.model_runtime.dispatch_guard import check_model_dispatch
 from qq_ai_bot.model_runtime.models import ModelProfile
 from qq_ai_bot.model_runtime.repository import ModelInvocationRepository
 from qq_ai_bot.model_runtime.request_accounting import (
@@ -51,10 +52,7 @@ class GeminiSearchBridge:
         state: BridgeState,
         fallback: WebSearchProvider | None = None,
         invocations: ModelInvocationRepository | None = None,
-        summary_max_characters: int = 16000,
     ) -> None:
-        if summary_max_characters < 1:
-            raise ValueError("search summary limit must be positive")
         if (
             profile.max_output_tokens_limit is not None
             and profile.default_max_output_tokens > profile.max_output_tokens_limit
@@ -65,7 +63,6 @@ class GeminiSearchBridge:
         self.state = state
         self.fallback = fallback
         self.invocations = invocations
-        self.summary_max_characters = summary_max_characters
         self.slot = asyncio.Lock()
         self._namespace = hashlib.sha256(
             json.dumps(
@@ -75,7 +72,6 @@ class GeminiSearchBridge:
                     "model": profile.model,
                     "base_url": profile.base_url,
                     "max_output": profile.default_max_output_tokens,
-                    "summary_max_characters": summary_max_characters,
                     "reasoning_effort": profile.reasoning_effort,
                     "wire_options": str(profile.wire_options),
                     "credential": credential,
@@ -87,8 +83,8 @@ class GeminiSearchBridge:
 
     async def search(self, request: WebSearchRequest) -> WebSearchResponse:
         query = " ".join(request.query.split())
-        if not 1 <= len(query) <= 400:
-            raise WebSearchError("invalid_query", "搜索词须为 1–400 字符")
+        if not query:
+            raise WebSearchError("invalid_query", "搜索词不能为空")
         normalized_request = replace(request, query=query)
         key = hashlib.sha256(
             self._namespace
@@ -122,6 +118,8 @@ class GeminiSearchBridge:
         if control is not None:
             await control.validate()
             await control.reserve_request(auxiliary=True)
+        else:
+            await check_model_dispatch()
         constraints = {key: value for key, value in asdict(request).items() if value is not None}
         prompt = (
             "请使用 Google 搜索查找以下问题的公开来源。只依据实际搜索到的来源回答；"
@@ -178,7 +176,7 @@ class GeminiSearchBridge:
                 url,
                 WebSearchSource(
                     source_id=hashlib.sha256(f"{url}\x1f{request.query}".encode()).hexdigest()[:24],
-                    title=(citation.title or url)[:300],
+                    title=citation.title or url,
                     url=url,
                     domain=urlsplit(url).hostname or "",
                     snippet="",
@@ -196,7 +194,7 @@ class GeminiSearchBridge:
             response.completion_tokens,
             response.cached_prompt_tokens,
         )
-        sources = list(found.values())[: max(1, min(request.max_results, 5))]
+        sources = list(found.values())
         extract_failed = False
         if self.fallback is not None:
             fallback = self.fallback
@@ -207,17 +205,16 @@ class GeminiSearchBridge:
                     page = await fallback.extract(sources[index].url, request.query)
                     sources[index] = replace(
                         sources[index],
-                        snippet=page.snippet[:1000],
-                        relevant_content=page.relevant_content[:2500],
+                        snippet=page.snippet,
+                        relevant_content=page.relevant_content,
                     )
                 except WebSearchError:
                     extract_failed = True
 
-            # At most three pages; Tavily keeps its existing global HTTP semaphore.
             # Assign by original index so response order is independent of completion order.
             extracts = [
                 asyncio.create_task(extract_source(index))
-                for index in range(min(len(sources), request.extract_max_results or 0, 3))
+                for index in range(min(len(sources), request.extract_max_results or 0))
             ]
             gathered = asyncio.gather(*extracts)
             try:
@@ -259,7 +256,7 @@ class GeminiSearchBridge:
             prompt_tokens=response.prompt_tokens,
             completion_tokens=response.completion_tokens,
             cached_prompt_tokens=response.cached_prompt_tokens,
-            provider_summary=response.content[: self.summary_max_characters].strip() or None,
+            provider_summary=response.content.strip() or None,
         )
 
     async def _record(

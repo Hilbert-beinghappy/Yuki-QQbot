@@ -3,10 +3,11 @@
 from __future__ import annotations
 
 import json
+from collections.abc import Callable
 from datetime import UTC, datetime, timedelta
 from typing import Any, cast
 
-from sqlalchemy import and_, delete, func, or_, select, true, update
+from sqlalchemy import and_, false, func, or_, select, true, update
 from sqlalchemy.dialects.sqlite import insert
 from sqlalchemy.engine import CursorResult
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -21,7 +22,11 @@ from qq_ai_bot.automation.models import (
     AutomationStatus,
     RunStatus,
 )
-from qq_ai_bot.automation.validator import ValidatedAutomation, collect_send_targets
+from qq_ai_bot.automation.validator import (
+    ValidatedAutomation,
+    canonical_script_hash,
+    collect_send_targets,
+)
 from qq_ai_bot.conversation.hydrate import ensure_canonical_conversation
 from qq_ai_bot.domain.conversations import ConversationScope
 from qq_ai_bot.identity.canonical_repository import (
@@ -38,14 +43,13 @@ from qq_ai_bot.persistence.database import Database
 from qq_ai_bot.persistence.models import (
     AutomationModel,
     AutomationRunModel,
-    AutomationStepRunModel,
     AutomationVersionModel,
 )
 from qq_ai_bot.persistence.unit_of_work import optional_session
 
 
 class AutomationRepository:
-    """Own automation rows, immutable versions, runs, step audits, and leases."""
+    """Own automation rows, immutable versions, runs, and leases."""
 
     def __init__(self, database: Database) -> None:
         self._database = database
@@ -66,10 +70,9 @@ class AutomationRepository:
         *,
         creator_person_id: str,
         max_runs: int | None,
-        misfire_grace_seconds: int,
+        next_run_at: datetime,
         now: datetime,
         creation_source_key: str | None = None,
-        max_active: int | None = None,
         session: AsyncSession | None = None,
     ) -> AutomationRecord:
         script_json = validated.script.model_dump_json(exclude_none=True)
@@ -93,10 +96,8 @@ class AutomationRepository:
                     .limit(1)
                 )
                 if previous is not None:
-                    if (
-                        previous.script_hash != validated.script_hash
-                        or previous.max_runs != max_runs
-                    ):
+                    initial_hash = await self.initial_script_hash(previous.id, session=active)
+                    if initial_hash != validated.script_hash or previous.max_runs != max_runs:
                         raise ValueError("automation_creation_key_conflict")
                     return _automation_record(previous)
             if creator_person_id == "self":
@@ -106,11 +107,6 @@ class AutomationRepository:
                 creator = await active_person_id_for(active, authority.creator_user_id)
                 if creator != creator_person_id or authority.principal_kind != "person":
                     raise ValueError("创建者没有对应的永久主体")
-            if (
-                max_active is not None
-                and await self.active_count(creator_person_id, session=active) >= max_active
-            ):
-                raise ValueError(f"当前主体最多同时启用 {max_active} 个自动化任务")
             target_person, target_space = await _bind_canonical_send_targets(
                 active,
                 validated,
@@ -134,12 +130,11 @@ class AutomationRepository:
                 authority_snapshot_json=authority_json,
                 created_from_message_id=authority.created_from_message_id,
                 creation_source_key=creation_source_key,
-                next_run_at=validated.next_run_at,
+                next_run_at=next_run_at,
                 last_run_at=None,
                 run_count=0,
                 max_runs=max_runs,
                 consecutive_failures=0,
-                misfire_grace_seconds=misfire_grace_seconds,
                 claimed_by=None,
                 claimed_until=None,
                 created_at=timestamp,
@@ -153,25 +148,68 @@ class AutomationRepository:
             )
             active.add(row)
             await active.flush()
-            active.add(
-                AutomationVersionModel(
-                    automation_id=row.id,
-                    version=1,
-                    script_json=script_json,
-                    script_hash=validated.script_hash,
-                    updated_by=authority.creator_user_id,
-                    created_at=timestamp,
-                )
+            version = AutomationVersionModel(
+                automation_id=row.id,
+                version=1,
+                script_json=script_json,
+                script_hash=validated.script_hash,
+                authority_snapshot_json=authority_json,
+                canonical_target_person_id=target_person,
+                canonical_target_space_id=target_space,
+                canonical_presence_id=presence,
+                updated_by=authority.creator_user_id,
+                created_at=timestamp,
             )
+            active.add(version)
             await active.flush()
-            return _automation_record(row)
+            return _automation_record(row, version.id)
 
     async def get(
         self, automation_id: int, *, session: AsyncSession | None = None
     ) -> AutomationRecord | None:
         async with optional_session(self._database, session, write=False) as active:
             row = await active.get(AutomationModel, automation_id)
-        return _automation_record(row) if row is not None else None
+            version_id = await _current_version_id(active, automation_id)
+        return _automation_record(row, version_id) if row is not None else None
+
+    async def get_for_run(
+        self, run_id: int | None, *, session: AsyncSession | None = None
+    ) -> AutomationRecord | None:
+        """Read the accepted definition through its original immutable version."""
+
+        async with optional_session(self._database, session, write=False) as active:
+            pair = (
+                await active.execute(
+                    select(AutomationModel, AutomationVersionModel)
+                    .join(
+                        AutomationRunModel, AutomationRunModel.automation_id == AutomationModel.id
+                    )
+                    .join(
+                        AutomationVersionModel,
+                        AutomationVersionModel.id == AutomationRunModel.version_id,
+                    )
+                    .where(AutomationRunModel.id == run_id)
+                )
+            ).one_or_none()
+        if pair is None:
+            return None
+        owner, version = pair
+        if version.authority_snapshot_json is None:
+            return None
+        script = AutomationScript.model_validate_json(version.script_json)
+        return _automation_record(owner, version.id).model_copy(
+            update={
+                "script": script,
+                "name": script.name,
+                "timezone": script.timezone,
+                "script_hash": version.script_hash,
+                "required_capabilities": tuple(dict.fromkeys(step.call for step in script.steps)),
+                "authority_snapshot": json.loads(version.authority_snapshot_json),
+                "canonical_target_person_id": version.canonical_target_person_id,
+                "canonical_target_space_id": version.canonical_target_space_id,
+                "canonical_presence_id": version.canonical_presence_id,
+            }
+        )
 
     async def resolve_active_creator_person(
         self,
@@ -216,6 +254,8 @@ class AutomationRepository:
         self,
         creator_person_id: str,
         creation_source_key: str,
+        *,
+        session: AsyncSession | None = None,
     ) -> AutomationRecord | None:
         """Resolve a delegated create retry without producing another task."""
 
@@ -223,9 +263,25 @@ class AutomationRepository:
             self._owner_clause(creator_person_id),
             AutomationModel.creation_source_key == creation_source_key,
         )
-        async with self._database.sessions() as session:
-            row = await session.scalar(query.order_by(AutomationModel.id.asc()).limit(1))
+        async with optional_session(self._database, session, write=False) as active:
+            row = await active.scalar(query.order_by(AutomationModel.id.asc()).limit(1))
         return _automation_record(row) if row is not None else None
+
+    async def initial_script_hash(
+        self, automation_id: int, *, session: AsyncSession | None = None
+    ) -> str | None:
+        async with optional_session(self._database, session, write=False) as active:
+            script_json = await active.scalar(
+                select(AutomationVersionModel.script_json).where(
+                    AutomationVersionModel.automation_id == automation_id,
+                    AutomationVersionModel.version == 1,
+                )
+            )
+        return (
+            canonical_script_hash(AutomationScript.model_validate_json(script_json))
+            if script_json is not None
+            else None
+        )
 
     async def list_for_creator(
         self,
@@ -387,11 +443,11 @@ class AutomationRepository:
         values: dict[str, Any] = {
             "status": status.value,
             "updated_at": _aware_utc(now),
-            "claimed_by": None,
-            "claimed_until": None,
         }
         if status in {AutomationStatus.CANCELLED, AutomationStatus.COMPLETED}:
             values["next_run_at"] = None
+            values["claimed_by"] = None
+            values["claimed_until"] = None
         async with optional_session(self._database, session, write=True) as active:
             result = await active.execute(
                 update(AutomationModel)
@@ -405,6 +461,92 @@ class AutomationRepository:
                 .values(**values)
             )
         return bool(cast(CursorResult[Any], result).rowcount)
+
+    async def cancel(
+        self,
+        automation_id: int,
+        *,
+        creator_person_id: str,
+        now: datetime,
+        session: AsyncSession | None = None,
+    ) -> bool:
+        """Withdraw the actual admitted run trees in the management transaction."""
+        from qq_ai_bot.runtime.work_management import manage_work, stop_owned_execution
+        from qq_ai_bot.runtime.work_repository import TERMINAL
+        from qq_ai_bot.runtime.work_schema_v1 import work
+
+        transaction = (
+            self._database.immediate_session()
+            if session is None
+            else optional_session(self._database, session, write=True)
+        )
+        async with transaction as active:
+            changed = await self.set_status(
+                automation_id,
+                creator_person_id=creator_person_id,
+                status=AutomationStatus.CANCELLED,
+                now=now,
+                session=active,
+            )
+            owned = select(work.c.id).where(
+                func.json_extract(work.c.source_json, "$.owner") == "automation",
+                func.json_extract(work.c.source_json, "$.automation_id") == automation_id,
+            )
+            roots = (
+                (
+                    await active.execute(
+                        select(work.c.id, work.c.revision, work.c.state).where(
+                            work.c.id.in_(owned),
+                            or_(
+                                work.c.parent_work_id.is_(None), work.c.parent_work_id.not_in(owned)
+                            ),
+                        )
+                    )
+                )
+                .mappings()
+                .all()
+            )
+            for root in roots:
+                if root["state"] in TERMINAL:
+                    await stop_owned_execution(active, root["id"], "automation_cancelled")
+                else:
+                    await manage_work(
+                        active,
+                        root["id"],
+                        root["revision"],
+                        "cancel",
+                        reason="automation_cancelled",
+                    )
+                changed = True
+            runs = (
+                await active.scalars(
+                    select(AutomationRunModel).where(
+                        AutomationRunModel.automation_id == automation_id,
+                        AutomationRunModel.status == RunStatus.RUNNING.value,
+                    )
+                )
+            ).all()
+            for run in runs:
+                changed |= await self.finish_run(
+                    run.id,
+                    status=RunStatus.CANCELLED,
+                    steps_completed=run.steps_completed,
+                    llm_calls=run.llm_calls,
+                    tool_calls=run.tool_calls,
+                    messages_sent=run.messages_sent,
+                    error_category="automation_cancelled",
+                    summary=json.loads(run.result_summary_json),
+                    finished_at=now,
+                    session=active,
+                )
+            # Terminal plan identity stays terminal; cancellation still withdraws
+            # a retained tree and releases its actual processing claim.
+            await active.execute(
+                update(AutomationModel)
+                .where(AutomationModel.id == automation_id, self._owner_clause(creator_person_id))
+                .values(claimed_by=None, claimed_until=None)
+            )
+            return changed
 
     async def resume(
         self,
@@ -422,15 +564,17 @@ class AutomationRepository:
                     AutomationModel.id == automation_id,
                     self._owner_clause(creator_person_id),
                     AutomationModel.status.in_(
-                        [AutomationStatus.PAUSED.value, AutomationStatus.FAILED.value]
+                        [
+                            AutomationStatus.PAUSED.value,
+                            AutomationStatus.FAILED.value,
+                            AutomationStatus.BLOCKED.value,
+                        ]
                     ),
                 )
                 .values(
                     status=AutomationStatus.ACTIVE.value,
                     next_run_at=_aware_utc(next_run_at),
                     consecutive_failures=0,
-                    claimed_by=None,
-                    claimed_until=None,
                     updated_at=_aware_utc(now),
                 )
             )
@@ -458,8 +602,6 @@ class AutomationRepository:
                 .values(
                     status=AutomationStatus.ACTIVE.value,
                     next_run_at=timestamp,
-                    claimed_by=None,
-                    claimed_until=None,
                     updated_at=timestamp,
                 )
             )
@@ -473,6 +615,7 @@ class AutomationRepository:
         validated: ValidatedAutomation,
         authority: DelegatedAuthority,
         now: datetime,
+        next_run_at: datetime | None = None,
         session: AsyncSession | None = None,
     ) -> AutomationRecord | None:
         timestamp = _aware_utc(now)
@@ -511,11 +654,9 @@ class AutomationRepository:
             row.script_hash = validated.script_hash
             row.required_capabilities_json = json.dumps(validated.required_capabilities)
             row.authority_snapshot_json = authority.model_dump_json()
-            row.next_run_at = validated.next_run_at
-            row.status = AutomationStatus.ACTIVE.value
+            if next_run_at is not None:
+                row.next_run_at = next_run_at
             row.consecutive_failures = 0
-            row.claimed_by = None
-            row.claimed_until = None
             row.updated_at = timestamp
             target_person, target_space = await _bind_canonical_send_targets(
                 active,
@@ -525,18 +666,21 @@ class AutomationRepository:
             )
             row.canonical_target_person_id = target_person
             row.canonical_target_space_id = target_space
-            active.add(
-                AutomationVersionModel(
-                    automation_id=automation_id,
-                    version=latest_version + 1,
-                    script_json=script_json,
-                    script_hash=validated.script_hash,
-                    updated_by=authority.creator_user_id,
-                    created_at=timestamp,
-                )
+            version = AutomationVersionModel(
+                automation_id=automation_id,
+                version=latest_version + 1,
+                script_json=script_json,
+                script_hash=validated.script_hash,
+                authority_snapshot_json=authority.model_dump_json(),
+                canonical_target_person_id=target_person,
+                canonical_target_space_id=target_space,
+                canonical_presence_id=row.canonical_presence_id,
+                updated_by=authority.creator_user_id,
+                created_at=timestamp,
             )
+            active.add(version)
             await active.flush()
-            return _automation_record(row)
+            return _automation_record(row, version.id)
 
     async def claim_due(
         self,
@@ -544,49 +688,64 @@ class AutomationRepository:
         worker_id: str,
         now: datetime,
         lease_seconds: int,
-        limit: int = 10,
+        enabled: bool = True,
+        clock: Callable[[], datetime] | None = None,
     ) -> tuple[AutomationRecord, ...]:
         timestamp = _aware_utc(now)
-        lease_until = timestamp + timedelta(seconds=lease_seconds)
+        running = (
+            select(AutomationRunModel.id)
+            .where(
+                AutomationRunModel.automation_id == AutomationModel.id,
+                AutomationRunModel.status == RunStatus.RUNNING.value,
+            )
+            .exists()
+        )
+        due = and_(
+            true() if enabled else false(),
+            AutomationModel.status == AutomationStatus.ACTIVE.value,
+            AutomationModel.next_run_at.is_not(None),
+            AutomationModel.next_run_at <= timestamp,
+        )
         async with self._database.sessions() as session:
             candidate_ids = (
                 await session.scalars(
                     select(AutomationModel.id)
                     .where(
-                        AutomationModel.status == AutomationStatus.ACTIVE.value,
-                        AutomationModel.next_run_at.is_not(None),
-                        AutomationModel.next_run_at <= timestamp,
+                        or_(running, due),
                         or_(
                             AutomationModel.claimed_until.is_(None),
                             AutomationModel.claimed_until < timestamp,
                         ),
                     )
                     .order_by(AutomationModel.next_run_at.asc(), AutomationModel.id.asc())
-                    .limit(max(1, min(limit, 50)))
                 )
             ).all()
         claimed: list[AutomationRecord] = []
         for automation_id in candidate_ids:
-            async with self._database.sessions() as session, session.begin():
+            async with self._database.immediate_session() as session:
+                claimed_at = _aware_utc(clock() if clock is not None else datetime.now(UTC))
                 result = await session.execute(
                     update(AutomationModel)
                     .where(
                         AutomationModel.id == automation_id,
-                        AutomationModel.status == AutomationStatus.ACTIVE.value,
-                        AutomationModel.next_run_at.is_not(None),
-                        AutomationModel.next_run_at <= timestamp,
+                        or_(running, due),
                         or_(
                             AutomationModel.claimed_until.is_(None),
-                            AutomationModel.claimed_until < timestamp,
+                            AutomationModel.claimed_until < claimed_at,
                         ),
                     )
-                    .values(claimed_by=worker_id, claimed_until=lease_until)
+                    .values(
+                        claimed_by=worker_id,
+                        claimed_until=claimed_at + timedelta(seconds=lease_seconds),
+                    )
                 )
                 if not cast(CursorResult[Any], result).rowcount:
                     continue
                 row = await session.get(AutomationModel, automation_id)
                 if row is not None:
-                    claimed.append(_automation_record(row))
+                    claimed.append(
+                        _automation_record(row, await _current_version_id(session, automation_id))
+                    )
         return tuple(claimed)
 
     async def release_claim(
@@ -594,12 +753,9 @@ class AutomationRepository:
         automation_id: int,
         *,
         worker_id: str,
-        next_run_at: datetime | None = None,
         not_before: datetime | None = None,
     ) -> None:
         values: dict[str, Any] = {"claimed_by": None, "claimed_until": not_before}
-        if next_run_at is not None:
-            values["next_run_at"] = _aware_utc(next_run_at)
         async with self._database.sessions() as session, session.begin():
             await session.execute(
                 update(AutomationModel)
@@ -616,7 +772,6 @@ class AutomationRepository:
                 select(AutomationModel.claimed_until).where(
                     AutomationModel.id == automation_id,
                     AutomationModel.claimed_by == worker_id,
-                    AutomationModel.status == AutomationStatus.ACTIVE.value,
                 )
             )
         return _aware_utc(value).timestamp() if value is not None else None
@@ -628,7 +783,6 @@ class AutomationRepository:
                 .where(
                     AutomationModel.id == automation_id,
                     AutomationModel.claimed_by == worker_id,
-                    AutomationModel.status == AutomationStatus.ACTIVE.value,
                     func.julianday(AutomationModel.claimed_until) > func.julianday("now"),
                 )
                 .values(claimed_until=until)
@@ -641,22 +795,81 @@ class AutomationRepository:
         *,
         scheduled_for: datetime,
         actual_started_at: datetime,
+        worker_id: str | None = None,
+        version_id: int | None = None,
     ) -> AutomationRunRecord | None:
+        from qq_ai_bot.runtime.work_budget_schema import automation_budgets
         from qq_ai_bot.runtime.work_recovery_schema import invocations
 
         scheduled = _aware_utc(scheduled_for)
         started = _aware_utc(actual_started_at)
         key = f"{automation_id}:{scheduled.isoformat()}"
-        async with self._database.sessions() as session, session.begin():
-            script_hash = await session.scalar(
-                select(AutomationModel.script_hash).where(AutomationModel.id == automation_id)
-            )
-            if script_hash is None:
+        async with self._database.immediate_session() as session:
+            owner = await session.get(AutomationModel, automation_id)
+            if owner is None:
                 raise ValueError("automation_not_found")
+            current_version = await _current_version_id(session, automation_id)
+            if worker_id is not None and (
+                owner.claimed_by != worker_id
+                or owner.claimed_until is None
+                or _aware_utc(owner.claimed_until) <= datetime.now(UTC)
+                or owner.status != AutomationStatus.ACTIVE.value
+                or owner.next_run_at is None
+                or _aware_utc(owner.next_run_at) != scheduled
+                or current_version != version_id
+            ):
+                return None
+            existing = await session.scalar(
+                select(AutomationRunModel).where(
+                    AutomationRunModel.automation_id == automation_id,
+                    AutomationRunModel.scheduled_for == scheduled,
+                )
+            )
+            if existing is not None:
+                if (
+                    existing.status != RunStatus.RUNNING.value
+                    and owner.next_run_at is not None
+                    and _aware_utc(owner.next_run_at) == scheduled
+                ):
+                    owner.next_run_at = None
+                return None
+            if owner.max_runs is not None:
+                admitted = int(
+                    await session.scalar(
+                        select(func.count(AutomationRunModel.id)).where(
+                            AutomationRunModel.automation_id == automation_id,
+                            AutomationRunModel.status == RunStatus.RUNNING.value,
+                        )
+                    )
+                    or 0
+                )
+                if owner.run_count + admitted >= owner.max_runs:
+                    return None
+            version = await session.get(AutomationVersionModel, version_id or current_version)
+            if version is None:
+                raise ValueError("automation_version_unavailable")
+            if version.authority_snapshot_json is None:
+                # This is a new admission from the retained current definition,
+                # never a reconstruction of an already accepted historical run.
+                version = AutomationVersionModel(
+                    automation_id=owner.id,
+                    version=version.version + 1,
+                    script_json=owner.script_json,
+                    script_hash=owner.script_hash,
+                    authority_snapshot_json=owner.authority_snapshot_json,
+                    canonical_target_person_id=owner.canonical_target_person_id,
+                    canonical_target_space_id=owner.canonical_target_space_id,
+                    canonical_presence_id=owner.canonical_presence_id,
+                    updated_by=owner.creator_user_id,
+                    created_at=started,
+                )
+                session.add(version)
+                await session.flush()
             run_id = await session.scalar(
                 insert(AutomationRunModel)
                 .values(
                     automation_id=automation_id,
+                    version_id=version.id,
                     scheduled_for=scheduled,
                     actual_started_at=started,
                     finished_at=None,
@@ -675,14 +888,24 @@ class AutomationRepository:
             )
             if run_id is None:
                 return None
+            limits = AutomationScript.model_validate_json(version.script_json).limits
+            await session.execute(
+                insert(automation_budgets)
+                .values(
+                    run_id=run_id,
+                    model_limit=limits.max_llm_calls,
+                    tool_limit=limits.max_tool_calls,
+                )
+                .on_conflict_do_nothing(index_elements=[automation_budgets.c.run_id])
+            )
             # The initial resume boundary is part of admitting the run. A crash
             # cannot leave a new RUNNING run without its original script identity.
             await session.execute(
                 insert(invocations).values(
                     run_id=run_id,
-                    script_hash=script_hash,
+                    script_hash=version.script_hash,
                     phase="ready",
-                    payload_json='{"next_step":0}',
+                    payload_json=json.dumps({"next_step": 0, "version_id": version.id}),
                     updated=datetime.now(UTC).timestamp(),
                 )
             )
@@ -690,46 +913,19 @@ class AutomationRepository:
             assert row is not None
             return _run_record(row)
 
-    async def resumable_run(
-        self, automation_id: int, scheduled_for: datetime
-    ) -> AutomationRunRecord | None:
+    async def running_runs(self, automation_id: int) -> tuple[AutomationRunRecord, ...]:
         async with self._database.sessions() as session:
-            row = await session.scalar(
-                select(AutomationRunModel).where(
-                    AutomationRunModel.automation_id == automation_id,
-                    AutomationRunModel.scheduled_for == _aware_utc(scheduled_for),
-                    AutomationRunModel.status == RunStatus.RUNNING.value,
+            rows = (
+                await session.scalars(
+                    select(AutomationRunModel)
+                    .where(
+                        AutomationRunModel.automation_id == automation_id,
+                        AutomationRunModel.status == RunStatus.RUNNING.value,
+                    )
+                    .order_by(AutomationRunModel.scheduled_for, AutomationRunModel.id)
                 )
-            )
-            return _run_record(row) if row else None
-
-    async def record_step(
-        self,
-        *,
-        run_id: int,
-        step_id: str,
-        capability: str,
-        status: str,
-        input_summary: dict[str, Any],
-        output_summary: dict[str, Any],
-        started_at: datetime,
-        finished_at: datetime,
-        error_category: str | None,
-    ) -> None:
-        async with self._database.sessions() as session, session.begin():
-            session.add(
-                AutomationStepRunModel(
-                    run_id=run_id,
-                    step_id=step_id,
-                    capability=capability,
-                    status=status,
-                    input_summary_json=_redacted_json(input_summary),
-                    output_summary_json=_redacted_json(output_summary),
-                    started_at=_aware_utc(started_at),
-                    finished_at=_aware_utc(finished_at),
-                    error_category=error_category,
-                )
-            )
+            ).all()
+            return tuple(_run_record(row) for row in rows)
 
     async def finish_run(
         self,
@@ -744,12 +940,49 @@ class AutomationRepository:
         summary: dict[str, Any],
         finished_at: datetime,
         worker_id: str | None = None,
+        session: AsyncSession | None = None,
     ) -> bool:
-        async with self._database.sessions() as session, session.begin():
-            result = await session.execute(
+        from qq_ai_bot.runtime.work_budget_schema import automation_budgets
+        from qq_ai_bot.runtime.work_recovery_schema import invocations
+        from qq_ai_bot.time.schedules import schedule_after_completion
+
+        timestamp = _aware_utc(finished_at)
+        transaction = (
+            self._database.immediate_session()
+            if session is None
+            else optional_session(self._database, session, write=True)
+        )
+        async with transaction as active:
+            run = await active.get(AutomationRunModel, run_id)
+            if run is None:
+                return False
+            cursor_json = await active.scalar(
+                select(invocations.c.payload_json).where(invocations.c.run_id == run_id)
+            )
+            cursor = json.loads(cursor_json) if cursor_json is not None else {}
+            steps_completed = max(
+                steps_completed, run.steps_completed, cursor.get("steps_completed", 0)
+            )
+            llm_calls = max(llm_calls, run.llm_calls, cursor.get("llm_calls", 0))
+            tool_calls = max(tool_calls, run.tool_calls, cursor.get("tool_calls", 0))
+            messages_sent = max(messages_sent, run.messages_sent, cursor.get("messages_sent", 0))
+            accepted = await self.get_for_run(run.id, session=active)
+            ledger = (
+                await active.execute(
+                    select(automation_budgets.c.models, automation_budgets.c.tools).where(
+                        automation_budgets.c.run_id == run_id
+                    )
+                )
+            ).first()
+            if ledger is not None:
+                llm_calls = max(llm_calls, ledger.models)
+                if accepted is not None and accepted.script.uses_runtime_budget:
+                    tool_calls = ledger.tools
+            result = await active.execute(
                 update(AutomationRunModel)
                 .where(
                     AutomationRunModel.id == run_id,
+                    AutomationRunModel.status == RunStatus.RUNNING.value,
                     AutomationRunModel.automation_id.in_(
                         select(AutomationModel.id).where(AutomationModel.claimed_by == worker_id)
                     )
@@ -764,64 +997,51 @@ class AutomationRepository:
                     messages_sent=messages_sent,
                     error_category=error_category,
                     result_summary_json=_redacted_json(summary),
-                    finished_at=_aware_utc(finished_at),
+                    finished_at=timestamp,
                 )
                 .returning(AutomationRunModel.id)
             )
-            return result.scalar_one_or_none() is not None
-
-    async def finish_automation_run(
-        self,
-        automation_id: int,
-        *,
-        worker_id: str,
-        status: RunStatus,
-        next_run_at: datetime | None,
-        now: datetime,
-        max_consecutive_failures: int,
-    ) -> None:
-        timestamp = _aware_utc(now)
-        async with self._database.immediate_session() as session:
-            row = await session.get(AutomationModel, automation_id)
-            if row is None or row.claimed_by != worker_id:
-                return
+            if result.scalar_one_or_none() is None:
+                return False
+            row = await active.get(AutomationModel, run.automation_id)
+            assert row is not None
             row.last_run_at = timestamp
             row.run_count += 1
-            row.claimed_by = None
-            row.claimed_until = None
             row.updated_at = timestamp
-            if status is RunStatus.SUCCEEDED:
-                row.consecutive_failures = 0
-                if row.max_runs is not None and row.run_count >= row.max_runs:
-                    row.status = AutomationStatus.COMPLETED.value
-                    row.next_run_at = None
-                elif next_run_at is None:
-                    row.status = AutomationStatus.COMPLETED.value
-                    row.next_run_at = None
-                else:
-                    row.status = AutomationStatus.ACTIVE.value
-                    row.next_run_at = _aware_utc(next_run_at)
-            elif status is RunStatus.CANCELLED:
-                row.status = AutomationStatus.CANCELLED.value
+            row.consecutive_failures = (
+                0 if status is RunStatus.SUCCEEDED else row.consecutive_failures + 1
+            )
+            if row.status in {AutomationStatus.CANCELLED.value, AutomationStatus.COMPLETED.value}:
+                return True
+            if row.max_runs is not None and row.run_count >= row.max_runs:
+                row.status = AutomationStatus.COMPLETED.value
                 row.next_run_at = None
-            elif status is RunStatus.MISSED:
-                row.next_run_at = _aware_utc(next_run_at) if next_run_at else None
-                row.status = (
-                    AutomationStatus.ACTIVE.value
-                    if next_run_at is not None
-                    else AutomationStatus.COMPLETED.value
-                )
-            elif status is RunStatus.BLOCKED:
-                row.status = AutomationStatus.BLOCKED.value
-                row.next_run_at = None
-            else:
-                row.consecutive_failures += 1
-                if next_run_at is None or row.consecutive_failures >= max_consecutive_failures:
-                    row.status = AutomationStatus.FAILED.value
-                    row.next_run_at = None
+                return True
+            if row.next_run_at is not None and _aware_utc(row.next_run_at) == _aware_utc(
+                run.scheduled_for
+            ):
+                if accepted is not None:
+                    row.next_run_at = schedule_after_completion(
+                        accepted.script.schedule,
+                        _aware_utc(run.scheduled_for),
+                        timestamp,
+                        accepted.timezone,
+                    )
                 else:
-                    row.status = AutomationStatus.ACTIVE.value
-                    row.next_run_at = _aware_utc(next_run_at) if next_run_at else None
+                    row.next_run_at = None
+                if row.status != AutomationStatus.PAUSED.value:
+                    if status is RunStatus.CANCELLED:
+                        row.status = AutomationStatus.CANCELLED.value
+                        row.next_run_at = None
+                    elif status is RunStatus.BLOCKED:
+                        row.status = AutomationStatus.BLOCKED.value
+                    elif row.next_run_at is None:
+                        row.status = (
+                            AutomationStatus.COMPLETED.value
+                            if status is RunStatus.SUCCEEDED
+                            else AutomationStatus.FAILED.value
+                        )
+            return True
 
     async def run_history(
         self,
@@ -851,16 +1071,6 @@ class AutomationRepository:
                     AutomationModel.status == AutomationStatus.ACTIVE.value
                 )
             )
-
-    async def cleanup_runs(self, *, before: datetime) -> int:
-        async with self._database.sessions() as session, session.begin():
-            result = await session.execute(
-                delete(AutomationRunModel).where(
-                    AutomationRunModel.created_at < _aware_utc(before),
-                    AutomationRunModel.status != RunStatus.RUNNING.value,
-                )
-            )
-        return int(cast(CursorResult[Any], result).rowcount or 0)
 
 
 async def _bind_canonical_send_targets(
@@ -928,9 +1138,22 @@ async def _default_canonical_target(
     return target_person, None
 
 
-def _automation_record(row: AutomationModel) -> AutomationRecord:
+async def _current_version_id(session: AsyncSession, automation_id: int) -> int | None:
+    return cast(
+        int | None,
+        await session.scalar(
+            select(AutomationVersionModel.id)
+            .where(AutomationVersionModel.automation_id == automation_id)
+            .order_by(AutomationVersionModel.version.desc())
+            .limit(1)
+        ),
+    )
+
+
+def _automation_record(row: AutomationModel, version_id: int | None = None) -> AutomationRecord:
     return AutomationRecord(
         id=row.id,
+        version_id=version_id,
         claimed_by=row.claimed_by,
         creator_kind=row.creator_kind,
         creator_user_id=row.creator_user_id,
@@ -948,7 +1171,6 @@ def _automation_record(row: AutomationModel) -> AutomationRecord:
         run_count=row.run_count,
         max_runs=row.max_runs,
         consecutive_failures=row.consecutive_failures,
-        misfire_grace_seconds=row.misfire_grace_seconds,
         created_at=_aware_utc(row.created_at),
         updated_at=_aware_utc(row.updated_at),
         canonical_creator_person_id=row.canonical_creator_person_id,
@@ -977,6 +1199,7 @@ def _automation_directory_entry(
 def _run_record(row: AutomationRunModel) -> AutomationRunRecord:
     return AutomationRunRecord(
         id=row.id,
+        version_id=row.version_id,
         automation_id=row.automation_id,
         scheduled_for=_aware_utc(row.scheduled_for),
         actual_started_at=_aware_utc(row.actual_started_at),
@@ -1000,20 +1223,14 @@ def _aware_utc(value: datetime) -> datetime:
 def _redacted_json(value: dict[str, Any]) -> str:
     sensitive = {"api_key", "token", "password", "secret", "authorization"}
 
-    def redact(item: Any, depth: int = 0) -> Any:
-        if depth > 4:
-            return "[truncated]"
+    def redact(item: Any) -> Any:
         if isinstance(item, dict):
             return {
-                str(key)[:128]: "[redacted]"
-                if str(key).casefold() in sensitive
-                else redact(child, depth + 1)
-                for key, child in list(item.items())[:50]
+                str(key): "[redacted]" if str(key).casefold() in sensitive else redact(child)
+                for key, child in item.items()
             }
         if isinstance(item, list):
-            return [redact(child, depth + 1) for child in item[:20]]
-        if isinstance(item, str):
-            return item[:1000]
+            return [redact(child) for child in item]
         return item
 
-    return json.dumps(redact(value), ensure_ascii=False, separators=(",", ":"))[:16000]
+    return json.dumps(redact(value), ensure_ascii=False, separators=(",", ":"))

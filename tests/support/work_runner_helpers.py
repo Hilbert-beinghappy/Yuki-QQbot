@@ -85,9 +85,6 @@ async def case(database, tmp_path, responses, *, reporting="interactive", send_s
         def finalize(self, text, runtime):
             return text
 
-        def exhausted(self, runtime):
-            return "exhausted"
-
     runtime = AgentRuntime(
         origin=TurnOrigin.USER_MESSAGE,
         actor_user_id="10001",

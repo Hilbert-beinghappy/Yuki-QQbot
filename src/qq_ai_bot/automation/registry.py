@@ -9,8 +9,13 @@ from typing import Any, Literal
 
 from pydantic import BaseModel, ConfigDict, Field
 
-from qq_ai_bot.automation.authority import AuthorityContext, PermissionLevel
+from qq_ai_bot.automation.authority import (
+    AuthorityContext,
+    PermissionLevel,
+    _permission_level_allowed,
+)
 from qq_ai_bot.automation.models import AutomationContext, RetryPolicy, RiskClass, TurnOrigin
+from yuki_plugin_sdk.models import PermissionLevel as SdkPermissionLevel
 
 
 class CapabilityArguments(BaseModel):
@@ -18,17 +23,17 @@ class CapabilityArguments(BaseModel):
 
 
 class AgentArguments(CapabilityArguments):
-    instruction: str = Field(min_length=1, max_length=4000)
+    instruction: str = Field(min_length=1)
     context_profile: Literal["none", "creator_private", "current_group"] = "none"
     delivery_target: Literal["none", "self_private", "current_group"] | None = None
-    max_tool_calls: int = Field(default=32, ge=0, le=160)
-    max_model_requests: int = Field(default=24, ge=1, le=120)
+    max_tool_calls: int | None = Field(default=None, ge=0)
+    max_model_requests: int | None = Field(default=None, ge=1)
 
 
 class ConfigGetArguments(CapabilityArguments):
-    key: str = Field(min_length=1, max_length=128)
+    key: str = Field(min_length=1)
     scope_type: Literal["global", "group", "user"] = "global"
-    scope_id: str = Field(default="", max_length=64)
+    scope_id: str = ""
 
 
 class ConfigSetArguments(ConfigGetArguments):
@@ -36,7 +41,7 @@ class ConfigSetArguments(ConfigGetArguments):
 
 
 class WebSearchArguments(CapabilityArguments):
-    query: str = Field(min_length=1, max_length=400)
+    query: str = Field(min_length=1)
     topic: Literal["general", "news"] = "general"
     time_range: Literal["day", "week", "month", "year"] | None = None
     start_date: str | None = None
@@ -44,27 +49,27 @@ class WebSearchArguments(CapabilityArguments):
 
 
 class WebReadArguments(CapabilityArguments):
-    url: str = Field(min_length=1, max_length=2048)
-    question: str = Field(default="", max_length=1000)
+    url: str = Field(min_length=1)
+    question: str = ""
 
 
 class PersonMemoryArguments(CapabilityArguments):
-    user_id: str = Field(min_length=1, max_length=64)
-    limit: int = Field(default=20, ge=1, le=100)
+    user_id: str = Field(min_length=1)
+    limit: int = Field(default=20, ge=1)
 
 
 class GroupMemoryArguments(CapabilityArguments):
-    group_id: str = Field(min_length=1, max_length=64)
-    limit: int = Field(default=20, ge=1, le=100)
+    group_id: str = Field(min_length=1)
+    limit: int = Field(default=20, ge=1)
 
 
 class HistorySearchArguments(CapabilityArguments):
-    keyword: str = Field(min_length=1, max_length=400)
-    user_id: str | None = Field(default=None, max_length=64)
-    group_id: str | None = Field(default=None, max_length=64)
-    after: str | None = Field(default=None, max_length=64)
-    before: str | None = Field(default=None, max_length=64)
-    limit: int = Field(default=20, ge=1, le=100)
+    keyword: str = Field(min_length=1)
+    user_id: str | None = None
+    group_id: str | None = None
+    after: str | None = None
+    before: str | None = None
+    limit: int = Field(default=20, ge=1)
 
 
 @dataclass(frozen=True, slots=True)
@@ -109,10 +114,8 @@ class CapabilityExecutionContext:
     )
 
 
-CapabilityHandler = Callable[
-    [dict[str, Any], CapabilityExecutionContext], Awaitable[CapabilityResult]
-]
-CapabilityArgumentValidator = Callable[[object, bool], dict[str, Any]]
+CapabilityHandler = Callable[[Any, CapabilityExecutionContext], Awaitable[CapabilityResult]]
+CapabilityArgumentValidator = Callable[[object], dict[str, Any]]
 CapabilitySchemaVersion = int | str
 
 
@@ -122,7 +125,7 @@ class AutomationCapability:
     description: str
     argument_model: type[BaseModel]
     output_schema: dict[str, object]
-    required_permission: PermissionLevel
+    required_permission: PermissionLevel | SdkPermissionLevel
     risk_class: RiskClass
     retry_policy: RetryPolicy
     allowed_origins: frozenset[TurnOrigin]
@@ -133,30 +136,21 @@ class AutomationCapability:
     provider_version: str | None = None
     provider_manifest_hash: str | None = None
     handler: CapabilityHandler | None = field(default=None, repr=False)
-    result_cacheable: bool = True
 
     @property
     def input_schema(self) -> dict[str, object]:
         return self.argument_schema or self.argument_model.model_json_schema()
 
-    def validate_arguments(
-        self,
-        value: object,
-        *,
-        allow_templates: bool = False,
-    ) -> dict[str, Any]:
+    def validate_arguments(self, value: object) -> BaseModel | dict[str, Any]:
         """Validate arguments through the capability's native schema contract."""
 
         if self.argument_validator is not None:
-            return self.argument_validator(value, allow_templates)
-        return self.argument_model.model_validate(value).model_dump()
+            return self.argument_validator(value)
+        return self.argument_model.model_validate(value)
 
     def permits(self, permission: PermissionLevel) -> bool:
-        if permission is PermissionLevel.SELF:
-            return self.name in {"yuki.agent", "social.send_message"}
-        return not (
-            self.required_permission is PermissionLevel.SUPERUSER
-            and permission is not PermissionLevel.SUPERUSER
+        return _permission_level_allowed(
+            self.required_permission, permission is PermissionLevel.SUPERUSER
         )
 
 
@@ -232,7 +226,7 @@ def build_capability_registry(
         (
             "config.set",
             "自动化管理员委托修改单个配置 key/value；指定 scope_type/scope_id，"
-            "不允许修改 automation.*。不能替代当前请求的 admin_set_config 授权。",
+            "不能替代当前请求的 admin_set_config 授权。",
             ConfigSetArguments,
             PermissionLevel.SUPERUSER,
             RiskClass.MUTATE,

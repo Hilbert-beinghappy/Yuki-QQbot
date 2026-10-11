@@ -284,8 +284,6 @@ class WebSettings(DomainSettings):
     web_timeout_seconds: float = Field(default=180.0, gt=0)
     web_max_retries: int = Field(ge=0)
     web_global_concurrency: int = Field(gt=0)
-    web_max_calls_per_turn: int = Field(gt=0)
-    web_tool_result_max_characters: int = Field(gt=0)
     web_source_retention_days: int = Field(gt=0)
     web_source_max_runs_per_conversation: int = Field(gt=0)
 
@@ -395,17 +393,6 @@ class AutomationSettings(DomainSettings):
     default_timezone: str
     automation_poll_seconds: float = Field(gt=0)
     automation_lease_seconds: int = Field(gt=0)
-    automation_max_active_per_superuser: int = Field(gt=0)
-    automation_max_active_per_user: int = Field(gt=0)
-    automation_max_steps: int = Field(gt=0)
-    automation_max_llm_calls_per_run: int = Field(gt=0)
-    automation_max_tool_calls_per_run: int = Field(gt=0)
-    automation_max_messages_per_run: int = Field(gt=0)
-    automation_max_runtime_seconds: int = Field(gt=0)
-    automation_min_interval_seconds: int = Field(gt=0)
-    automation_default_misfire_grace_seconds: int = Field(gt=0)
-    automation_max_consecutive_failures: int = Field(gt=0)
-    automation_run_retention_days: int = Field(gt=0)
 
 
 class ToolingSettings(DomainSettings):

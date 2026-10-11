@@ -360,8 +360,6 @@ class Settings(BaseSettings):
     web_timeout_seconds: float = 180.0
     web_max_retries: int = 1
     web_global_concurrency: int = 4
-    web_max_calls_per_turn: int = 3
-    web_tool_result_max_characters: int = 16000
     web_source_retention_days: int = 7
     web_source_max_runs_per_conversation: int = 10
 
@@ -443,17 +441,6 @@ class Settings(BaseSettings):
     default_timezone: str = "Asia/Shanghai"
     automation_poll_seconds: float = 2.0
     automation_lease_seconds: int = 120
-    automation_max_active_per_superuser: int = 50
-    automation_max_active_per_user: int = 10
-    automation_max_steps: int = 16
-    automation_max_llm_calls_per_run: int = 10
-    automation_max_tool_calls_per_run: int = 16
-    automation_max_messages_per_run: int = 10
-    automation_max_runtime_seconds: int = 600
-    automation_min_interval_seconds: int = 60
-    automation_default_misfire_grace_seconds: int = 1800
-    automation_max_consecutive_failures: int = 3
-    automation_run_retention_days: int = 30
 
     @field_validator("web_search_depth")
     @classmethod

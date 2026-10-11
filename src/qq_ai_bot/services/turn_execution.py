@@ -127,6 +127,7 @@ class _OrdinarySummaryDispatch:
     sequence: TranscriptRequest
     control: WorkControl | None
     priority: ModelExecutionPriority
+    tools: AgentToolBackend | None = None
     prepared: bool = field(default=False, init=False)
 
     async def complete(self) -> ChatResponse:
@@ -146,7 +147,8 @@ class _OrdinarySummaryDispatch:
             return
         assert self.runtime.auxiliary_requests is not None
         if (
-            self.request_index + self.runtime.auxiliary_requests[0] + 1
+            self.runtime.max_model_requests is not None
+            and self.request_index + self.runtime.auxiliary_requests[0] + 1
             >= self.runtime.max_model_requests
         ):
             raise WorkCapacityError("model_request_budget")
@@ -155,7 +157,14 @@ class _OrdinarySummaryDispatch:
                 await self.runtime.before_model_request()
         if self.control is not None:
             await self.control.reserve_request(auxiliary=True)
+        elif self.runtime.admit_model_request is not None:
+            await self.runtime.admit_model_request()
         self.runtime.auxiliary_requests[0] += 1
+        self.runner._record_failure_usage(
+            self.tools,
+            tool_calls=0,
+            model_requests=self.request_index + self.runtime.auxiliary_requests[0],
+        )
         self.prepared = True
 
 
@@ -165,6 +174,7 @@ class _PrimaryDispatch:
 
     runner: AgentRunner
     runtime: AgentRuntime
+    request_index: int
     execute: Callable[[], Awaitable[ChatResponse]]
     sequence: TranscriptRequest
     boundary: ContextBoundary | None
@@ -244,15 +254,23 @@ class _PrimaryDispatch:
                 self.observed_event_ids.update(self.selected_boundary.event_ids)
                 if work_session is not None:
                     work_session.public_event_ids.update(self.selected_boundary.event_ids)
-        elif self.selected_boundary is not None:
-            await self.selected_boundary.commit()
-            self.observed_event_ids.update(self.selected_boundary.event_ids)
+        else:
+            if self.runtime.admit_model_request is not None:
+                await self.runtime.admit_model_request()
+            if self.selected_boundary is not None:
+                await self.selected_boundary.commit()
+                self.observed_event_ids.update(self.selected_boundary.event_ids)
         if self.has_native_effects:
             # Mark the original private task before real native dispatch. SDK
             # backends without an ordinary private token have no protection hook.
             protect_native = getattr(self.tools, "protect_native_dispatch", None)
             if callable(protect_native):
                 await protect_native(self.runtime)
+        self.runner._record_failure_usage(
+            self.tools,
+            tool_calls=0,
+            model_requests=self.request_index + 1 + sum(self.runtime.auxiliary_requests or ()),
+        )
         self.prepared = True
 
 
@@ -411,7 +429,8 @@ class TurnExecution:
     async def begin(self, request_index: int) -> LoopSignal | None:
 
         if (
-            self.runtime.auxiliary_requests
+            self.runtime.max_model_requests is not None
+            and self.runtime.auxiliary_requests
             and request_index + self.runtime.auxiliary_requests[0]
             >= self.runtime.max_model_requests
         ):
@@ -448,12 +467,14 @@ class TurnExecution:
         if (
             self.state.control is not None
             and self.state.control.current is not None
+            and self.runtime.max_model_requests is not None
             and self.state.control.requests_started >= self.runtime.max_model_requests
         ):
             return STOP
         if (
             self.state.control is not None
             and self.state.control.current is not None
+            and self.runtime.max_tool_calls is not None
             and self.runtime.max_tool_calls > 0
             and self.state.control.tools_started >= self.runtime.max_tool_calls
             and not self.state.provider_pause_replay
@@ -567,6 +588,7 @@ class TurnExecution:
                     for image in message.images
                 ),
                 runtime=self.runtime,
+                request_index=request_index,
                 execute=execute,
                 sequence=candidate.sequence,
                 boundary=self.state.boundary,
@@ -600,6 +622,11 @@ class TurnExecution:
                 source_count=len(response.citations),
             )
             self.state.staged_evidence_results = 0
+            self.runner._record_failure_usage(
+                self.tools,
+                tool_calls=self.state.calls_used,
+                model_requests=request_index + 1 + (self.runtime.auxiliary_requests or [0])[0],
+            )
         except _RequestNotStarted as exc:
             self.runner._record_failure_usage(
                 self.tools, tool_calls=self.state.calls_used, model_requests=request_index
@@ -915,7 +942,10 @@ class TurnExecution:
             else:
                 # The paid source is now safely paired. New inputs can
                 # enter this new request without invalidating its cursor.
-                if self.state.control.requests_started >= self.runtime.max_model_requests:
+                if (
+                    self.runtime.max_model_requests is not None
+                    and self.state.control.requests_started >= self.runtime.max_model_requests
+                ):
                     return STOP
                 if self.state.paid_staging and not self.state.provider_pause_replay:
                     waiting = await self.take_boundary_inputs(request_index, self.state.boundary)
@@ -973,6 +1003,7 @@ class TurnExecution:
                         sequence,
                         self.state.control,
                         priority,
+                        self.tools,
                     )
                     return await self.runner._concurrency.run_llm(
                         self.runtime.conversation_key, dispatch.complete
@@ -1208,7 +1239,9 @@ class TurnExecution:
             response.tool_calls,
             self.tools,
             self.runtime,
-            remaining_calls=max(
+            remaining_calls=None
+            if self.runtime.max_tool_calls is None
+            else max(
                 0,
                 self.runtime.max_tool_calls
                 - max(
@@ -1234,6 +1267,9 @@ class TurnExecution:
         )
         batch, executed = self.state.coordinated.calls, self.state.coordinated.executed_count
         self.state.calls_used += executed
+        self.runner._record_failure_usage(
+            self.tools, tool_calls=self.state.calls_used, model_requests=0
+        )
         return ToolBatchOutcome(
             tuple(ToolCallOutcome(c, r, e) for c, r, e in batch),
             executed_count=executed,
@@ -1412,17 +1448,6 @@ class TurnExecution:
                 suppress_delivery=True,
                 work_state="queued",
             )
-        exhausted = (
-            self.tools.exhausted(self.runtime)
-            if self.tools is not None
-            else "工具调用次数过多，Agent 已停止。"
-        )
-        return AgentRunResult(
-            text=exhausted,
-            tool_calls_used=self.state.calls_used,
-            model_requests=self.runtime.max_model_requests,
-            web_was_used=self.state.web_was_used,
-            native_tool_events=tuple(self.state.native_events),
-            citations=tuple(self.state.citations),
-            response_status=self.state.response_status,
-        )
+        from qq_ai_bot.runtime.work_budget import WorkBudgetExceeded
+
+        raise WorkBudgetExceeded("agent_segment_budget_exhausted")

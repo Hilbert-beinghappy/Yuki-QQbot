@@ -31,7 +31,7 @@ class WebSearchProvider(Protocol):
         """Search and extract a bounded set of relevant public pages."""
 
     async def extract(self, url: str, query: str) -> WebSearchSource:
-        """Extract query-relevant content from one validated public page."""
+        """Extract content from one validated public page."""
 
     async def close(self) -> None:
         """Release provider-owned resources."""
@@ -41,8 +41,8 @@ def normalize_public_url(url: str) -> str:
     """Validate and normalize one public HTTP(S) URL without resolving DNS."""
 
     candidate = url.strip()
-    if not candidate or len(candidate) > 2048:
-        raise WebSearchValidationError("invalid_url", "URL 不能为空且不能超过 2048 个字符")
+    if not candidate:
+        raise WebSearchValidationError("invalid_url", "URL 不能为空")
     try:
         parsed = urlsplit(candidate)
         port = parsed.port

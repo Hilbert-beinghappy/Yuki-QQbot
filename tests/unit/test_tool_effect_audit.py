@@ -42,6 +42,7 @@ from qq_ai_bot.runtime.origin import TurnOrigin
 from qq_ai_bot.runtime.work_control import WorkControl
 from qq_ai_bot.runtime.work_repository import WorkRepository
 from qq_ai_bot.runtime.work_schema_v1 import effects
+from qq_ai_bot.services.agent_runner import AgentRuntime
 from qq_ai_bot.services.agent_tools import ToolRuntime
 from qq_ai_bot.services.chat import ChatService
 from qq_ai_bot.services.invocation_service import defer_tool_audit
@@ -126,7 +127,23 @@ async def test_equal_sends_and_cross_response_ids_keep_distinct_social_operation
     backend = MainAgentBackend(chat, runtime)
     backend._catalog = registry.catalog(runtime)
     backend._callable_tool_names = {"send_message"}
-    agent = SimpleNamespace(work_control=owner.control)
+    actor = runtime.actor_context
+    agent = AgentRuntime(
+        origin=actor.origin,
+        actor_user_id=actor.user_id,
+        actor_is_superuser=runtime.actor_is_superuser,
+        delegated_authority=None,
+        conversation_key=runtime.conversation_key,
+        current_group_id=actor.group_id,
+        bot_user_id=actor.bot_user_id,
+        gateway=runtime.gateway,
+        runtime_config=runtime.runtime_config,
+        current_time=chat._time.current_default(),
+        allowed_capabilities=frozenset(),
+        max_tool_calls=runtime.runtime_config.agent.max_tool_calls,
+        max_model_requests=runtime.runtime_config.agent.max_model_requests,
+        work_control=owner.control,
+    )
     calls = tuple(ToolCall(i, ToolFunction("send_message", "{}")) for i in ("call_0", "call_1"))
     coordinator = ToolInvocationCoordinator()
 
@@ -228,7 +245,23 @@ async def test_social_success_and_original_work_call_survive_telemetry_failure(
     backend = MainAgentBackend(chat, runtime)
     backend._catalog = registry.catalog(runtime)
     backend._callable_tool_names = {"send_message"}
-    agent = SimpleNamespace(work_control=work.control)
+    actor = runtime.actor_context
+    agent = AgentRuntime(
+        origin=actor.origin,
+        actor_user_id=actor.user_id,
+        actor_is_superuser=runtime.actor_is_superuser,
+        delegated_authority=None,
+        conversation_key=runtime.conversation_key,
+        current_group_id=actor.group_id,
+        bot_user_id=actor.bot_user_id,
+        gateway=runtime.gateway,
+        runtime_config=runtime.runtime_config,
+        current_time=chat._time.current_default(),
+        allowed_capabilities=frozenset(),
+        max_tool_calls=runtime.runtime_config.agent.max_tool_calls,
+        max_model_requests=runtime.runtime_config.agent.max_model_requests,
+        work_control=work.control,
+    )
 
     async def invoke():
         result = await backend.execute_call(direct_invocations((call,), agent)[0])
