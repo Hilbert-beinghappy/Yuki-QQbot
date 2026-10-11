@@ -2,6 +2,8 @@
 
 import asyncio
 import json
+import sqlite3
+from contextlib import closing, contextmanager
 from datetime import UTC, datetime, timedelta
 from uuid import uuid4
 
@@ -41,6 +43,7 @@ from qq_ai_bot.persistence.models import (
     MemoryMutationReceiptModel,
     MemorySelfReflectionCycleModel,
     MemorySelfReflectionRunModel,
+    MemorySelfReflectionRuntimeModel,
     MemorySelfReflectionStateModel,
     MemoryToolReceiptModel,
 )
@@ -147,9 +150,136 @@ async def claim(database, cycle="cycle-1", *, max_characters=16000):
     )
 
 
+@contextmanager
+def unrelated_wal_commit_before_write(database, initiative_id):
+    """Commit another connection after source reads and before the first writer SQL."""
+    committed = False
+
+    def compete(_connection, _cursor, statement, *_args):
+        nonlocal committed
+        sql = statement.lstrip().upper()
+        if committed or not sql.startswith(("INSERT", "UPDATE", "DELETE", "BEGIN IMMEDIATE")):
+            return
+        with closing(sqlite3.connect(database.engine.url.database)) as writer:
+            assert writer.execute("PRAGMA journal_mode").fetchone() == ("wal",)
+            assert (
+                writer.execute(
+                    "UPDATE autonomy_initiative_runs SET feedback_sequence = feedback_sequence + 1 "
+                    "WHERE id = ?",
+                    (initiative_id,),
+                ).rowcount
+                == 1
+            )
+            writer.commit()
+        committed = True
+
+    sql_event.listen(database.engine.sync_engine, "before_cursor_execute", compete)
+    try:
+        yield
+    except OperationalError as error:
+        error.add_note(f"sqlite_errorcode={getattr(error.orig, 'sqlite_errorcode', None)}")
+        raise
+    finally:
+        sql_event.remove(database.engine.sync_engine, "before_cursor_execute", compete)
+    assert committed
+
+
+async def test_reflection_scan_keeps_all_owner_counters_after_unrelated_wal_commit(database):
+    mutations, _, initial, initiative_id = await seed(database)
+    repository = SelfReflectionRepository(database)
+    assert await repository.scan_new_events() == 0
+    first = await _event(
+        mutations._ledger,
+        message_id=str(uuid4()),
+        sender_user_id="1001",
+        content="已有 owner 的待处理来源",
+        group_id="3001",
+    )
+    assert await repository.scan_new_events() == 1
+    old = await _event(
+        mutations._ledger,
+        message_id=str(uuid4()),
+        sender_user_id="1002",
+        content="旧 generation 的真实历史",
+        group_id="3002",
+    )
+    async with database.immediate_session() as session:
+        conversation = await session.get(CanonicalConversationModel, old.canonical_conversation_id)
+        conversation.generation += 1
+        conversation.last_generation_change_event_id = old.id
+    events = [old]
+    for owner, group, content, bot in (
+        ("1001", "3001", "同一页的已有 owner", False),
+        ("1001", None, "独立私人 owner 的真实来源", False),
+        ("1002", "3002", "新 generation 的真实来源", False),
+        ("8000", "3001", "Yuki 的实际回复", True),
+        ("1001", "3001", "　", False),
+    ):
+        events.append(
+            await _event(
+                mutations._ledger,
+                message_id=str(uuid4()),
+                sender_user_id=owner,
+                content=content,
+                group_id=group,
+                direction="outbound" if bot else "inbound",
+                sender_is_bot=bot,
+            )
+        )
+    with unrelated_wal_commit_before_write(database, initiative_id):
+        scanned = 0
+        while count := await repository.scan_new_events(limit=2):
+            scanned += count
+        assert scanned == len(events)
+    assert await SelfReflectionRepository(database).scan_new_events(limit=2) == 0
+    async with database.sessions() as session:
+        runtime = await session.get(MemorySelfReflectionRuntimeModel, 1)
+        states = tuple(await session.scalars(select(MemorySelfReflectionStateModel)))
+        sources = tuple(
+            await session.scalars(
+                select(ChatEventModel)
+                .where(
+                    ChatEventModel.id.in_(
+                        [first.id, *(item.id for item in events if item.id != old.id)]
+                    )
+                )
+                .order_by(ChatEventModel.id)
+            )
+        )
+        conversations = {
+            row.id: row for row in await session.scalars(select(CanonicalConversationModel))
+        }
+        expected = {}
+        for source in sources:
+            conversation = conversations[source.canonical_conversation_id]
+            expected.setdefault((conversation.person_id, conversation.space_id), []).append(source)
+        assert len(states) == len(expected) == 3
+        for state in states:
+            owner_sources = expected[(state.canonical_person_id, state.canonical_space_id)]
+            texts = [
+                row.evidence_content.strip()
+                for row in owner_sources
+                if row.evidence_content.strip()
+            ]
+            assert initial.id <= state.last_event_id < owner_sources[0].id
+            assert state.latest_event_id == owner_sources[-1].id
+            assert state.pending_events == len(texts)
+            assert state.pending_characters == sum(map(len, texts))
+            assert state.pending_since == owner_sources[0].occurred_at
+            assert state.has_yuki_reply == any(row.direction == "outbound" for row in owner_sources)
+            assert not state.has_tool_result
+        assert runtime.last_scanned_event_id == events[-1].id
+        assert runtime.ingress_events_total == sum(
+            bool(row.evidence_content.strip()) for row in sources
+        )
+        assert await session.scalar(select(func.count(ChatEventModel.id))) == len(events) + 2
+        assert (await session.get(InitiativeRunModel, initiative_id)).feedback_sequence == 1
+
+
 @pytest.mark.parametrize("source_kind", ["initiative", "ordinary"])
+@pytest.mark.parametrize("run_state", ["new", "retry"])
 async def test_concurrent_reflection_claims_keep_one_original_run(
-    database, monkeypatch, source_kind
+    database, monkeypatch, source_kind, run_state
 ):
     mutations, _, initial, initiative_id = await seed(database)
     repository = SelfReflectionRepository(database)
@@ -179,6 +309,17 @@ async def test_concurrent_reflection_claims_keep_one_original_run(
             group_id="3001",
         )
         await repository.scan_new_events()
+    original_id = original_fingerprint = checkpoint = None
+    if run_state == "retry":
+        (previous,) = await repository.claim_due(**options)
+        original_id = previous.run_id
+        await repository.fail(original_id, "provider_unavailable")
+        checkpoint = '{"output":{"proposals":[],"episodes":[]}}'
+        async with database.immediate_session() as session:
+            stored = await session.get(MemorySelfReflectionRunModel, original_id)
+            original_fingerprint = stored.input_fingerprint
+            stored.checkpoint_json = checkpoint
+        options["cycle_id"] = "retry-cycle"
     both_prepared = asyncio.Event()
     readers = 0
 
@@ -216,18 +357,173 @@ async def test_concurrent_reflection_claims_keep_one_original_run(
             return_exceptions=True,
         )
     accepted = [batch for result in outcomes if isinstance(result, tuple) for batch in result]
-    rejected = [result for result in outcomes if isinstance(result, OperationalError)]
-    assert len(accepted) == len(rejected) == 1, outcomes
-    assert getattr(rejected[0].orig, "sqlite_errorcode", None) in (5, 517)
+    assert len(accepted) == 1 and sum(result == () for result in outcomes) == 1, outcomes
     original = accepted[0]
     assert await repository.claim_due(**{**options, "cycle_id": "next-cycle"}) == ()
     async with database.sessions() as session:
         stored = tuple(await session.scalars(select(MemorySelfReflectionRunModel)))
     assert len(stored) == 1 and stored[0].id == original.run_id
-    assert stored[0].status == "processing" and stored[0].attempt_count == 1
+    assert stored[0].status == "processing"
+    assert stored[0].attempt_count == (2 if run_state == "retry" else 1)
     assert stored[0].input_fingerprint
+    if run_state == "retry":
+        assert original.run_id == original_id
+        assert stored[0].input_fingerprint == original_fingerprint
+        assert stored[0].checkpoint_json == checkpoint
     assert original.initiative_run_id == (initiative_id if source_kind == "initiative" else None)
     assert bool(original.events) == (source_kind == "ordinary")
+
+
+@pytest.mark.parametrize("run_state", ["new", "retry"])
+async def test_initiative_claim_keeps_original_paid_window_after_unrelated_wal_commit(
+    database, run_state
+):
+    mutations, facts, initial, initiative_id = await seed(database)
+    await record(database, initial, initiative_id, "original", result_excerpt="真实的原始工具来源")
+    await finish(database, initiative_id)
+    repository = SelfReflectionRepository(database)
+    provider = FakeLLMProvider(responder=lambda _: '{"proposals":[],"episodes":[]}')
+    reflection = SelfReflectionService(
+        settings=make_settings(database.url, self_memory_enabled=True),
+        repository=repository,
+        facts=facts,
+        mutations=mutations,
+        models=InjectedModelExecutor(provider),
+        metrics=MemoryLifecycleMetrics(),
+    )
+    checkpoint = fingerprint = None
+    if run_state == "retry":
+        (original,) = await claim(database, "paid-original")
+        assert await reflection.reflect(original) == (0, 0)
+        assert len(provider.requests) == 1
+        checkpoint = await repository.load_checkpoint(original.run_id)
+        async with database.sessions() as session:
+            fingerprint = (
+                await session.get(MemorySelfReflectionRunModel, original.run_id)
+            ).input_fingerprint
+        await repository.fail(original.run_id, "cursor_unacknowledged")
+    await record(
+        database, initial, initiative_id, "late", result_excerpt="迟到的另一条真实工具来源"
+    )
+    async with database.immediate_session() as session:
+        owner = await session.get(CanonicalConversationModel, initial.canonical_conversation_id)
+        owner.generation += 1
+        owner.last_generation_change_event_id = initial.id
+    with unrelated_wal_commit_before_write(database, initiative_id):
+        (batch,) = await claim(database, "wal-receipt", max_characters=1)
+    assert batch.initiative_run_id == initiative_id and batch.events == ()
+    (receipt,) = await repository.tool_receipts(batch)
+    assert receipt.result_excerpt == "真实的原始工具来源"
+    assert batch.first_receipt_id == batch.last_receipt_id == receipt.id
+    async with database.sessions() as session:
+        (stored,) = tuple(await session.scalars(select(MemorySelfReflectionRunModel)))
+        initiative = await session.get(InitiativeRunModel, initiative_id)
+        owner = await session.get(CanonicalConversationModel, initial.canonical_conversation_id)
+        assert stored.id == batch.run_id and stored.status == "processing"
+        assert stored.canonical_person_id is None
+        assert stored.canonical_space_id == initiative.space_id == owner.space_id
+        assert initiative.generation < owner.generation and initiative.feedback_sequence == 1
+        assert stored.attempt_count == (2 if run_state == "retry" else 1)
+        if run_state == "retry":
+            assert stored.id == original.run_id
+            assert stored.input_fingerprint == fingerprint and stored.checkpoint_json == checkpoint
+    assert await reflection.reflect(batch) == (0, 0)
+    assert len(provider.requests) == 1
+    await repository.complete(batch, proposals=0, committed=0)
+    (remaining,) = await claim(database, "late-only")
+    assert remaining.run_id != batch.run_id
+    assert remaining.first_receipt_id > batch.last_receipt_id
+    assert [item.result_excerpt for item in await repository.tool_receipts(remaining)] == [
+        "迟到的另一条真实工具来源"
+    ]
+    async with database.sessions() as session:
+        cursor = await session.get(InitiativeReflectionCursorModel, initiative_id)
+        assert cursor.last_receipt_id == batch.last_receipt_id
+        assert await session.scalar(select(func.count(ChatEventModel.id))) == 1
+
+
+@pytest.mark.parametrize("operation", ["claim", "complete", "recover_interrupted", "recover_stale"])
+async def test_reflection_transition_keeps_original_source_after_unrelated_wal_commit(
+    database, operation
+):
+    mutations, _, initial, initiative_id = await seed(database)
+    repository = SelfReflectionRepository(database)
+    await repository.scan_new_events()
+    first = await _event(
+        mutations._ledger,
+        message_id=str(uuid4()),
+        sender_user_id="1001",
+        content="原批次的完整真实来源",
+        group_id="3001",
+    )
+    await repository.scan_new_events()
+    options = dict(
+        scheduled_slot="wal-transition",
+        local_date="2026-10-12",
+        event_threshold=1,
+        character_threshold=1,
+        max_wait_seconds=0,
+        max_sessions=1,
+        max_daily_calls=96,
+        max_events=1,
+        max_characters=16000,
+        cycle_id="original-cycle",
+    )
+    if operation != "claim":
+        (batch,) = await repository.claim_due(**options)
+        if operation.startswith("recover"):
+            await repository.save_checkpoint(batch.run_id, '{"completed_counts":[0,0]}')
+    tail = await _event(
+        mutations._ledger,
+        message_id=str(uuid4()),
+        sender_user_id="1001",
+        content="原批次之后尚未处理的完整尾部",
+        group_id="3001",
+    )
+    await repository.scan_new_events()
+    with unrelated_wal_commit_before_write(database, initiative_id):
+        if operation == "claim":
+            (batch,) = await repository.claim_due(**options)
+        elif operation == "complete":
+            await repository.complete(batch, proposals=0, committed=0)
+        elif operation == "recover_interrupted":
+            assert await repository.recover_interrupted(batch.run_id, "interrupted") == "completed"
+        else:
+            assert await repository.recover_stale_runs(started_before=datetime.now(UTC)) == 1
+    assert [item.id for item in batch.events] == [first.id]
+    assert batch.events[0].content == first.content
+    async with database.sessions() as session:
+        (run,) = tuple(await session.scalars(select(MemorySelfReflectionRunModel)))
+        state = await session.get(MemorySelfReflectionStateModel, batch.state.id)
+        owner = await session.get(CanonicalConversationModel, first.canonical_conversation_id)
+        runtime = await session.get(MemorySelfReflectionRuntimeModel, 1)
+        assert run.id == batch.run_id and run.attempt_count == 1
+        assert (run.first_event_id, run.last_event_id) == (first.id, first.id)
+        assert (run.canonical_person_id, run.canonical_space_id) == (
+            owner.person_id,
+            owner.space_id,
+        )
+        assert run.cycle_id == "original-cycle" and run.input_fingerprint
+        assert run.proposal_count == run.committed_count == 0
+        assert run.checkpoint_json is None
+        assert run.status == ("processing" if operation == "claim" else "completed")
+        assert state.last_event_id == (initial.id if operation == "claim" else first.id)
+        assert state.latest_event_id == tail.id
+        expected = [first, tail] if operation == "claim" else [tail]
+        assert state.pending_events == len(expected)
+        assert state.pending_characters == sum(len(item.content) for item in expected)
+        assert not state.has_yuki_reply and not state.has_tool_result
+        assert runtime.last_scanned_event_id == tail.id and runtime.ingress_events_total == 2
+        assert (await session.get(InitiativeRunModel, initiative_id)).feedback_sequence == 1
+    if operation != "claim":
+        assert await repository.completed_result(batch.run_id) == (0, 0)
+        await repository.complete(batch, proposals=0, committed=0)
+        assert await repository.recover_interrupted(batch.run_id, "duplicate-recovery") is None
+        assert await repository.recover_stale_runs(started_before=datetime.now(UTC)) == 0
+        (next_batch,) = await repository.claim_due(
+            **{**options, "scheduled_slot": "tail-only", "cycle_id": "tail-cycle"}
+        )
+        assert [item.id for item in next_batch.events] == [tail.id]
 
 
 async def test_visible_self_input_keeps_all_local_facts_and_active_only_expiry(database):
