@@ -1,18 +1,22 @@
 """Bounded metadata expiration and filesystem GC preserve live cache owners."""
 
 import asyncio
+import json
 import threading
+from dataclasses import replace
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from unittest.mock import AsyncMock
 
 import pytest
-from sqlalchemy import event, insert, select
+from sqlalchemy import event, insert, select, update
 
 from qq_ai_bot.conversation import media_service
-from qq_ai_bot.conversation.media_service import ConversationMediaService
+from qq_ai_bot.conversation.canonical_db_models import CanonicalConversationModel
+from qq_ai_bot.conversation.media_service import ConversationMediaError, ConversationMediaService
 from qq_ai_bot.domain.conversations import ScopeType
-from qq_ai_bot.persistence.models import ConversationMediaItemModel
+from qq_ai_bot.domain.messages import ChatImage
+from qq_ai_bot.persistence.models import ChatEventModel, ConversationMediaItemModel
 from qq_ai_bot.persistence.repositories import EventLedgerRepository
 from qq_ai_bot.services.image_preprocessor import ImagePreprocessor
 
@@ -164,3 +168,89 @@ async def test_blocked_gc_filesystem_keeps_event_loop_responsive_and_publish_loc
         release.set()
         await asyncio.gather(cleanup, return_exceptions=True)
         await service.close()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("change", ["generation", "hash", "expiry", "keeper"])
+async def test_selected_media_batches_frames_and_rechecks_real_sources(
+    database, tmp_path, monkeypatch, change
+):
+    service, source, _directory = await _cache(database, tmp_path, 3)
+    expires = datetime.now(UTC) + timedelta(hours=24)
+    digest = "a" * 64
+    segments = json.dumps([{"type": "image", "data": {"file": str(i)}} for i in range(3)])
+    async with database.immediate_session() as writer:
+        await writer.execute(
+            update(ChatEventModel)
+            .where(ChatEventModel.id == source.id)
+            .values(segments_json=segments, content="unused body" * 10000)
+        )
+        await writer.execute(
+            update(ConversationMediaItemModel)
+            .where(ConversationMediaItemModel.source_event_id == source.id)
+            .values(expires_at=expires, content_sha256=digest)
+        )
+    images = tuple(
+        ChatImage(
+            "data:image/png;base64,eA==",
+            source="history",
+            conversation_id=source.canonical_conversation_id,
+            generation=1,
+            source_event_id=source.id,
+            attachment_index=index,
+            content_hash=digest,
+            expires_at=expires.isoformat(),
+        )
+        for index in range(3)
+    )
+    parse = json.loads
+    parses = 0
+    sql = []
+
+    def count_parse(value, *args, **kwargs):
+        nonlocal parses
+        parses += int(value == segments)
+        return parse(value, *args, **kwargs)
+
+    def capture(_connection, _cursor, statement, *_args):
+        sql.append(statement)
+
+    monkeypatch.setattr(media_service.json, "loads", count_parse)
+    event.listen(database.engine.sync_engine, "before_cursor_execute", capture)
+    try:
+        await service.validate_images((*images, replace(images[0], video_timestamp_seconds=1.0)))
+    finally:
+        event.remove(database.engine.sync_engine, "before_cursor_execute", capture)
+    assert parses == 1
+    assert not any("chat_events.content" in statement for statement in sql)
+    with pytest.raises(ConversationMediaError, match="attachment_scope_denied"):
+        await service.validate_images((replace(images[0], conversation_id="other"),))
+    async with database.immediate_session() as writer:
+        if change == "generation":
+            await writer.execute(
+                update(CanonicalConversationModel)
+                .where(CanonicalConversationModel.id == source.canonical_conversation_id)
+                .values(generation=2)
+            )
+        elif change == "keeper":
+            await writer.execute(
+                update(ChatEventModel)
+                .where(ChatEventModel.id == source.id)
+                .values(suppression_status="duplicate", utterance_fingerprint="d" * 64)
+            )
+        else:
+            await writer.execute(
+                update(ConversationMediaItemModel)
+                .where(ConversationMediaItemModel.source_event_id == source.id)
+                .values(
+                    **(
+                        {"content_sha256": "b" * 64}
+                        if change == "hash"
+                        else {"expires_at": datetime.now(UTC) - timedelta(seconds=1)}
+                    )
+                )
+            )
+    with pytest.raises(ConversationMediaError):
+        await service.validate_images(images)
+    service.resolver.resolve.assert_not_awaited()
+    await service.close()

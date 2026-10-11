@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import logging
 import time
 
@@ -84,30 +85,27 @@ class MemoryEmbeddingWorker:
             return 0
         facts = await self._jobs.load_active_facts(jobs)
         valid_jobs = []
+        skipped = []
+        changed_fact_ids = []
         texts = []
         for job in jobs:
             fact = facts.get(job.fact_id)
             if fact is None:
-                await self._jobs.skip(job)
+                skipped.append(job)
                 continue
-            current_hash = self._jobs.documents.content_hash_fields(
+            text = self._jobs.documents.build_fields(
                 kind=fact.kind,
                 category=fact.category,
                 memory_key=fact.memory_key,
                 content=fact.content,
             )
-            if current_hash != job.content_hash:
-                await self._jobs.enqueue_fact(job.fact_id, force=True)
+            if hashlib.sha256(text.encode("utf-8")).hexdigest() != job.content_hash:
+                changed_fact_ids.append(job.fact_id)
                 continue
             valid_jobs.append(job)
-            texts.append(
-                self._jobs.documents.build_fields(
-                    kind=fact.kind,
-                    category=fact.category,
-                    memory_key=fact.memory_key,
-                    content=fact.content,
-                )
-            )
+            texts.append(text)
+        await self._jobs.skip_many(tuple(skipped))
+        await self._jobs.enqueue_facts(tuple(changed_fact_ids), force=True)
         if not valid_jobs:
             return 0
         started = time.perf_counter()
@@ -139,20 +137,18 @@ class MemoryEmbeddingWorker:
         except asyncio.CancelledError:
             raise
         except EmbeddingProviderError as exc:
-            for job in valid_jobs:
-                await self._jobs.fail(
-                    job,
-                    error_category=exc.code,
-                    retryable=exc.retryable,
-                    initial_delay_seconds=self._retry_initial_seconds,
-                )
+            await self._jobs.fail_many(
+                tuple(valid_jobs),
+                error_category=exc.code,
+                retryable=exc.retryable,
+                initial_delay_seconds=self._retry_initial_seconds,
+            )
             return 0
         except ValueError:
-            for job in valid_jobs:
-                await self._jobs.fail(
-                    job,
-                    error_category="embedding_invalid_response",
-                    retryable=False,
-                    initial_delay_seconds=self._retry_initial_seconds,
-                )
+            await self._jobs.fail_many(
+                tuple(valid_jobs),
+                error_category="embedding_invalid_response",
+                retryable=False,
+                initial_delay_seconds=self._retry_initial_seconds,
+            )
             return 0

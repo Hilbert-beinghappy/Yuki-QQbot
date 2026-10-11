@@ -9,10 +9,11 @@ from collections.abc import Sequence
 from datetime import UTC, datetime, timedelta
 from typing import Any, cast
 
-from sqlalchemy import and_, func, or_, select, update
+from sqlalchemy import and_, func, or_, select, text, update
 from sqlalchemy.dialects.sqlite import insert
 from sqlalchemy.engine import CursorResult
 from sqlalchemy.ext.asyncio import AsyncSession
+from sqlalchemy.orm import load_only
 from sqlalchemy.sql.elements import ColumnElement
 
 from qq_ai_bot.conversation.canonical_db_models import CanonicalConversationModel
@@ -26,6 +27,7 @@ from qq_ai_bot.memory.projections import (
     project_active_person_external_id,
     project_active_space_external_id,
 )
+from qq_ai_bot.memory.self_reflection.db_models import InitiativeReflectionWindowModel
 from qq_ai_bot.memory.self_reflection.models import (
     SelfReflectionBatch,
     SelfReflectionState,
@@ -195,7 +197,15 @@ class SelfReflectionRepository:
         gaps = list(
             (
                 await session.scalars(
-                    select(MemorySelfReflectionRunModel).where(
+                    select(MemorySelfReflectionRunModel)
+                    .options(
+                        load_only(
+                            MemorySelfReflectionRunModel.first_event_id,
+                            MemorySelfReflectionRunModel.last_event_id,
+                            MemorySelfReflectionRunModel.status,
+                        )
+                    )
+                    .where(
                         MemorySelfReflectionRunModel.conversation_key_hash
                         == state.conversation_key_hash,
                         MemorySelfReflectionRunModel.last_event_id > state.last_event_id,
@@ -215,7 +225,17 @@ class SelfReflectionRepository:
         if unfinished:
             processed_last_event_id = min(processed_last_event_id, min(unfinished) - 1)
         remaining_query = self._apply_event_scope(
-            select(ChatEventModel).where(
+            select(ChatEventModel)
+            .options(
+                load_only(
+                    ChatEventModel.content,
+                    ChatEventModel.audio_transcript,
+                    ChatEventModel.occurred_at,
+                    ChatEventModel.direction,
+                    ChatEventModel.author_kind,
+                )
+            )
+            .where(
                 ChatEventModel.id > processed_last_event_id,
                 ChatEventModel.id <= state.latest_event_id,
                 ChatEventModel.event_kind == "message",
@@ -230,10 +250,22 @@ class SelfReflectionRepository:
                         ChatEventModel.id > completed_run.last_event_id,
                     )
                 )
-        remaining = list(
-            (await session.scalars(remaining_query.order_by(ChatEventModel.id.asc()))).all()
+        remaining = await session.stream_scalars(
+            remaining_query.order_by(ChatEventModel.id.asc()).execution_options(yield_per=100)
         )
-        nonempty = [item for item in remaining if item.evidence_content.strip()]
+        pending_events = pending_characters = 0
+        pending_since = None
+        has_yuki_reply = False
+        async for item in remaining:
+            content = item.evidence_content
+            if content.strip():
+                pending_events += 1
+                pending_characters += len(content)
+                if pending_since is None:
+                    pending_since = item.occurred_at
+            has_yuki_reply = has_yuki_reply or (
+                item.direction == "outbound" and event_author_is_yuki(author_kind=item.author_kind)
+            )
         receipt_filter = self._owner_receipt_filter(
             state.canonical_person_id, state.canonical_space_id
         )
@@ -248,13 +280,10 @@ class SelfReflectionRepository:
             )
         )
         state.last_event_id = processed_last_event_id
-        state.pending_events = len(nonempty)
-        state.pending_characters = sum(len(item.evidence_content) for item in nonempty)
-        state.pending_since = nonempty[0].occurred_at if nonempty else None
-        state.has_yuki_reply = any(
-            item.direction == "outbound" and event_author_is_yuki(author_kind=item.author_kind)
-            for item in remaining
-        )
+        state.pending_events = pending_events
+        state.pending_characters = pending_characters
+        state.pending_since = pending_since
+        state.has_yuki_reply = has_yuki_reply
         state.has_tool_result = has_tool
         state.high_value_signal = False
         state.updated_at = now
@@ -265,29 +294,10 @@ class SelfReflectionRepository:
         state: MemorySelfReflectionStateModel,
         *,
         now: datetime,
+        conversation: CanonicalConversationModel | None,
     ) -> None:
         """Discard the no-longer-live prefix left behind by an explicit conversation reset."""
 
-        person_id, space_id = require_xor_memory_owner(
-            state.canonical_person_id,
-            state.canonical_space_id,
-        )
-        owner_filter = (
-            and_(
-                CanonicalConversationModel.kind == "space",
-                CanonicalConversationModel.space_id == space_id,
-                CanonicalConversationModel.person_id.is_(None),
-            )
-            if space_id
-            else and_(
-                CanonicalConversationModel.kind == "private",
-                CanonicalConversationModel.person_id == person_id,
-                CanonicalConversationModel.space_id.is_(None),
-            )
-        )
-        conversation = await session.scalar(
-            select(CanonicalConversationModel).where(owner_filter).limit(1)
-        )
         if conversation is None:
             return
         live_boundary = max(
@@ -322,6 +332,7 @@ class SelfReflectionRepository:
         now = datetime.now(UTC)
         async with self._database.sessions() as session, session.begin():
             session.autoflush = False
+            await session.execute(text("BEGIN"))
             runtime = await session.get(MemorySelfReflectionRuntimeModel, 1)
             if runtime is None:
                 maximum = int(await session.scalar(select(func.max(ChatEventModel.id))) or 0)
@@ -345,8 +356,6 @@ class SelfReflectionRepository:
                     .limit(max(1, limit))
                 )
             ).all()
-            from qq_ai_bot.identity.memory_guard import refuse_legacy_live_event
-
             live_ids: set[int] = set()
             if rows:
                 live_ids = set(
@@ -357,16 +366,52 @@ class SelfReflectionRepository:
                         )
                     )
                 )
-            staged_states: dict[str, MemorySelfReflectionStateModel] = {}
+            conversation_ids = {row.canonical_conversation_id for row in rows}
+            conversations = (
+                {
+                    conversation.id: conversation
+                    for conversation in await session.scalars(
+                        select(CanonicalConversationModel).where(
+                            CanonicalConversationModel.id.in_(conversation_ids)
+                        )
+                    )
+                }
+                if conversation_ids
+                else {}
+            )
+            person_ids = {c.person_id for c in conversations.values() if c.person_id}
+            space_ids = {c.space_id for c in conversations.values() if c.space_id}
+            staged_states = (
+                {
+                    hashlib.sha256(
+                        format_canonical_memory_partition(
+                            person_id=state.canonical_person_id,
+                            space_id=state.canonical_space_id,
+                        ).encode("utf-8")
+                    ).hexdigest(): state
+                    for state in await session.scalars(
+                        select(MemorySelfReflectionStateModel).where(
+                            self._xor_owner_state_clause(),
+                            or_(
+                                MemorySelfReflectionStateModel.canonical_person_id.in_(person_ids),
+                                MemorySelfReflectionStateModel.canonical_space_id.in_(space_ids),
+                            ),
+                        )
+                    )
+                }
+                if person_ids or space_ids
+                else {}
+            )
             for row in rows:
                 if row.id not in live_ids:
                     continue
-                if await refuse_legacy_live_event(session, row):
-                    continue
-                conversation = await session.get(
-                    CanonicalConversationModel, row.canonical_conversation_id
-                )
-                if conversation is None:
+                conversation = conversations.get(row.canonical_conversation_id)
+                if (
+                    not row.canonical_event_id
+                    or conversation is None
+                    or row.id <= conversation.starts_after_event_id
+                    or row.id <= conversation.last_generation_change_event_id
+                ):
                     continue
                 owners = self._owner_ids_from_live_conversation(
                     conversation, event_scope_type=row.scope_type
@@ -379,12 +424,7 @@ class SelfReflectionRepository:
                         person_id=person_id, space_id=space_id
                     ).encode("utf-8")
                 ).hexdigest()
-                state = await session.scalar(
-                    select(MemorySelfReflectionStateModel).where(
-                        self._owner_state_filter(person_id, space_id)
-                    )
-                )
-                state = staged_states.get(key_hash, state)
+                state = staged_states.get(key_hash)
                 content = row.evidence_content.strip()
                 if state is None:
                     state = MemorySelfReflectionStateModel(
@@ -459,6 +499,7 @@ class SelfReflectionRepository:
         now = datetime.now(UTC)
         async with self._database.sessions() as session, session.begin():
             session.autoflush = False
+            await session.execute(text("BEGIN"))
             used = 0
             available = min(1, max_sessions, max(0, max_daily_calls - used))
             if available <= 0:
@@ -489,9 +530,72 @@ class SelfReflectionRepository:
                     )
                 )
             ).all()
+            state = MemorySelfReflectionStateModel
+            run = MemorySelfReflectionRunModel
+            conversation = CanonicalConversationModel
+            selected_states = state_query.with_only_columns(state.id)
+            owner_scope = or_(
+                and_(
+                    conversation.kind == "space",
+                    conversation.space_id == state.canonical_space_id,
+                    conversation.person_id.is_(None),
+                    state.canonical_person_id.is_(None),
+                ),
+                and_(
+                    conversation.kind == "private",
+                    conversation.person_id == state.canonical_person_id,
+                    conversation.space_id.is_(None),
+                    state.canonical_space_id.is_(None),
+                ),
+            )
+            conversations = {
+                (c.person_id, c.space_id): c
+                for c in await session.scalars(
+                    select(conversation)
+                    .join(state, owner_scope)
+                    .where(state.id.in_(selected_states))
+                )
+            }
+            live_run_source = (
+                select(ChatEventModel.id)
+                .join(conversation, ChatEventModel.canonical_conversation_id == conversation.id)
+                .where(
+                    owner_scope,
+                    ChatEventModel.id >= run.first_event_id,
+                    ChatEventModel.id <= run.last_event_id,
+                    ChatEventModel.event_kind == "message",
+                    ChatEventModel.canonical_event_id.is_not(None),
+                    ChatEventModel.id > conversation.starts_after_event_id,
+                    ChatEventModel.id > conversation.last_generation_change_event_id,
+                    keeper_event_clause(),
+                )
+                .correlate(state, run)
+                .exists()
+            )
+            runs_by_scope: dict[str, list[MemorySelfReflectionRunModel]] = {}
+            for outstanding_run in await session.scalars(
+                select(run)
+                .join(state, run.conversation_key_hash == state.conversation_key_hash)
+                .where(
+                    state.id.in_(selected_states),
+                    run.last_event_id > state.last_event_id,
+                    live_run_source,
+                )
+                .order_by(run.first_event_id)
+            ):
+                runs_by_scope.setdefault(outstanding_run.conversation_key_hash, []).append(
+                    outstanding_run
+                )
             claimed: list[SelfReflectionBatch] = []
             for row in states:
-                await self._reconcile_generation_boundary(session, row, now=now)
+                await self._reconcile_generation_boundary(
+                    session,
+                    row,
+                    now=now,
+                    conversation=conversations.get(
+                        (row.canonical_person_id, row.canonical_space_id)
+                    ),
+                )
                 if row.pending_events <= 0:
                     continue
                 receipt_filter = self._owner_receipt_filter(
@@ -506,29 +610,11 @@ class SelfReflectionRepository:
                         )
                     )
                 )
-                outstanding = list(
-                    (
-                        await session.scalars(
-                            select(MemorySelfReflectionRunModel)
-                            .where(
-                                MemorySelfReflectionRunModel.conversation_key_hash
-                                == row.conversation_key_hash,
-                                MemorySelfReflectionRunModel.last_event_id > row.last_event_id,
-                                self._apply_event_scope(
-                                    select(ChatEventModel.id).where(
-                                        ChatEventModel.id
-                                        >= MemorySelfReflectionRunModel.first_event_id,
-                                        ChatEventModel.id
-                                        <= MemorySelfReflectionRunModel.last_event_id,
-                                        ChatEventModel.event_kind == "message",
-                                    ),
-                                    row,
-                                ).exists(),
-                            )
-                            .order_by(MemorySelfReflectionRunModel.first_event_id)
-                        )
-                    ).all()
-                )
+                outstanding = [
+                    owned
+                    for owned in runs_by_scope.get(row.conversation_key_hash, ())
+                    if owned.last_event_id > row.last_event_id
+                ]
                 retry = next(
                     (
                         r
@@ -654,6 +740,8 @@ class SelfReflectionRepository:
                     retry.error_category = "source_changed"
                     continue
                 input_characters = sum(len(item.evidence_content) for item in event_rows)
+                selected_events = tuple(_event_record(item) for item in event_rows)
+                selected_context = tuple(_event_record(item) for item in context_rows)
                 run_values = {
                     "conversation_key_hash": row.conversation_key_hash,
                     "bot_user_id": row.bot_user_id,
@@ -702,8 +790,8 @@ class SelfReflectionRepository:
                 claimed.append(
                     SelfReflectionBatch(
                         state=projected_state,
-                        events=tuple(_event_record(item) for item in event_rows),
-                        context_events=tuple(_event_record(item) for item in context_rows),
+                        events=selected_events,
+                        context_events=selected_context,
                         trigger_reason=reason,
                         scheduled_slot=scheduled_slot,
                         run_id=run_id,
@@ -839,6 +927,7 @@ class SelfReflectionRepository:
         now = datetime.now(UTC)
         async with self._database.sessions() as session, session.begin():
             session.autoflush = False
+            await session.execute(text("BEGIN"))
             run = await session.get(MemorySelfReflectionRunModel, batch.run_id)
             if run is None or run.status != "processing":
                 return
@@ -875,15 +964,21 @@ class SelfReflectionRepository:
 
         async with self._database.sessions() as session, session.begin():
             session.autoflush = False
+            await session.execute(text("BEGIN"))
             run = await session.get(MemorySelfReflectionRunModel, run_id)
             if run is None or run.status != "processing":
                 return None
-            return await self._recover_processing_run(
+            status, window = await self._recover_processing_run(
                 session,
                 run,
                 error_category=error_category,
                 now=datetime.now(UTC),
             )
+            if window is not None:
+                from qq_ai_bot.memory.self_reflection.initiative import advance_cursor
+
+                await advance_cursor(session, window)
+            return status
 
     async def recover_stale_runs(self, *, started_before: datetime) -> int:
         """Recover abandoned processing rows left by a crash or hard process stop."""
@@ -891,6 +986,7 @@ class SelfReflectionRepository:
         now = datetime.now(UTC)
         async with self._database.sessions() as session, session.begin():
             session.autoflush = False
+            await session.execute(text("BEGIN"))
             rows = (
                 await session.scalars(
                     select(MemorySelfReflectionRunModel).where(
@@ -899,13 +995,20 @@ class SelfReflectionRepository:
                     )
                 )
             ).all()
+            cursor_updates = []
             for run in rows:
-                await self._recover_processing_run(
+                _, window = await self._recover_processing_run(
                     session,
                     run,
                     error_category="stale_processing",
                     now=now,
                 )
+                if window is not None:
+                    cursor_updates.append(window)
+            from qq_ai_bot.memory.self_reflection.initiative import advance_cursor
+
+            for window in cursor_updates:
+                await advance_cursor(session, window)
             return len(rows)
 
     async def completed_result(self, run_id: int) -> tuple[int, int] | None:
@@ -931,7 +1034,7 @@ class SelfReflectionRepository:
         *,
         error_category: str,
         now: datetime,
-    ) -> str:
+    ) -> tuple[str, InitiativeReflectionWindowModel | None]:
         """Use atomic result mappings as the commit checkpoint for recovery."""
 
         committed = int(
@@ -946,12 +1049,8 @@ class SelfReflectionRepository:
             json.loads(run.checkpoint_json).get("completed_counts") if run.checkpoint_json else None
         )
         if completed_counts is not None or (committed and run.checkpoint_json is None):
-            from qq_ai_bot.memory.self_reflection.db_models import InitiativeReflectionWindowModel
-            from qq_ai_bot.memory.self_reflection.initiative import advance_cursor
-
             window = await session.get(InitiativeReflectionWindowModel, run.id)
             if window is not None:
-                await advance_cursor(session, window)
                 run.status = "completed"
                 run.proposal_count = max(
                     int(run.proposal_count),
@@ -963,7 +1062,7 @@ class SelfReflectionRepository:
                 run.checkpoint_json = None
                 run.retry_state = None
                 run.completed_at = now
-                return "completed"
+                return "completed", window
             state = await session.scalar(
                 select(MemorySelfReflectionStateModel).where(
                     self._owner_state_filter(run.canonical_person_id, run.canonical_space_id)
@@ -973,7 +1072,7 @@ class SelfReflectionRepository:
                 run.status = "failed"
                 run.error_category = "recovery_state_missing"
                 run.completed_at = now
-                return "failed"
+                return "failed", None
             run.status = "completed"
             await self._advance_state(
                 session,
@@ -990,7 +1089,7 @@ class SelfReflectionRepository:
             run.checkpoint_json = None
             run.retry_state = None
             run.completed_at = now
-            return "completed"
+            return "completed", None
         run.committed_count = max(int(run.committed_count), committed)
         if run.checkpoint_json:
             output = json.loads(run.checkpoint_json).get("output", {})
@@ -1003,7 +1102,7 @@ class SelfReflectionRepository:
             run.attempt_count = max(0, run.attempt_count - 1)
         run.retry_state = "waiting"
         run.next_attempt_at = now
-        return "failed"
+        return "failed", None
 
     async def fail(self, run_id: int, error_category: str) -> None:
         async with self._database.sessions() as session, session.begin():

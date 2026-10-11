@@ -8,7 +8,7 @@ from datetime import UTC, datetime, timedelta
 from typing import Any
 from zoneinfo import ZoneInfo
 
-from sqlalchemy import func, literal, select, update
+from sqlalchemy import func, literal, select, text, update
 from sqlalchemy.dialects.sqlite import insert
 from sqlalchemy.orm import load_only
 
@@ -104,6 +104,7 @@ class ReflectionControlRepository:
 
         initiative_tools = await initiative_backlog(self.database)
         async with self.database.sessions() as session:
+            await session.execute(text("BEGIN"))
             states = (await session.scalars(select(State).where(State.pending_events > 0))).all()
             runs = (
                 await session.scalars(
@@ -118,7 +119,12 @@ class ReflectionControlRepository:
                             Run.processed_events,
                         )
                     )
-                    .where(Run.status != "completed")
+                    .where(
+                        Run.status != "completed",
+                        Run.conversation_key_hash.in_(
+                            select(State.conversation_key_hash).where(State.pending_events > 0)
+                        ),
+                    )
                 )
             ).all()
             calls = int(
@@ -151,14 +157,13 @@ class ReflectionControlRepository:
                     ).group_by(Request.attempt_kind, Request.status)
                 )
             ).all()
-            recent_cycles = (
-                await session.scalars(
-                    select(Cycle)
-                    .options(load_only(Cycle.created_at, Cycle.report_json))
-                    .where(Cycle.completed_at >= now - timedelta(hours=24))
-                    .order_by(Cycle.created_at.asc())
-                )
-            ).all()
+            baseline = await session.scalar(
+                select(Cycle)
+                .options(load_only(Cycle.created_at, Cycle.report_json))
+                .where(Cycle.completed_at >= now - timedelta(hours=24))
+                .order_by(Cycle.created_at.asc())
+                .limit(1)
+            )
             delivery_metrics = (
                 await session.execute(
                     select(Cycle.delivery_state, func.count(Cycle.id))
@@ -168,12 +173,14 @@ class ReflectionControlRepository:
             ).all()
         oldest = 0.0
         scopes: list[dict[str, Any]] = []
+        runs_by_scope: dict[str, list[Run]] = {}
+        for run in runs:
+            runs_by_scope.setdefault(run.conversation_key_hash, []).append(run)
         for state in states:
             own = [
                 r
-                for r in runs
-                if r.conversation_key_hash == state.conversation_key_hash
-                and r.last_event_id > state.last_event_id
+                for r in runs_by_scope.get(state.conversation_key_hash, ())
+                if r.last_event_id > state.last_event_id
             ]
             counts = {name: 0 for name in groups}
             for r in own:
@@ -215,8 +222,7 @@ class ReflectionControlRepository:
                 )
         rate_window = 0.0
         ingress_rate = drain_rate = None
-        if recent_cycles:
-            baseline = recent_cycles[0]
+        if baseline is not None:
             rate_window = max(0.0, (now - utc(baseline.created_at)).total_seconds())
             before = json.loads(baseline.report_json).get("before", {})
             if rate_window >= 60:

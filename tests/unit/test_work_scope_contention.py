@@ -170,3 +170,133 @@ async def test_renew_does_not_extend_lease_that_expired_after_read(database, tmp
     assert await repository.renew(lease) is False
     async with database.sessions() as reader:
         assert await reader.scalar(select(scope.c.lease_until)) == 0
+
+
+async def test_busy_scope_with_many_qualified_work_does_not_hide_independent_scope(
+    database, tmp_path
+):
+    import json
+    import time
+
+    from qq_ai_bot.conversation.rollup.models import RollupPolicyConfig
+    from qq_ai_bot.domain.conversations import ConversationScope
+    from qq_ai_bot.persistence.models import ChatEventModel
+    from qq_ai_bot.persistence.scoped_event_uow import ScopedEventLedgerUnitOfWork
+    from qq_ai_bot.runtime.work_control import WorkControl
+    from qq_ai_bot.runtime.work_scheduler import WorkScheduler
+    from qq_ai_bot.runtime.work_schema_v1 import work
+
+    env = await social_env(database, tmp_path)
+    ledger = ScopedEventLedgerUnitOfWork(database, config=RollupPolicyConfig())
+    await ledger.append(
+        scope=ConversationScope.private("80001", "10001"),
+        platform_message_id="independent-private-source",
+        sender_user_id="10001",
+        direction="inbound",
+        content="Continue the independent private work.",
+    )
+    async with database.sessions() as reader:
+        events = (await reader.scalars(select(ChatEventModel))).all()
+    private_event = next(row for row in events if row.scope_type == "private")
+    group_event = next(row for row in events if row.scope_type == "group")
+    repository = WorkRepository(database)
+
+    async def accept_for(event, key, goal):
+        lease = await repository.acquire(event.canonical_conversation_id, 1)
+        assert lease is not None
+        try:
+            return await repository.accept(
+                lease,
+                source_key=key,
+                source={
+                    "origin": "user_message",
+                    "principal_kind": "person",
+                    "actor_person_id": env.person,
+                    "actor_user_id": "10001",
+                    "presence_id": env.presence,
+                    "trigger_event_id": event.id,
+                },
+                goal=goal,
+                initial_state="queued",
+            )
+        finally:
+            await repository.release(lease)
+
+    group_work = [
+        await accept_for(group_event, f"qualified-group:{index}", f"original group work {index}")
+        for index in range(10)
+    ]
+    full_goal = "接纳独立 scope 的原目标，保留完整材料。" * 1000
+    independent = await accept_for(private_event, "independent-private-work", full_goal)
+    async with database.immediate_session() as writer:
+        await writer.execute(
+            update(work).where(work.c.id.in_([row["id"] for row in group_work])).values(updated=0)
+        )
+        await writer.execute(update(work).where(work.c.id == independent["id"]).values(updated=1))
+    busy_entered, independent_finished, release_busy = (
+        asyncio.Event(),
+        asyncio.Event(),
+        asyncio.Event(),
+    )
+    active = {}
+
+    async def resume(item):
+        is_group = item["conversation_id"] == group_event.canonical_conversation_id
+        if not is_group:
+            await asyncio.wait_for(busy_entered.wait(), timeout=10)
+        lease = await repository.acquire(item["conversation_id"], item["generation"])
+        assert lease is not None
+        try:
+            current = await repository.transition(
+                lease, item["id"], item["revision"], "running"
+            )
+            assert current["goal"] == item["goal"]
+
+            async def validate():
+                assert await repository.valid(lease)
+
+            control = WorkControl(
+                repository,
+                lease,
+                item["source_key"],
+                json.loads(item["source_json"]),
+                validate,
+                current=current,
+            )
+            if is_group:
+                active["lease"], active["work_id"] = lease, item["id"]
+                busy_entered.set()
+                await asyncio.wait_for(release_busy.wait(), timeout=10)
+            else:
+                assert await repository.valid(active["lease"])
+            result = json.loads(
+                await control.execute(
+                    "task_control",
+                    {"action": "complete", "result": "original scope lease admitted"},
+                    f"scope-admitted:{item['id']}",
+                )
+            )
+            assert result["ok"]
+            await control.settle(pending_inputs=False)
+            if not is_group:
+                independent_finished.set()
+            return None
+        finally:
+            await repository.release(lease)
+
+    scheduler = WorkScheduler(repository, resume, chat_admission_enabled=True)
+    scheduler._last_reclaim = time.monotonic()
+    tasks = await scheduler.dispatch_once()
+    try:
+        await asyncio.wait_for(independent_finished.wait(), timeout=10)
+        assert await repository.valid(active["lease"])
+        assert (await repository.get(active["work_id"]))["state"] == "running"
+        saved = await repository.get(independent["id"])
+        assert saved["state"] == "completed" and saved["goal"] == full_goal
+        assert saved["source_json"] == independent["source_json"]
+        assert (
+            json.loads(saved["checkpoint_json"])["sync_result"] == "original scope lease admitted"
+        )
+    finally:
+        release_busy.set()
+        await asyncio.gather(*tasks)

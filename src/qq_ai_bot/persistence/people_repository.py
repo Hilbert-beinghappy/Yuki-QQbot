@@ -5,9 +5,11 @@ from __future__ import annotations
 import json
 import re
 import unicodedata
+from collections.abc import Mapping
 from dataclasses import dataclass, replace
 from datetime import UTC, datetime
 from difflib import SequenceMatcher
+from heapq import nsmallest
 
 from sqlalchemy import String, case, cast, delete, func, or_, select, text, update
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -32,7 +34,7 @@ from qq_ai_bot.identity.canonical_repository import (
     forget_person_for_external_account,
     trip,
 )
-from qq_ai_bot.identity.db_models import PresenceModel
+from qq_ai_bot.identity.db_models import IdentityBindingModel, PresenceModel
 from qq_ai_bot.identity.errors import CanonicalIdentityError
 from qq_ai_bot.identity.person_state import (
     load_canonical_aliases,
@@ -43,6 +45,7 @@ from qq_ai_bot.identity.person_state import (
     load_canonical_membership_count,
     load_canonical_person_enabled,
     load_canonical_profile,
+    load_canonical_profiles,
     observe_canonical_person,
     observe_canonical_space,
     set_canonical_person_enabled,
@@ -170,24 +173,31 @@ def _score_group_member_identities(
     minimum_score: float,
 ) -> tuple[GroupMemberNameMatch, ...]:
     matches: list[GroupMemberNameMatch] = []
+    normalized_labels: dict[str, str] = {}
+    scores: dict[str, float] = {}
     for user_id, (nickname, group_card, aliases) in identities.items():
         labels = tuple(dict.fromkeys((group_card, nickname, *sorted(aliases))))
         best_alias = ""
         best_score = 0.0
         best_exact = False
         for label in labels:
-            candidate = normalize_person_name(label)
+            if label not in normalized_labels:
+                normalized_labels[label] = normalize_person_name(label)
+            candidate = normalized_labels[label]
             if not candidate:
                 continue
             exact = candidate == query
-            if exact:
-                score = 1.0
-            elif query in candidate or candidate in query:
-                score = 0.75 + 0.25 * (
-                    min(len(query), len(candidate)) / max(len(query), len(candidate))
-                )
-            else:
-                score = SequenceMatcher(None, query, candidate).ratio()
+            if candidate not in scores:
+                if exact:
+                    score = 1.0
+                elif query in candidate or candidate in query:
+                    score = 0.75 + 0.25 * (
+                        min(len(query), len(candidate)) / max(len(query), len(candidate))
+                    )
+                else:
+                    score = SequenceMatcher(None, query, candidate).ratio()
+                scores[candidate] = score
+            score = scores[candidate]
             if score > best_score or (
                 score == best_score and label.casefold() < best_alias.casefold()
             ):
@@ -205,14 +215,17 @@ def _score_group_member_identities(
                     exact=best_exact,
                 )
             )
-    matches.sort(
-        key=lambda item: (
-            -item.score,
-            item.display_name.casefold(),
-            item.user_id,
+    return tuple(
+        nsmallest(
+            limit,
+            matches,
+            key=lambda item: (
+                -item.score,
+                item.display_name.casefold(),
+                item.user_id,
+            ),
         )
     )
-    return tuple(matches[: min(limit, 5)])
 
 
 async def _observe_role(
@@ -220,18 +233,20 @@ async def _observe_role(
     user_id: str,
     *,
     is_bot: bool,
-) -> AccountRole:
+    binding: IdentityBindingModel | None = None,
+) -> tuple[AccountRole, IdentityBindingModel | None]:
     settings = identity_write_settings()
     if is_bot or user_id in settings.ignored_bot_users:
-        return "external_bot"
+        return "external_bot", None
     external = external_id(user_id)
     if external in settings.ignored_bot_users:
-        return "external_bot"
+        return "external_bot", None
     presence = await find_presence(session, external)
-    binding = await find_identity_binding(session, external)
+    if binding is None:
+        binding = await find_identity_binding(session, external)
     if presence is not None and binding is None:
-        return "yuki_self"
-    return "human"
+        return "yuki_self", None
+    return "human", binding
 
 
 async def _canonical_conversation_for_privacy_scope(
@@ -324,26 +339,41 @@ class PeopleRepository:
 
         now = datetime.now(UTC)
         async with self._database.immediate_session() as session:
+            current_binding = None
             if expected_person_id is not None:
                 current_binding = await find_identity_binding(session, external_id(user_id))
                 if current_binding is None or current_binding.person_id != expected_person_id:
                     raise CanonicalIdentityError("canonical_owner_mismatch")
+            role, current_binding = await _observe_role(
+                session, user_id, is_bot=is_bot, binding=current_binding
+            )
+            if role != "human":
+                return
+            if current_binding is None:
+                raise CanonicalIdentityError("unclassified")
             await observe_canonical_person(
                 session,
-                user_id=user_id,
+                binding=current_binding,
                 nickname=nickname if nickname_known else "",
                 group_id=group_id,
                 group_card=group_card,
                 group_name=group_name,
                 nickname_known=nickname_known,
                 group_card_known=group_card_known,
-                role=await _observe_role(session, user_id, is_bot=is_bot),
                 now=now,
             )
 
-    async def get(self, *, user_id: str, group_id: str | None = None) -> UserProfileSnapshot | None:
+    async def get(
+        self,
+        *,
+        user_id: str,
+        group_id: str | None = None,
+        include_nickname: bool = True,
+    ) -> UserProfileSnapshot | None:
         async with self._database.sessions() as session:
-            loaded = await load_canonical_profile(session, user_id=user_id, group_id=group_id)
+            loaded = await load_canonical_profile(
+                session, user_id=user_id, group_id=group_id, include_nickname=include_nickname
+            )
             if loaded is None:
                 return None
             nickname, card = loaded
@@ -360,27 +390,42 @@ class PeopleRepository:
         user_ids: tuple[str, ...],
         *,
         group_id: str | None = None,
+        person_ids: Mapping[str, str] | None = None,
+        members_only: bool = False,
+        session: AsyncSession | None = None,
     ) -> dict[str, UserProfileSnapshot]:
-        """Load several people and their current-group cards in one query."""
+        """Batch the requested people and current-group cards without per-person reads."""
 
         unique_ids = tuple(dict.fromkeys(user_ids))
         if not unique_ids:
             return {}
-        async with self._database.sessions() as session:
-            loaded: dict[str, UserProfileSnapshot] = {}
-            for item in unique_ids:
-                pair = await load_canonical_profile(session, user_id=item, group_id=group_id)
-                if pair is None:
-                    continue
-                nickname, card = pair
-                loaded[item] = UserProfileSnapshot(
-                    user_id=item,
-                    scope_type=ScopeType.GROUP if group_id else ScopeType.PRIVATE,
-                    nickname=nickname,
+        if session is None:
+            async with self._database.sessions() as owned_session:
+                return await self.get_many(
+                    unique_ids,
                     group_id=group_id,
-                    group_card=card,
+                    person_ids=person_ids,
+                    members_only=members_only,
+                    session=owned_session,
                 )
-            return loaded
+        profiles = await load_canonical_profiles(
+            session,
+            unique_ids,
+            group_id=group_id,
+            person_ids=person_ids,
+            members_only=members_only,
+        )
+        return {
+            item: UserProfileSnapshot(
+                user_id=item,
+                scope_type=ScopeType.GROUP if group_id else ScopeType.PRIVATE,
+                nickname=profiles[item][0],
+                group_id=group_id,
+                group_card=profiles[item][1],
+            )
+            for item in unique_ids
+            if item in profiles
+        }
 
     async def aliases(self, user_id: str, *, limit: int = 20) -> tuple[str, ...]:
         async with self._database.sessions() as session:
@@ -423,14 +468,23 @@ class PeopleRepository:
         self,
         user_ids: tuple[str, ...],
         group_id: str,
+        *,
+        person_ids: Mapping[str, str] | None = None,
+        session: AsyncSession | None = None,
     ) -> frozenset[str]:
         """Return only identities with a real membership in the exact group."""
 
         unique_ids = tuple(dict.fromkeys(user_ids))
         if not unique_ids:
             return frozenset()
-        async with self._database.sessions() as session:
-            return await load_canonical_members_in_group(session, unique_ids, group_id)
+        if session is None:
+            async with self._database.sessions() as owned_session:
+                return await self.members_in_group(
+                    unique_ids, group_id, person_ids=person_ids, session=owned_session
+                )
+        return await load_canonical_members_in_group(
+            session, unique_ids, group_id, person_ids=person_ids
+        )
 
     async def person_reference_ids(
         self,
@@ -450,6 +504,39 @@ class PeopleRepository:
             return await canonical_person_reference_ids(
                 session, unique_ids, speaker_user_id=speaker_user_id
             )
+
+    async def person_reference_map(
+        self,
+        user_ids: tuple[str, ...],
+        *,
+        speaker_user_id: str,
+        bot_user_id: str,
+        session: AsyncSession | None = None,
+    ) -> dict[str, str]:
+        """Resolve actual account-to-Person references for one preparation."""
+        if session is None:
+            async with self._database.sessions() as owned_session:
+                return await self.person_reference_map(
+                    user_ids,
+                    speaker_user_id=speaker_user_id,
+                    bot_user_id=bot_user_id,
+                    session=owned_session,
+                )
+        from qq_ai_bot.identity.event_author import project_event_authors
+
+        accounts = tuple(
+            dict.fromkeys(
+                str(raw).strip()
+                for raw in user_ids
+                if str(raw).strip() and str(raw).strip() != speaker_user_id
+            )
+        )
+        authors = await project_event_authors(session, sender_user_ids=accounts)
+        return {
+            account: author.author_person_id
+            for account, author in authors.items()
+            if author.author_kind == "person" and author.author_person_id is not None
+        }
 
     async def find_group_members_by_exact_name(
         self,
@@ -489,6 +576,49 @@ class PeopleRepository:
                 limit=limit,
                 minimum_score=minimum_score,
             )
+
+    async def find_group_members_by_normalized_names(
+        self,
+        names: tuple[str, ...],
+        group_id: str,
+    ) -> dict[str, tuple[GroupMemberNameMatch, ...]]:
+        """Resolve all declared normalized exact names from one complete group projection."""
+        queries = {name: normalize_person_name(name) for name in dict.fromkeys(names)}
+        if not queries:
+            return {}
+        async with self._database.sessions() as session:
+            projections = await load_canonical_group_member_name_projections(session, group_id)
+        wanted = {query for query in queries.values() if query}
+        labels: dict[str, str] = {}
+        matches: dict[str, dict[str, GroupMemberNameMatch]] = {}
+        for item in projections:
+            for label in dict.fromkeys((item.group_card, item.nickname, *sorted(item.aliases))):
+                if label not in labels:
+                    labels[label] = normalize_person_name(label)
+                normalized = labels[label]
+                if normalized not in wanted:
+                    continue
+                candidates = matches.setdefault(normalized, {})
+                previous = candidates.get(item.user_id)
+                if previous is None or label.casefold() < previous.matched_alias.casefold():
+                    candidates[item.user_id] = GroupMemberNameMatch(
+                        user_id=item.user_id,
+                        nickname=item.nickname,
+                        group_card=item.group_card,
+                        matched_alias=label,
+                        score=1.0,
+                        exact=True,
+                    )
+        ranked = {
+            query: tuple(
+                sorted(
+                    candidates.values(),
+                    key=lambda item: (item.display_name.casefold(), item.user_id),
+                )
+            )
+            for query, candidates in matches.items()
+        }
+        return {name: ranked.get(query, ()) for name, query in queries.items()}
 
     async def set_enabled(
         self,

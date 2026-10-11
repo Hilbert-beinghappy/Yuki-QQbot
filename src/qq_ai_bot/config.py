@@ -224,7 +224,6 @@ class Settings(BaseSettings):
     memory_self_reflection_timeout_seconds: float = 180.0
     memory_self_reflection_tool_receipt_characters: int = 2000
     memory_self_reflection_tool_receipt_retention_days: int = 7
-    memory_max_referenced_targets: int = 5
     memory_lexical_candidate_limit: int = 50
     memory_context_limit_per_entity: int = 4
     memory_overview_limit_per_entity: int = 10

@@ -1,6 +1,6 @@
 """Real ASGI, SQL and trusted credentials; no gateway or paid model calls."""
 
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from uuid import uuid4
 
 import httpx
@@ -659,3 +659,139 @@ async def test_avatar_cache_is_private_and_bound_to_login_cookie(web, monkeypatc
     assert response.headers["cache-control"] == "private, max-age=3600"
     assert response.headers["vary"] == "Cookie"
     assert response.headers["x-content-type-options"] == "nosniff"
+
+
+@pytest.mark.parametrize("kind", ["rebuild", "dream"])
+async def test_operation_pages_read_original_status_without_parsing_private_run_json(
+    database, kind
+):
+    from sqlalchemy import insert
+    from tests.support.projection_sql_counts import capture_sql
+
+    from qq_ai_bot.control_plane.operations import OperationKind, OperationStatus
+    from qq_ai_bot.control_plane.paging import PageRequest
+    from qq_ai_bot.memory.dream.db_models import MemoryDreamRunModel
+    from qq_ai_bot.persistence.models import MemoryRebuildRunModel
+
+    now = datetime.now(UTC)
+    public_ids = [str(uuid4()) for _ in range(3)]
+    model = MemoryRebuildRunModel if kind == "rebuild" else MemoryDreamRunModel
+    statuses = (
+        ("planned", "commit_paused", "failed")
+        if kind == "rebuild"
+        else ("running", "partial_failed", "rolled_back")
+    )
+    private = (
+        {
+            "selection_json": "private selection not used by operation view",
+            "selection_hash": "a" * 64,
+            "snapshot_max_event_id": 0,
+            "extraction_fingerprint": "b" * 64,
+            "plan_statistics_json": "private statistics not used by operation view",
+        }
+        if kind == "rebuild"
+        else {
+            "mode": "full",
+            "snapshot_max_fact_id": 0,
+            "statistics_json": "private statistics not used by operation view",
+        }
+    )
+    async with database.immediate_session() as writer:
+        await writer.execute(
+            insert(model),
+            [
+                {
+                    **private,
+                    "public_id": public_id,
+                    "status": statuses[index],
+                    "snapshot_created_at": now,
+                    "created_at": now + timedelta(seconds=index),
+                    "updated_at": now + timedelta(seconds=index),
+                    "error_category": "private error details!",
+                }
+                for index, public_id in enumerate(public_ids)
+            ],
+        )
+    queries = ControlQueryAdapter(database)
+    operation_kind = OperationKind(kind)
+    with capture_sql(database) as statements:
+        first = await queries.list_operations(PageRequest(limit=2), kind=operation_kind)
+        tail = await queries.list_operations(
+            PageRequest(limit=2, cursor=first.next_cursor), kind=operation_kind
+        )
+        numbered = await queries.list_operations(
+            PageRequest(limit=2, number=1), kind=operation_kind
+        )
+        all_items = (*first.items, *tail.items)
+        individual = [await queries.read_operation(item.operation_id) for item in all_items]
+    assert [item.operation_id for item in all_items] == [
+        f"{kind}:{public_id}" for public_id in public_ids
+    ]
+    assert individual == list(all_items)
+    assert tail.next_cursor is None and numbered.total == 3 and numbered.number == 1
+    assert numbered.items[0] == all_items[-1]
+    for item in all_items:
+        assert item.error_category == (
+            "operation_failed" if item.status is OperationStatus.FAILED else None
+        )
+    assert not any(
+        column in sql
+        for sql, _ in statements
+        for column in ("selection_json", "statistics_json", "plan_statistics_json")
+    )
+
+
+async def test_config_spec_page_preserves_schema_and_secret_configured_fields(database):
+    from sqlalchemy import insert
+    from tests.support.projection_sql_counts import capture_sql
+
+    from qq_ai_bot.admin.config_registry import ConfigRegistry
+    from qq_ai_bot.control_plane.paging import PageRequest
+    from qq_ai_bot.persistence.models import RuntimeConfigOverrideModel
+
+    settings = make_settings(
+        database.url, llm_api_key="private-provider-secret", onebot_access_token=""
+    )
+    queries = ControlQueryAdapter(database, settings=settings)
+    keys = ("context.compaction_window_tokens", "llm.api_key", "onebot.access_token")
+    specs = [queries._registry.get(key) for key in keys]
+    queries._registry = ConfigRegistry(specs)
+    now = datetime.now(UTC)
+    async with database.immediate_session() as writer:
+        await writer.execute(
+            insert(RuntimeConfigOverrideModel),
+            [
+                {
+                    "config_key": key,
+                    "scope_type": "global",
+                    "value_json": "private-unused-value" * 1000,
+                    "value_type": "integer",
+                    "apply_mode": "hot",
+                    "version": 1,
+                    "created_at": now,
+                    "updated_at": now,
+                    "updated_by": "fixture",
+                }
+                for key in (keys[0], "zz.retired.setting")
+            ],
+        )
+    with capture_sql(database) as statements:
+        items = []
+        request = PageRequest(limit=1)
+        while True:
+            page = await queries.list_config_specs(request)
+            items.extend(page.items)
+            if page.next_cursor is None:
+                break
+            request = PageRequest(limit=1, cursor=page.next_cursor)
+        numbered = await queries.list_config_specs(PageRequest(limit=1, number=2))
+    assert [item.key for item in items] == list(keys)
+    assert [item.configured for item in items] == [True, True, False]
+    assert numbered.items == (items[1],) and numbered.total == 3 and numbered.number == 2
+    for item, spec in zip(items, specs, strict=True):
+        assert item.minimum == spec.minimum and item.maximum == spec.maximum
+        assert item.choices == spec.choices
+        assert item.allowed_scopes == tuple(scope.value for scope in spec.allowed_scopes)
+        assert item.sensitive == spec.sensitive and item.apply_mode == spec.apply_mode.value
+    assert "private-provider-secret" not in repr(items)
+    assert not any("value_json" in sql for sql, _ in statements)

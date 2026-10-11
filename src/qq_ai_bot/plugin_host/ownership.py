@@ -163,6 +163,37 @@ async def require_live_person(session: AsyncSession, person_id: str | None) -> s
     return person.id
 
 
+async def require_live_people(session: AsyncSession, person_ids: tuple[str, ...]) -> None:
+    """Apply the same Person facts once for a state directory's distinct owners."""
+    if not person_ids:
+        return
+    presences = set(
+        await session.scalars(select(PresenceModel.id).where(PresenceModel.id.in_(person_ids)))
+    )
+    spaces = set(
+        await session.scalars(
+            select(CanonicalSpaceModel.id).where(CanonicalSpaceModel.id.in_(person_ids))
+        )
+    )
+    people = {
+        person_id: enabled
+        for person_id, enabled in (
+            await session.execute(
+                select(CanonicalPersonModel.id, CanonicalPersonModel.enabled).where(
+                    CanonicalPersonModel.id.in_(person_ids)
+                )
+            )
+        )
+    }
+    for person_id in person_ids:
+        if person_id in presences or person_id in spaces:
+            raise PluginOwnershipError(CANONICAL_OWNER_MISMATCH)
+        if person_id not in people:
+            raise PluginOwnershipError(MISSING_CANONICAL_OWNER)
+        if not people[person_id]:
+            raise PluginOwnershipError(CANONICAL_OWNER_DISABLED)
+
+
 async def require_live_space(session: AsyncSession, space_id: str | None) -> str:
     """Read a Space by canonical id only. Never consult raw group/bot keys."""
 

@@ -17,7 +17,7 @@ from pathlib import Path
 from typing import Any
 from uuid import uuid4
 
-from sqlalchemy import and_, or_, select, update
+from sqlalchemy import and_, func, or_, select, text, tuple_, update
 
 from qq_ai_bot.admin.models import VisionRuntimeConfig
 from qq_ai_bot.capabilities.media import PreparedMediaData
@@ -246,22 +246,72 @@ class ConversationMediaService:
                 # Failed prefetch remains uncached and can be retried on inspection.
                 continue
 
-    async def _source(
-        self, event_id: int, index: int
-    ) -> tuple[ConversationMediaItemModel, ChatEventModel, dict[str, Any]]:
+    async def _sources(
+        self, keys: tuple[tuple[int, int], ...]
+    ) -> dict[
+        tuple[int, int],
+        tuple[ConversationMediaItemModel, int | None, int | None, dict[str, Any]],
+    ]:
+        """Prepare selected metadata together, parsing each source event once."""
+        if not keys:
+            return {}
+        values = func.json_each(json.dumps(keys)).table_valued("value")
+        selected = select(
+            func.json_extract(values.c.value, "$[0]"),
+            func.json_extract(values.c.value, "$[1]"),
+        )
+        model = ConversationMediaItemModel
         async with self.database.sessions() as session:
-            item = await session.get(ConversationMediaItemModel, (event_id, index))
-            event = await session.get(ChatEventModel, event_id)
-            if (
-                item is None
-                or event is None
-                or event.suppression_status != "keeper"
-                or event.direction != "inbound"
-                or event.canonical_conversation_id != item.conversation_id
-            ):
+            await session.execute(text("BEGIN"))
+            rows = (
+                await session.execute(
+                    select(
+                        model,
+                        CanonicalConversationModel.generation,
+                        CanonicalConversationModel.starts_after_event_id,
+                    )
+                    .join(ChatEventModel, ChatEventModel.id == model.source_event_id)
+                    .outerjoin(
+                        CanonicalConversationModel,
+                        CanonicalConversationModel.id == model.conversation_id,
+                    )
+                    .where(
+                        tuple_(model.source_event_id, model.attachment_index).in_(selected),
+                        ChatEventModel.suppression_status == "keeper",
+                        ChatEventModel.direction == "inbound",
+                        ChatEventModel.canonical_conversation_id == model.conversation_id,
+                    )
+                )
+            ).all()
+            metadata = {
+                (row[0].source_event_id, row[0].attachment_index): row for row in rows
+            }
+            event_ids = tuple(dict.fromkeys(key[0] for key in metadata))
+            selected_events = func.json_each(json.dumps(event_ids)).table_valued("value")
+            raw_segments = {
+                event_identity: segments
+                for event_identity, segments in (
+                    await session.execute(
+                        select(ChatEventModel.id, ChatEventModel.segments_json).where(
+                            ChatEventModel.id.in_(select(selected_events.c.value))
+                        )
+                    )
+                ).all()
+            }
+        parsed: dict[int, Any] = {}
+        sources: dict[
+            tuple[int, int],
+            tuple[ConversationMediaItemModel, int | None, int | None, dict[str, Any]],
+        ] = {}
+        for key in keys:
+            row = metadata.get(key)
+            if row is None:
                 raise ConversationMediaError("attachment_not_found")
+            item, generation, floor = row
             try:
-                segment = json.loads(event.segments_json)[item.segment_index]
+                if key[0] not in parsed:
+                    parsed[key[0]] = json.loads(raw_segments[key[0]])
+                segment = parsed[key[0]][item.segment_index]
             except (ValueError, TypeError, IndexError) as exc:
                 raise ConversationMediaError("attachment_source_invalid") from exc
             if (
@@ -270,15 +320,27 @@ class ConversationMediaService:
                 or not isinstance(segment.get("data"), dict)
             ):
                 raise ConversationMediaError("attachment_source_invalid")
-            return item, event, segment["data"]
+            sources[key] = (item, generation, floor, segment["data"])
+        return sources
 
     def _path(self, item: ConversationMediaItemModel) -> Path:
         if not item.cache_name or "/" in item.cache_name or "\\" in item.cache_name:
             raise ConversationMediaError("cache_missing")
         return self.root / item.conversation_id / str(item.source_event_id) / item.cache_name
 
-    async def _cache(self, event_id: int, index: int, gateway: OneBotMediaGateway | None) -> Path:
-        item, _, data = await self._source(event_id, index)
+    async def _cache(
+        self,
+        event_id: int,
+        index: int,
+        gateway: OneBotMediaGateway | None,
+        *,
+        source: tuple[
+            ConversationMediaItemModel, int | None, int | None, dict[str, Any]
+        ] | None = None,
+    ) -> Path:
+        if source is None:
+            source = (await self._sources(((event_id, index),)))[(event_id, index)]
+        item, _, _, data = source
         if item.cache_status == "expired":
             raise ConversationMediaError("attachment_expired")
         if item.expires_at is not None:
@@ -384,18 +446,19 @@ class ConversationMediaService:
         generation: int | None,
         gateway: OneBotMediaGateway | None,
     ) -> tuple[ConversationMediaItemModel, Path]:
-        item, _, _ = await self._source(event_id, attachment_index)
-        async with self.database.sessions() as session:
-            conversation = await session.get(CanonicalConversationModel, conversation_id)
-            if (
-                conversation is None
-                or item.conversation_id != conversation_id
-                or item.generation != conversation.generation
-                or event_id <= conversation.starts_after_event_id
-                or (generation is not None and generation != conversation.generation)
-            ):
-                raise ConversationMediaError("attachment_scope_denied")
-        path = await self._cache(event_id, attachment_index, gateway)
+        key = (event_id, attachment_index)
+        source = (await self._sources((key,)))[key]
+        item, current_generation, floor, _ = source
+        if (
+            current_generation is None
+            or floor is None
+            or item.conversation_id != conversation_id
+            or item.generation != current_generation
+            or event_id <= floor
+            or (generation is not None and generation != current_generation)
+        ):
+            raise ConversationMediaError("attachment_scope_denied")
+        path = await self._cache(event_id, attachment_index, gateway, source=source)
         # Recheck after network work: /ai new may have advanced during download.
         async with self.database.sessions() as session:
             conversation = await session.get(CanonicalConversationModel, conversation_id)
@@ -552,23 +615,25 @@ class ConversationMediaService:
                     raise ConversationMediaError("attachment_source_invalid")
                 continue
             seen[key] = dependency
-            item, _, _ = await self._source(*key)
-            async with self.database.sessions() as session:
-                conversation = await session.get(CanonicalConversationModel, image.conversation_id)
-                if (
-                    conversation is None
-                    or item.conversation_id != image.conversation_id
-                    or item.generation != image.generation
-                    or conversation.generation != image.generation
-                    or image.source_event_id <= conversation.starts_after_event_id
-                ):
-                    raise ConversationMediaError("attachment_scope_denied")
+        sources = await self._sources(tuple(seen))
+        for key, dependency in seen.items():
+            conversation_id, generation, content_hash, expires_at = dependency
+            item, current_generation, floor, _ = sources[key]
+            if (
+                current_generation is None
+                or floor is None
+                or item.conversation_id != conversation_id
+                or item.generation != generation
+                or current_generation != generation
+                or key[0] <= floor
+            ):
+                raise ConversationMediaError("attachment_scope_denied")
             if (
                 item.cache_status != "cached"
-                or item.content_sha256 != image.content_hash
+                or item.content_sha256 != content_hash
                 or item.expires_at is None
                 or _aware(item.expires_at) <= datetime.now(UTC)
-                or _aware(item.expires_at).isoformat() != image.expires_at
+                or _aware(item.expires_at).isoformat() != expires_at
             ):
                 raise ConversationMediaError("attachment_expired")
 

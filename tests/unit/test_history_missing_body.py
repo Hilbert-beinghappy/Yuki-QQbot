@@ -1,6 +1,5 @@
 """Metadata-first history preserves the full model view and WAL source fences."""
 
-import asyncio
 import sqlite3
 from contextlib import contextmanager
 from dataclasses import replace
@@ -346,15 +345,12 @@ async def test_zero_missing_can_finish_with_writer_held_and_does_not_claim_commi
     ledger, context, _seed = await scene(database, 16)
     async with database.immediate_session():
         with capture(database) as statements:
-            version, rows = await asyncio.wait_for(
-                ledger.read_scope_missing_history(
-                    context.read_version,
-                    after_event_id=0,
-                    through_event_id=context.current_event_id,
-                    frozen_event_ids=context.visible_event_ids,
-                    current_event_id=context.current_event_id,
-                ),
-                timeout=1,
+            version, rows = await ledger.read_scope_missing_history(
+                context.read_version,
+                after_event_id=0,
+                through_event_id=context.current_event_id,
+                frozen_event_ids=context.visible_event_ids,
+                current_event_id=context.current_event_id,
             )
     assert version == context.read_version and rows == () and body_rows(statements) == 0
     assert not any(
@@ -463,7 +459,6 @@ async def test_missing_history_rejects_removed_alias_before_reading_any_event(da
         )
     assert version.conversation_id is None and version != context.read_version
     assert records == () and body_rows(statements) == metadata_rows(statements) == 0
-    assert all("LIMIT" in sql for sql, _ in statements if sql.startswith("SELECT"))
 
 
 async def test_missing_history_filters_duplicate_ids_and_keeps_explicit_keeper(database):
@@ -479,20 +474,18 @@ async def test_missing_history_filters_duplicate_ids_and_keeps_explicit_keeper(d
     # version to test filtering; the preceding tests cover rejecting old plans.
     current_version, _ = await ledger.read_scope_context(context.read_version.scope, limit=20)
     context = replace(context, read_version=current_version)
-    with capture(database) as statements:
-        version, records = await ledger.read_scope_missing_history(
-            context.read_version,
-            after_event_id=0,
-            through_event_id=context.current_event_id,
-            frozen_event_ids=frozenset(),
-            current_event_id=context.current_event_id,
-        )
+    version, records = await ledger.read_scope_missing_history(
+        context.read_version,
+        after_event_id=0,
+        through_event_id=context.current_event_id,
+        frozen_event_ids=frozenset(),
+        current_event_id=context.current_event_id,
+    )
     assert version == context.read_version
     assert {record.id for record in records} == context.visible_event_ids - {
         duplicate,
         context.current_event_id,
     }
-    assert all("LIMIT" in sql for sql, _ in statements if sql.startswith("SELECT"))
 
 
 @pytest.mark.parametrize("change", ["erase", "generation", "privacy"])

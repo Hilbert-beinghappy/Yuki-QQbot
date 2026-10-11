@@ -88,8 +88,8 @@ Control Plane 仍要求 capability。
 - 证据明细及 readable evidence count 共用同一 SQL 来源谓词，按 canonical event、普通
   tool receipt 或无事件 SELF initiative 分支核验来源、owner、隐藏状态及 SELF 可见范围。
   明细在 SQL 中过滤后排序，公开分页继续应用请求的 limit，不逐 evidence 查来源。
-  内部聚合和完整 lineage 读取全部可读证据；移除旧查询的 100000 条保护截断，因此超过
-  该规模的历史尾部现在也参与复制。这是极端规模的行为修正；原始 confidence/authority 和来源资格保留。
+  内部证据聚合读取全部可读来源，不以固定条数截断历史尾部；原始 confidence/authority
+  和来源资格保留。无消费者的完整 lineage 装配入口已删除，原 operation/result/source 账本保留。
   Memory mutation、Dream 与维护批次在同连接显式只读 BEGIN 中先准备完整证据、
   来源和目标归属，再升级为短写事务。SQLite WAL 快照是本次准备的完整依赖围栏；
   任何竞争提交都使旧快照的首次写入被拒绝，不能仅用 fact.updated_at 推断来源未改变。

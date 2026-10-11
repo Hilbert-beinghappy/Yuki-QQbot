@@ -1,11 +1,14 @@
 """Actorless SELF evidence, read scope and restart-safe receipt reflection."""
 
+import asyncio
 import json
 from datetime import UTC, datetime, timedelta
 from uuid import uuid4
 
 import pytest
-from sqlalchemy import func, select
+from sqlalchemy import event as sql_event
+from sqlalchemy import func, select, update
+from sqlalchemy.exc import OperationalError
 from tests.conftest import make_settings
 from tests.support.model_executor import InjectedModelExecutor
 from tests.unit.test_memory_mutation import _event, _service
@@ -16,6 +19,7 @@ from qq_ai_bot.identity.db_models import SpaceBindingModel
 from qq_ai_bot.llm.fake import FakeLLMProvider
 from qq_ai_bot.memory.enums import MemoryKind, MemoryScopeType, MemoryStatus, SelfMemoryVisibility
 from qq_ai_bot.memory.metrics import MemoryLifecycleMetrics
+from qq_ai_bot.memory.models import MemoryFactCreate
 from qq_ai_bot.memory.mutation.models import (
     MemoryDecisionActorType,
     MemoryMutationContext,
@@ -26,13 +30,16 @@ from qq_ai_bot.memory.mutation.models import (
 from qq_ai_bot.memory.runtime.partition_lookup import DatabaseMemoryPartitionLookup
 from qq_ai_bot.memory.runtime.turn_session import TurnMemorySession
 from qq_ai_bot.memory.self_reflection.control import ReflectionControlRepository
+from qq_ai_bot.memory.self_reflection.db_models import InitiativeReflectionCursorModel
 from qq_ai_bot.memory.self_reflection.repository import SelfReflectionRepository
 from qq_ai_bot.memory.self_reflection.service import SelfReflectionService
 from qq_ai_bot.memory.subjects import ResolvedSubject
 from qq_ai_bot.persistence.models import (
     ChatEventModel,
     MemoryEvidenceModel,
+    MemoryFactModel,
     MemoryMutationReceiptModel,
+    MemorySelfReflectionCycleModel,
     MemorySelfReflectionRunModel,
     MemorySelfReflectionStateModel,
     MemoryToolReceiptModel,
@@ -138,6 +145,330 @@ async def claim(database, cycle="cycle-1", *, max_characters=16000):
         max_characters=max_characters,
         cycle_id=cycle,
     )
+
+
+@pytest.mark.parametrize("source_kind", ["initiative", "ordinary"])
+async def test_concurrent_reflection_claims_keep_one_original_run(
+    database, monkeypatch, source_kind
+):
+    mutations, _, initial, initiative_id = await seed(database)
+    repository = SelfReflectionRepository(database)
+    options = dict(
+        scheduled_slot="race",
+        local_date="2026-10-12",
+        event_threshold=1,
+        character_threshold=1,
+        max_wait_seconds=0,
+        max_sessions=1,
+        max_daily_calls=96,
+        max_events=100,
+        max_characters=16000,
+        force=True,
+        cycle_id="race",
+    )
+    if source_kind == "initiative":
+        await record(database, initial, initiative_id)
+        await finish(database, initiative_id)
+    else:
+        await repository.scan_new_events()
+        await _event(
+            mutations._ledger,
+            message_id="ordinary-concurrent-claim",
+            sender_user_id="1001",
+            content="双方读取同一原始普通窗口",
+            group_id="3001",
+        )
+        await repository.scan_new_events()
+    both_prepared = asyncio.Event()
+    readers = 0
+
+    async def rendezvous():
+        nonlocal readers
+        readers += 1
+        if readers == 2:
+            both_prepared.set()
+        await both_prepared.wait()
+
+    with monkeypatch.context() as patch:
+        if source_kind == "initiative":
+            from qq_ai_bot.memory.self_reflection import initiative
+
+            resolve = initiative.resolve_self_origin
+
+            async def prepared_source(*args, **kwargs):
+                source = await resolve(*args, **kwargs)
+                await rendezvous()
+                return source
+
+            patch.setattr(initiative, "resolve_self_origin", prepared_source)
+        else:
+            project = SelfReflectionRepository._state
+
+            async def prepared_state(*args, **kwargs):
+                state = await project(*args, **kwargs)
+                await rendezvous()
+                return state
+
+            patch.setattr(SelfReflectionRepository, "_state", staticmethod(prepared_state))
+        outcomes = await asyncio.gather(
+            repository.claim_due(**options),
+            SelfReflectionRepository(database).claim_due(**options),
+            return_exceptions=True,
+        )
+    accepted = [batch for result in outcomes if isinstance(result, tuple) for batch in result]
+    rejected = [result for result in outcomes if isinstance(result, OperationalError)]
+    assert len(accepted) == len(rejected) == 1, outcomes
+    assert getattr(rejected[0].orig, "sqlite_errorcode", None) in (5, 517)
+    original = accepted[0]
+    assert await repository.claim_due(**{**options, "cycle_id": "next-cycle"}) == ()
+    async with database.sessions() as session:
+        stored = tuple(await session.scalars(select(MemorySelfReflectionRunModel)))
+    assert len(stored) == 1 and stored[0].id == original.run_id
+    assert stored[0].status == "processing" and stored[0].attempt_count == 1
+    assert stored[0].input_fingerprint
+    assert original.initiative_run_id == (initiative_id if source_kind == "initiative" else None)
+    assert bool(original.events) == (source_kind == "ordinary")
+
+
+async def test_visible_self_input_keeps_all_local_facts_and_active_only_expiry(database):
+    _, facts, event, run_id = await seed(database)
+    await record(database, event, run_id)
+    await finish(database, run_id)
+    (batch,) = await claim(database)
+    global_facts, local_facts = [], []
+    for visibility, bucket in (("global", global_facts), ("group", local_facts)):
+        for index in range(21):
+            bucket.append(
+                await facts.remember(
+                    MemoryFactCreate(
+                        scope_type="self",
+                        visibility_type=visibility,
+                        visibility_group_id="3001" if visibility == "group" else None,
+                        memory_key=f"visible:{visibility}:{index}",
+                        category="test",
+                        content=f"{visibility} self fact {index}",
+                        source_type="explicit",
+                    )
+                )
+            )
+    expired = datetime.now(UTC) - timedelta(days=1)
+    async with database.immediate_session() as session:
+        await session.execute(
+            update(MemoryFactModel)
+            .where(MemoryFactModel.id == global_facts[0].id)
+            .values(valid_until=expired)
+        )
+        await session.execute(
+            update(MemoryFactModel)
+            .where(MemoryFactModel.id == global_facts[1].id)
+            .values(status="contested", conflict_state="contested", valid_until=expired)
+        )
+        await session.execute(
+            update(MemoryFactModel)
+            .where(MemoryFactModel.id == local_facts[0].id)
+            .values(status="invalidated", invalidated_reason="expired", valid_until=expired)
+        )
+        await session.execute(
+            update(MemoryFactModel)
+            .where(MemoryFactModel.id == local_facts[1].id)
+            .values(status="superseded")
+        )
+        await session.execute(
+            update(MemoryFactModel)
+            .where(MemoryFactModel.id == global_facts[2].id)
+            .values(review_state="quarantined")
+        )
+        await session.execute(
+            update(SpaceBindingModel)
+            .where(SpaceBindingModel.space_id == batch.state.canonical_space_id)
+            .values(status="disabled")
+        )
+    reflection = object.__new__(SelfReflectionService)
+    reflection._facts = facts
+    visible = await reflection._visible_self_facts(batch)
+    expected = {f.id for f in (*global_facts, *local_facts)} - {
+        global_facts[0].id,
+        global_facts[2].id,
+        local_facts[1].id,
+    }
+    assert {f.id for f in visible} == expected
+    assert global_facts[-1].id in expected and local_facts[-1].id in expected
+    assert visible[-2].id == global_facts[1].id and visible[-1].id == local_facts[0].id
+
+
+async def test_reflection_health_uses_original_oldest_recent_cycle_baseline(database, monkeypatch):
+    mutations, _, _, _ = await seed(database)
+    repository = SelfReflectionRepository(database)
+    await repository.scan_new_events()
+    for index in range(4):
+        await _event(
+            mutations._ledger,
+            message_id=f"baseline-health-{index}",
+            sender_user_id="1001",
+            content=f"真实待反思消息 {index}",
+            group_id="3001",
+        )
+    await repository.scan_new_events()
+    (batch,) = await repository.claim_due(
+        scheduled_slot="baseline-health",
+        local_date="2026-10-12",
+        event_threshold=1,
+        character_threshold=1,
+        max_wait_seconds=0,
+        max_sessions=1,
+        max_daily_calls=96,
+        max_events=1,
+        max_characters=16000,
+    )
+    now = datetime.now(UTC)
+    async with database.immediate_session() as session:
+        for hours, ingress_before in ((25, 0), (10, 1), (1, 1000)):
+            at = now - timedelta(hours=hours)
+            session.add(
+                MemorySelfReflectionCycleModel(
+                    id=f"sr_baseline_{hours}",
+                    source_key=f"baseline:{hours}",
+                    trigger="scheduled",
+                    status="completed",
+                    created_at=at,
+                    completed_at=at,
+                    report_json=json.dumps({"before": {"ingress_events_total": ingress_before}}),
+                    delivery_state="not_required",
+                )
+            )
+        await session.execute(
+            update(MemorySelfReflectionRunModel)
+            .where(MemorySelfReflectionRunModel.id == batch.run_id)
+            .values(
+                status="failed", retry_state="waiting", next_attempt_at=now + timedelta(hours=1)
+            )
+        )
+
+    class FixedDateTime(datetime):
+        @classmethod
+        def now(cls, tz=None):
+            return now
+
+    from qq_ai_bot.memory.self_reflection import control
+
+    monkeypatch.setattr(control, "datetime", FixedDateTime)
+    report = await ReflectionControlRepository(
+        database, make_settings(database.url, memory_self_reflection_event_threshold=1)
+    ).snapshot()
+    assert report["rate_window_seconds"] == 10 * 3600
+    assert report["ingress_events_total"] == 4
+    assert report["ingress_events_per_hour"] == 0.3
+    assert report["drain_events_per_hour"] == 0
+    assert report["waiting_retry"] == {"events": 1, "conversations": 1}
+    assert report["actionable"] == {"events": 3, "conversations": 1}
+
+
+async def test_mixed_recovery_prepares_full_tail_before_cursor_write_and_sees_staged_completion(
+    database,
+    monkeypatch,
+):
+    mutations, _, initial, initiative_id = await seed(database)
+    repository = SelfReflectionRepository(database)
+    await repository.scan_new_events()
+    await record(database, initial, initiative_id)
+    await finish(database, initiative_id)
+    (initiative,) = await claim(database)
+    first = await _event(
+        mutations._ledger,
+        message_id=str(uuid4()),
+        sender_user_id="1001",
+        content="completed range",
+        group_id="3001",
+    )
+    await repository.scan_new_events()
+    from qq_ai_bot.domain import audio
+
+    transcripts = []
+    original_transcript = audio.transcript_context
+
+    def transcript_context(value, *, include_replies=True):
+        transcripts.append(value)
+        return original_transcript(value, include_replies=include_replies)
+
+    monkeypatch.setattr(audio, "transcript_context", transcript_context)
+    (ordinary,) = await repository.claim_due(
+        scheduled_slot="mixed-ordinary",
+        local_date="2026-10-12",
+        event_threshold=1,
+        character_threshold=1,
+        max_wait_seconds=0,
+        max_sessions=1,
+        max_daily_calls=96,
+        max_events=1,
+        max_characters=16000,
+    )
+    tail = []
+    for index in range(105):
+        tail.append(
+            await _event(
+                mutations._ledger,
+                message_id=str(uuid4()),
+                sender_user_id="1001",
+                content="　" if index == 0 else f"pending {index}",
+                group_id="3001",
+            )
+        )
+    speech = json.dumps(
+        [
+            {"source": "current", "segment_index": 0, "text": "真实当前语音"},
+            {"source": "reply", "segment_index": 1, "text": "旧引用语音"},
+        ],
+        ensure_ascii=False,
+    )
+    async with database.immediate_session() as session:
+        await session.execute(
+            update(ChatEventModel)
+            .where(ChatEventModel.id == tail[-1].id)
+            .values(audio_transcript=speech)
+        )
+        for run_id in (initiative.run_id, ordinary.run_id):
+            row = await session.get(MemorySelfReflectionRunModel, run_id)
+            row.checkpoint_json = '{"completed_counts":[0,0]}'
+    await repository.scan_new_events()
+    transcripts.clear()
+    writing = False
+    source_reads_after_write = []
+
+    def trace(_connection, _cursor, statement, *_args):
+        nonlocal writing
+        sql = statement.lstrip().upper()
+        if sql.startswith(("INSERT", "UPDATE", "DELETE")):
+            writing = True
+        elif writing and sql.startswith("SELECT") and "CHAT_EVENTS" in sql:
+            source_reads_after_write.append(statement)
+
+    sql_event.listen(database.engine.sync_engine, "before_cursor_execute", trace)
+    try:
+        assert await repository.recover_stale_runs(started_before=datetime.now(UTC)) == 2
+    finally:
+        sql_event.remove(database.engine.sync_engine, "before_cursor_execute", trace)
+    assert source_reads_after_write == []
+    assert transcripts == [speech]
+    async with database.sessions() as session:
+        state = await session.get(MemorySelfReflectionStateModel, ordinary.state.id)
+        rows = tuple(
+            await session.scalars(
+                select(ChatEventModel)
+                .where(ChatEventModel.id.in_(tuple(item.id for item in tail)))
+                .order_by(ChatEventModel.id)
+            )
+        )
+        texts = [row.evidence_content for row in rows if row.evidence_content.strip()]
+        assert state.last_event_id == first.id
+        assert state.latest_event_id == tail[-1].id
+        assert state.pending_events == len(texts) == 104
+        assert state.pending_characters == sum(map(len, texts))
+        assert state.pending_since == rows[1].occurred_at
+        cursor = await session.get(InitiativeReflectionCursorModel, initiative_id)
+        assert cursor.last_receipt_id == initiative.last_receipt_id
+        assert (
+            await session.get(MemorySelfReflectionRunModel, ordinary.run_id)
+        ).status == "completed"
 
 
 @pytest.mark.asyncio

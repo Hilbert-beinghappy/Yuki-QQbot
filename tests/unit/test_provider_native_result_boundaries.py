@@ -1378,3 +1378,46 @@ async def test_real_http_failure_projection_preserves_transport_and_effect_facts
             if kind in (GeminiProvider, AnthropicMessagesProvider)
             else "original-opaque"
         ) in json.dumps(payload)
+
+
+async def test_model_stats_summary_preserves_weighted_latency_usage_and_historical_tasks(database):
+    from datetime import UTC, datetime
+
+    from sqlalchemy import insert
+
+    from qq_ai_bot.model_runtime.db_models import ModelInvocationModel
+    from qq_ai_bot.model_runtime.models import ModelStats
+
+    repository = ModelInvocationRepository(database)
+    assert await repository.stats_summary() == (ModelStats(), {}, {})
+    rows = [
+        {
+            "task": "planner" if index < 2 else "chat",
+            "profile_id": "old-profile" if index < 2 else "current-profile",
+            "provider": "fake",
+            "model": "measured",
+            "success": index % 3 != 0,
+            "prompt_tokens": None if index % 2 else 30,
+            "completion_tokens": None if index % 2 else 10,
+            "total_tokens": None if index % 2 else 40,
+            "cached_prompt_tokens": None if index % 2 else 7,
+            "cache_creation_input_tokens": None if index % 2 else 5,
+            "cache_creation_5m_input_tokens": None if index % 2 else 3,
+            "cache_creation_1h_input_tokens": None if index % 2 else 2,
+            "physical_request_count": 4,
+            "unknown_usage_request_count": 1,
+            "latency_seconds": 1.0 if index < 2 else 9.0,
+            "created_at": datetime.now(UTC),
+        }
+        for index in range(10)
+    ]
+    async with database.immediate_session() as writer:
+        await writer.execute(insert(ModelInvocationModel), rows)
+    stats, tasks, profiles = await repository.stats_summary()
+    assert stats == await repository.stats()
+    assert tasks == await repository.stats_by_task()
+    assert profiles == await repository.stats_by_profile()
+    assert stats.average_latency_seconds == 7.4
+    assert stats.unknown_usage == 5 and stats.failures == 4
+    assert tasks["planner"].average_latency_seconds == 1.0
+    assert profiles["current-profile"].average_latency_seconds == 9.0

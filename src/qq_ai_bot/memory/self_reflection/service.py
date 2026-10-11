@@ -22,11 +22,10 @@ from qq_ai_bot.memory.enums import (
     MemoryEvidenceRelation,
     MemoryKind,
     MemoryScopeType,
-    MemoryStatus,
     SelfMemoryVisibility,
 )
 from qq_ai_bot.memory.metrics import MemoryLifecycleMetrics
-from qq_ai_bot.memory.models import MemoryEvidenceCreate, MemoryFact, MemoryFactQuery
+from qq_ai_bot.memory.models import MemoryEvidenceCreate, MemoryFact
 from qq_ai_bot.memory.mutation.models import (
     MemoryDecisionActorType,
     MemoryMutationContext,
@@ -261,6 +260,7 @@ class SelfReflectionService:
                 ).decode(),
             )
         already_committed = await self._repository.committed_results(batch.run_id)
+        events_by_id = {event.id: event for event in batch.events}
         committed = 0
 
         for proposal_index, proposal in enumerate(output.proposals, start=1):
@@ -274,6 +274,7 @@ class SelfReflectionService:
                     fact_map=fact_map,
                     candidate_map=candidate_map,
                     event_map=event_map,
+                    events_by_id=events_by_id,
                     tool_map=tool_map,
                     result_index=proposal_index,
                 )
@@ -292,6 +293,7 @@ class SelfReflectionService:
                     episode,
                     index=index,
                     event_map=event_map,
+                    events_by_id=events_by_id,
                     tool_map=tool_map,
                 )
             except Exception as exc:
@@ -445,33 +447,10 @@ class SelfReflectionService:
         )
 
     async def _visible_self_facts(self, batch: SelfReflectionBatch) -> tuple[MemoryFact, ...]:
-        global_query = MemoryFactQuery(
-            scope_type=MemoryScopeType.SELF,
-            visibility_type=SelfMemoryVisibility.GLOBAL,
+        return await self._facts.repository.list_visible_self_facts(
+            person_id=batch.state.canonical_person_id,
+            space_id=batch.state.canonical_space_id,
         )
-        if batch.state.canonical_space_id is not None:
-            local_query = MemoryFactQuery(
-                scope_type=MemoryScopeType.SELF,
-                visibility_type=SelfMemoryVisibility.GROUP,
-                visibility_group_id=batch.state.external_space_id,
-                status=MemoryStatus.ACTIVE,
-            )
-        else:
-            local_query = MemoryFactQuery(
-                scope_type=MemoryScopeType.SELF,
-                visibility_type=SelfMemoryVisibility.PRIVATE,
-                visibility_user_id=batch.state.external_person_id,
-                status=MemoryStatus.ACTIVE,
-            )
-        rows: list[MemoryFact] = []
-        for status in (MemoryStatus.ACTIVE, MemoryStatus.CONTESTED, MemoryStatus.INVALIDATED):
-            for query in (global_query, local_query):
-                rows.extend(
-                    await self._facts.repository.list_facts(
-                        query.model_copy(update={"status": status}), limit=20
-                    )
-                )
-        return tuple({item.id: item for item in rows}.values())
 
     async def _apply(
         self,
@@ -481,6 +460,7 @@ class SelfReflectionService:
         fact_map: dict[str, MemoryFact],
         candidate_map: dict[str, MemoryClaimCandidate],
         event_map: dict[str, EventRecord],
+        events_by_id: dict[int, EventRecord],
         tool_map: dict[str, StoredToolReceipt],
         result_index: int,
     ) -> bool:
@@ -499,7 +479,11 @@ class SelfReflectionService:
         if proposal.merge_fact_ref and merge_fact is None:
             raise ValueError("unknown merge fact alias")
         event, tool, additional = self._evidence(
-            batch, proposal.evidence_refs, event_map=event_map, tool_map=tool_map
+            batch,
+            proposal.evidence_refs,
+            event_map=event_map,
+            events_by_id=events_by_id,
+            tool_map=tool_map,
         )
         tool_receipt_id = tool.id if tool is not None else None
         target = self._target(batch, proposal.visibility)
@@ -592,10 +576,15 @@ class SelfReflectionService:
         *,
         index: int,
         event_map: dict[str, EventRecord],
+        events_by_id: dict[int, EventRecord],
         tool_map: dict[str, StoredToolReceipt],
     ) -> bool:
         anchor, primary_tool, additional = self._evidence(
-            batch, proposal.evidence_refs, event_map=event_map, tool_map=tool_map
+            batch,
+            proposal.evidence_refs,
+            event_map=event_map,
+            events_by_id=events_by_id,
+            tool_map=tool_map,
         )
         source_key = (
             f"initiative:{batch.initiative_run_id}:{batch.first_receipt_id}:{batch.last_receipt_id}:{index}"
@@ -667,6 +656,7 @@ class SelfReflectionService:
         refs: tuple[str, ...],
         *,
         event_map: dict[str, EventRecord],
+        events_by_id: dict[int, EventRecord],
         tool_map: dict[str, StoredToolReceipt],
     ) -> tuple[EventRecord | None, StoredToolReceipt | None, tuple[MemoryEvidenceCreate, ...]]:
         events = []
@@ -681,8 +671,10 @@ class SelfReflectionService:
         anchor = events[0] if events else None
         primary_tool = tools[0] if not events and tools else None
         if anchor is None and primary_tool is not None:
-            anchor = next(
-                (event for event in batch.events if event.id == primary_tool.trigger_event_id), None
+            anchor = (
+                events_by_id.get(primary_tool.trigger_event_id)
+                if primary_tool.trigger_event_id is not None
+                else None
             )
         if anchor is None and not (
             batch.initiative_run_id
@@ -705,8 +697,10 @@ class SelfReflectionService:
         for receipt in tools:
             if primary_tool is not None and receipt.id == primary_tool.id:
                 continue
-            trigger = next(
-                (event for event in batch.events if event.id == receipt.trigger_event_id), None
+            trigger = (
+                events_by_id.get(receipt.trigger_event_id)
+                if receipt.trigger_event_id is not None
+                else None
             )
             additional.append(
                 MemoryEvidenceCreate(

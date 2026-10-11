@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from pydantic import ValidationError
+from sqlalchemy import text
 
 from qq_ai_bot.domain.conversations import ScopeType
 from qq_ai_bot.domain.messages import InboundMessage
@@ -28,7 +29,6 @@ class MemoryTargetResolver:
         self,
         inbound: InboundMessage,
         *,
-        max_referenced: int,
         include_self: bool = False,
     ) -> tuple[MemoryEntityTarget, ...]:
         user_id = inbound.sender.user_id
@@ -50,59 +50,58 @@ class MemoryTargetResolver:
                         block_id="current_self",
                     )
                 )
-            targets.extend(
-                (
-                    await self._read_scopes.person(user_id, user_id, include_person_groups=False)
-                ).targets
-            )
-        except ValidationError as exc:
-            raise MemoryRetrievalError("memory_target_invalid") from exc
-        if inbound.scope_type is ScopeType.PRIVATE or inbound.group_id is None:
-            return tuple(targets)
-
-        group_id = inbound.group_id
-        try:
-            local = await self._read_scopes.person(user_id, user_id, group_id=group_id)
-            targets.extend(
-                target.model_copy(update={"block_id": "current_person_in_group"})
-                for target in local.targets
-                if target.scope_type is MemoryScopeType.PERSON_GROUP
-            )
-            targets.extend(
-                target.model_copy(update={"block_id": "current_group"})
-                for target in (await self._read_scopes.group(user_id, group_id)).targets
-            )
-        except ValidationError as exc:
-            raise MemoryRetrievalError("memory_target_invalid") from exc
-        candidates = list(
-            await self._people.person_reference_ids(
-                tuple(
-                    item
-                    for item in (*inbound.mentioned_user_ids, inbound.reply_sender_user_id)
-                    if item
-                ),
-                speaker_user_id=user_id,
-                bot_user_id=inbound.bot_user_id,
-            )
-        )
-        referenced_count = 0
-        for candidate in candidates:
-            try:
-                person = await self._read_scopes.person(
-                    user_id, candidate, include_person_groups=False
+            is_group = inbound.scope_type is ScopeType.GROUP and inbound.group_id is not None
+            group_id = inbound.group_id if is_group else None
+            async with self._people.database.sessions() as session, session.begin():
+                await session.execute(text("BEGIN"))
+                owners = await self._people.person_reference_map(
+                    tuple(
+                        item
+                        for item in (*inbound.mentioned_user_ids, inbound.reply_sender_user_id)
+                        if item
+                    )
+                    if is_group
+                    else (),
+                    speaker_user_id=user_id,
+                    bot_user_id=inbound.bot_user_id,
+                    session=session,
                 )
-                if not person.targets:
-                    continue
-                targets.extend(person.targets)
-                local = await self._read_scopes.person(user_id, candidate, group_id=group_id)
+                representatives: dict[str, str] = {}
+                for account, person_id in owners.items():
+                    representatives.setdefault(person_id, account)
+                candidates = tuple(representatives.values())
+                scopes = await self._read_scopes.people(
+                    user_id,
+                    (user_id, *candidates),
+                    group_id=group_id,
+                    include_person_groups=is_group,
+                    restrict_to_group=False,
+                    person_ids=owners,
+                    session=session,
+                )
+            current = scopes.get(user_id)
+            if current is not None:
                 targets.extend(
                     target
-                    for target in local.targets
-                    if target.scope_type is MemoryScopeType.PERSON_GROUP
+                    if target.scope_type is MemoryScopeType.PERSON
+                    else target.model_copy(update={"block_id": "current_person_in_group"})
+                    for target in current.targets
                 )
-            except ValidationError as exc:
-                raise MemoryRetrievalError("memory_target_invalid") from exc
-            referenced_count += 1
-            if referenced_count >= max_referenced:
-                break
+                if group_id is not None and any(
+                    target.scope_type is MemoryScopeType.PERSON_GROUP for target in current.targets
+                ):
+                    targets.append(
+                        MemoryEntityTarget(
+                            scope_type=MemoryScopeType.GROUP,
+                            group_id=group_id,
+                            role=MemoryTargetRole.CURRENT_GROUP,
+                            block_id="current_group",
+                        )
+                    )
+            for candidate in candidates:
+                resolved = scopes.get(candidate)
+                if resolved is not None:
+                    targets.extend(resolved.targets)
+        except ValidationError as exc:
+            raise MemoryRetrievalError("memory_target_invalid") from exc
         return tuple(targets)

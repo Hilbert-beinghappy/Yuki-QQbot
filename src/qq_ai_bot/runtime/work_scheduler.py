@@ -236,38 +236,55 @@ class WorkScheduler:
             return []
         with self._timed("selection"):
             async with self.repository.database.sessions() as session:
+                query = (
+                    select(
+                        work.c.id,
+                        work.c.conversation_id,
+                        work.c.generation,
+                        work.c.source_key,
+                        work.c.source_json,
+                        work.c.goal,
+                        work.c.revision,
+                        work.c.state,
+                    )
+                    .outerjoin(
+                        scope,
+                        scope.c.conversation_id == work.c.conversation_id,
+                    )
+                    .outerjoin(recovery, recovery.c.work_id == work.c.id)
+                    .where(
+                        work.c.state.in_(("queued", "running")),
+                        or_(
+                            func.json_extract(work.c.source_json, "$.owner").in_(
+                                ("plugin_invocation", "automation", "plugin_background")
+                            ),
+                            func.json_extract(work.c.source_json, "$.origin").in_(
+                                ("user_message", "autonomous_group", "self_initiative")
+                            ),
+                        ),
+                        work.c.id.not_in(select(children.c.work_id)),
+                        work.c.conversation_id.not_in(tuple(self._in_flight)),
+                        or_(scope.c.owner.is_(None), scope.c.lease_until <= time.time()),
+                        or_(
+                            recovery.c.work_id.is_(None),
+                            recovery.c.not_before <= time.time(),
+                        ),
+                    )
+                    .order_by(work.c.updated)
+                )
+                scopes: dict[str, None] = {}
+                metadata = await session.execute(query.with_only_columns(work.c.conversation_id))
+                for (conversation_id,) in metadata:
+                    if conversation_id in scopes or len(scopes) < capacity:
+                        scopes.setdefault(conversation_id, None)
                 rows = (
                     (
-                        await session.execute(
-                            select(work)
-                            .outerjoin(
-                                scope,
-                                scope.c.conversation_id == work.c.conversation_id,
-                            )
-                            .outerjoin(recovery, recovery.c.work_id == work.c.id)
-                            .where(
-                                work.c.state.in_(("queued", "running")),
-                                or_(
-                                    func.json_extract(work.c.source_json, "$.owner").in_(
-                                        ("plugin_invocation", "automation", "plugin_background")
-                                    ),
-                                    func.json_extract(work.c.source_json, "$.origin").in_(
-                                        ("user_message", "autonomous_group", "self_initiative")
-                                    ),
-                                ),
-                                work.c.id.not_in(select(children.c.work_id)),
-                                work.c.conversation_id.not_in(tuple(self._in_flight)),
-                                or_(scope.c.owner.is_(None), scope.c.lease_until <= time.time()),
-                                or_(
-                                    recovery.c.work_id.is_(None),
-                                    recovery.c.not_before <= time.time(),
-                                ),
-                            )
-                            .order_by(work.c.updated)
-                        )
+                        (await session.execute(query.where(work.c.conversation_id.in_(scopes))))
+                        .mappings()
+                        .all()
                     )
-                    .mappings()
-                    .all()
+                    if scopes
+                    else []
                 )
         batches: dict[str, list[dict[str, Any]]] = {}
         for row in rows:

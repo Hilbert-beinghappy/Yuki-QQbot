@@ -16,6 +16,7 @@ from qq_ai_bot.automation.authority import DelegatedAuthority
 from qq_ai_bot.automation.models import (
     AutomationCreatorIdentity,
     AutomationDirectoryEntry,
+    AutomationDirectoryRecord,
     AutomationRecord,
     AutomationRunRecord,
     AutomationScript,
@@ -311,20 +312,12 @@ class AutomationRepository:
         statuses: tuple[AutomationStatus, ...],
         limit: int = 50,
         offset: int = 0,
+        include_script: bool = False,
     ) -> tuple[AutomationDirectoryEntry, ...]:
         """List a bounded, owner-independent task directory for the main Agent."""
 
-        query = (
-            select(AutomationModel, IdentityBindingModel.display_name)
-            .outerjoin(
-                IdentityBindingModel,
-                and_(
-                    IdentityBindingModel.person_id == AutomationModel.canonical_creator_person_id,
-                    IdentityBindingModel.platform == IDENTITY_PLATFORM,
-                    IdentityBindingModel.external_account_id == AutomationModel.creator_user_id,
-                ),
-            )
-            .where(AutomationModel.status.in_([status.value for status in statuses]))
+        query = _directory_statement(include_script=include_script).where(
+            AutomationModel.status.in_([status.value for status in statuses])
         )
         current = set(statuses) <= {AutomationStatus.ACTIVE, AutomationStatus.PAUSED}
         order = (
@@ -342,29 +335,19 @@ class AutomationRepository:
                     query.order_by(*order).offset(max(0, offset)).limit(max(1, min(limit, 101)))
                 )
             ).all()
-        return tuple(_automation_directory_entry(row, display_name) for row, display_name in rows)
+        return tuple(
+            _automation_directory_entry(row, include_script=include_script) for row in rows
+        )
 
     async def get_directory_entry(self, automation_id: int) -> AutomationDirectoryEntry | None:
         """Read one task and its creator projection in a single database query."""
 
-        query = (
-            select(AutomationModel, IdentityBindingModel.display_name)
-            .outerjoin(
-                IdentityBindingModel,
-                and_(
-                    IdentityBindingModel.person_id == AutomationModel.canonical_creator_person_id,
-                    IdentityBindingModel.platform == IDENTITY_PLATFORM,
-                    IdentityBindingModel.external_account_id == AutomationModel.creator_user_id,
-                ),
-            )
-            .where(AutomationModel.id == automation_id)
-        )
+        query = _directory_statement().where(AutomationModel.id == automation_id)
         async with self._database.sessions() as session:
             row = (await session.execute(query)).one_or_none()
         if row is None:
             return None
-        automation, display_name = row
-        return _automation_directory_entry(automation, display_name)
+        return _automation_directory_entry(row)
 
     async def list_current_for_creator(
         self,
@@ -700,18 +683,21 @@ class AutomationRepository:
             )
             .exists()
         )
-        due = and_(
-            true() if enabled else false(),
-            AutomationModel.status == AutomationStatus.ACTIVE.value,
-            AutomationModel.next_run_at.is_not(None),
-            AutomationModel.next_run_at <= timestamp,
-        )
+
+        def due_at(current: datetime) -> Any:
+            return and_(
+                true() if enabled else false(),
+                AutomationModel.status == AutomationStatus.ACTIVE.value,
+                AutomationModel.next_run_at.is_not(None),
+                AutomationModel.next_run_at <= current,
+            )
+
         async with self._database.sessions() as session:
             candidate_ids = (
                 await session.scalars(
                     select(AutomationModel.id)
                     .where(
-                        or_(running, due),
+                        or_(running, due_at(timestamp)),
                         or_(
                             AutomationModel.claimed_until.is_(None),
                             AutomationModel.claimed_until < timestamp,
@@ -721,31 +707,68 @@ class AutomationRepository:
                 )
             ).all()
         claimed: list[AutomationRecord] = []
-        for automation_id in candidate_ids:
+        for offset in range(0, len(candidate_ids), 128):
+            page = candidate_ids[offset : offset + 128]
             async with self._database.immediate_session() as session:
                 claimed_at = _aware_utc(clock() if clock is not None else datetime.now(UTC))
-                result = await session.execute(
-                    update(AutomationModel)
-                    .where(
-                        AutomationModel.id == automation_id,
-                        or_(running, due),
-                        or_(
-                            AutomationModel.claimed_until.is_(None),
-                            AutomationModel.claimed_until < claimed_at,
-                        ),
+                rows = (
+                    await session.scalars(
+                        update(AutomationModel)
+                        .where(
+                            AutomationModel.id.in_(page),
+                            or_(running, due_at(timestamp)),
+                            or_(
+                                AutomationModel.claimed_until.is_(None),
+                                AutomationModel.claimed_until < claimed_at,
+                            ),
+                        )
+                        .values(
+                            claimed_by=worker_id,
+                            claimed_until=claimed_at + timedelta(seconds=lease_seconds),
+                        )
+                        .returning(AutomationModel)
                     )
-                    .values(
-                        claimed_by=worker_id,
-                        claimed_until=claimed_at + timedelta(seconds=lease_seconds),
+                ).all()
+                accepted_ids = [row.id for row in rows]
+                latest = (
+                    select(
+                        AutomationVersionModel.automation_id,
+                        func.max(AutomationVersionModel.version).label("version"),
                     )
+                    .where(AutomationVersionModel.automation_id.in_(accepted_ids))
+                    .group_by(AutomationVersionModel.automation_id)
+                    .subquery()
                 )
-                if not cast(CursorResult[Any], result).rowcount:
-                    continue
-                row = await session.get(AutomationModel, automation_id)
-                if row is not None:
-                    claimed.append(
-                        _automation_record(row, await _current_version_id(session, automation_id))
+                versions: dict[int, int] = (
+                    dict(
+                        (
+                            await session.execute(
+                                select(
+                                    AutomationVersionModel.automation_id, AutomationVersionModel.id
+                                ).join(
+                                    latest,
+                                    and_(
+                                        AutomationVersionModel.automation_id
+                                        == latest.c.automation_id,
+                                        AutomationVersionModel.version == latest.c.version,
+                                    ),
+                                )
+                            )
+                        )
+                        .tuples()
+                        .all()
                     )
+                    if rows
+                    else {}
+                )
+            # The returned ORM columns are the accepted writer snapshot. Parse
+            # their original JSON only after commit has positively completed.
+            by_id = {row.id: row for row in rows}
+            claimed.extend(
+                _automation_record(by_id[identity], versions.get(identity))
+                for identity in page
+                if identity in by_id
+            )
         return tuple(claimed)
 
     async def release_claim(
@@ -1180,11 +1203,38 @@ def _automation_record(row: AutomationModel, version_id: int | None = None) -> A
     )
 
 
+def _directory_statement(*, include_script: bool = False) -> Any:
+    columns = (
+        [AutomationModel]
+        if include_script
+        else [getattr(AutomationModel, field) for field in AutomationDirectoryRecord.model_fields]
+    )
+    return select(*columns, IdentityBindingModel.display_name).outerjoin(
+        IdentityBindingModel,
+        and_(
+            IdentityBindingModel.person_id == AutomationModel.canonical_creator_person_id,
+            IdentityBindingModel.platform == IDENTITY_PLATFORM,
+            IdentityBindingModel.external_account_id == AutomationModel.creator_user_id,
+        ),
+    )
+
+
 def _automation_directory_entry(
-    row: AutomationModel,
-    display_name: str | None,
+    row: Any, *, include_script: bool = False
 ) -> AutomationDirectoryEntry:
-    record = _automation_record(row)
+    record = (
+        _automation_record(row[0])
+        if include_script
+        else AutomationDirectoryRecord(
+            **{
+                field: getattr(row, field)
+                for field in AutomationDirectoryRecord.model_fields
+                if field != "next_run_at"
+            },
+            next_run_at=_aware_utc(row.next_run_at) if row.next_run_at else None,
+        )
+    )
+    display_name = row[-1]
     return AutomationDirectoryEntry(
         record=record,
         creator=AutomationCreatorIdentity(

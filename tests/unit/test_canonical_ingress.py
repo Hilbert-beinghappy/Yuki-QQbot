@@ -4,12 +4,14 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from datetime import UTC, datetime
+from uuid import uuid4
 
 import pytest
 from sqlalchemy import select
 from tests.conftest import make_settings
 from tests.support.gateway import builtin_registry
 from tests.support.model_profiles import write_fake_profiles
+from tests.support.user_profiles_helpers import observe_members
 
 from qq_ai_bot.container import ApplicationContainer
 from qq_ai_bot.conversation.rollup.models import RollupPolicyConfig
@@ -1109,3 +1111,247 @@ async def test_internal_reply_reference_rejects_a_foreign_conversation(database:
             )
             is None
         )
+
+
+@pytest.mark.asyncio
+async def test_person_references_keep_all_people_and_the_first_mentioned_binding(
+    database: Database,
+) -> None:
+    from qq_ai_bot.identity.event_author import project_event_author, project_event_authors
+
+    user_ids = tuple(str(61001 + index) for index in range(8))
+    people = await observe_members(database, user_ids)
+    async with database.immediate_session() as session:
+        owner = await session.scalar(
+            select(IdentityBindingModel).where(
+                IdentityBindingModel.external_account_id == user_ids[0]
+            )
+        )
+        assert owner is not None
+        session.add(
+            IdentityBindingModel(
+                id=str(uuid4()),
+                person_id=owner.person_id,
+                platform="qq",
+                external_account_id="61999",
+                display_name="alternate account",
+                first_seen_at=_NOW,
+                last_seen_at=_NOW,
+                created_at=_NOW,
+                updated_at=_NOW,
+            )
+        )
+        disabled = await session.scalar(
+            select(IdentityBindingModel).where(
+                IdentityBindingModel.external_account_id == user_ids[-1]
+            )
+        )
+        assert disabled is not None
+        disabled.status = "disabled"
+    inputs = ("61999", "8000", "7777", "404", *user_ids, "1001", user_ids[1])
+    references = await people.person_reference_ids(
+        inputs, speaker_user_id="1001", bot_user_id="8000"
+    )
+    assert references == ("61999", *user_ids[1:-1])
+    async with database.sessions() as session:
+        batch = await project_event_authors(session, sender_user_ids=inputs)
+        for account in dict.fromkeys(inputs):
+            assert batch[account] == await project_event_author(session, sender_user_id=account)
+    assert batch["8000"].author_kind == "yuki"
+    assert batch["7777"].author_kind == "yuki"
+    assert batch["404"].author_person_id is None
+    assert batch[user_ids[-1]].author_person_id is None
+
+
+@pytest.mark.asyncio
+async def test_reference_projection_rejects_disabled_owner_and_presence_person_collision(
+    database: Database,
+) -> None:
+    from qq_ai_bot.identity.db_models import CanonicalPersonModel, PresenceModel
+    from qq_ai_bot.identity.event_author import project_event_authors
+
+    async with database.immediate_session() as session:
+        disabled_id = await ensure_person(session, "61010", now=_NOW)
+        owner = await session.get(CanonicalPersonModel, disabled_id)
+        assert owner is not None
+        owner.enabled = False
+        presence = await session.scalar(
+            select(PresenceModel).where(PresenceModel.external_account_id == "8000")
+        )
+        assert presence is not None
+        session.add(
+            IdentityBindingModel(
+                id=str(uuid4()),
+                person_id=disabled_id,
+                platform="qq",
+                external_account_id="8000",
+                display_name="collision",
+                first_seen_at=_NOW,
+                last_seen_at=_NOW,
+                created_at=_NOW,
+                updated_at=_NOW,
+            )
+        )
+    async with database.sessions() as session:
+        with pytest.raises(CanonicalIdentityError) as disabled:
+            await project_event_authors(session, sender_user_ids=("1001", "61010"))
+        assert disabled.value.category == "canonical_owner_disabled"
+        with pytest.raises(CanonicalIdentityError) as collision:
+            await project_event_authors(session, sender_user_ids=("8000",))
+        assert collision.value.category == "canonical_kind_mismatch"
+
+
+@pytest.mark.asyncio
+async def test_profile_batch_preserves_accounts_names_and_known_empty_group_card(
+    database: Database,
+) -> None:
+    from sqlalchemy import delete
+
+    from qq_ai_bot.identity.db_models import CanonicalPersonModel, SpaceBindingModel
+    from qq_ai_bot.persistence.models import MembershipModel, PersonAliasModel
+
+    people = await observe_members(database, ("61021", "61022", "61023"))
+    async with database.immediate_session() as session:
+        original = await session.scalar(
+            select(IdentityBindingModel).where(IdentityBindingModel.external_account_id == "61021")
+        )
+        assert original is not None
+        person_id = original.person_id
+        session.add(
+            IdentityBindingModel(
+                id=str(uuid4()),
+                person_id=person_id,
+                platform="qq",
+                external_account_id="61029",
+                display_name="alternate display",
+                first_seen_at=_NOW,
+                last_seen_at=_NOW,
+                created_at=_NOW,
+                updated_at=_NOW,
+            )
+        )
+        disabled = await session.scalar(
+            select(IdentityBindingModel).where(IdentityBindingModel.external_account_id == "61023")
+        )
+        assert disabled is not None
+        person = await session.get(CanonicalPersonModel, disabled.person_id)
+        assert person is not None
+        person.enabled = False
+    await people.observe(
+        user_id="61021",
+        nickname="",
+        nickname_known=False,
+        group_id="2001",
+        group_card="",
+        group_card_known=False,
+        expected_person_id=person_id,
+    )
+    old = await people.get(user_id="61021", group_id="2001")
+    assert old is not None and old.group_card == "card-61021"
+    await people.observe(
+        user_id="61021",
+        nickname="",
+        nickname_known=False,
+        group_id="2001",
+        group_card="",
+        group_card_known=True,
+        expected_person_id=person_id,
+    )
+    accounts = ("61029", "61022", "61021", "61029", "404", "61023")
+    profiles = await people.get_many(accounts, group_id="2001")
+    assert tuple(profiles) == ("61029", "61022", "61021")
+    assert profiles["61029"].nickname == profiles["61021"].nickname == "name-61021"
+    assert profiles["61029"].group_card == profiles["61021"].group_card == ""
+    assert profiles["61022"].group_card == "card-61022"
+    assert await people.members_in_group(accounts, "2001") == {"61029", "61021", "61022"}
+    card_only = await people.get(user_id="61021", group_id="2001", include_nickname=False)
+    assert card_only is not None and card_only.nickname == card_only.group_card == ""
+    assert await people.find_group_members_by_exact_name("card-61021", "2001") == ("61021",)
+    with pytest.raises(CanonicalIdentityError) as mismatch:
+        await people.observe(
+            user_id="61021", nickname="wrong owner", expected_person_id=str(uuid4())
+        )
+    assert mismatch.value.category == "canonical_owner_mismatch"
+    async with database.sessions() as session:
+        binding = await session.scalar(
+            select(IdentityBindingModel).where(IdentityBindingModel.external_account_id == "61021")
+        )
+        space_binding = await session.scalar(
+            select(SpaceBindingModel).where(SpaceBindingModel.external_space_id == "2001")
+        )
+        assert binding is not None and space_binding is not None
+        membership = await session.get(MembershipModel, (person_id, space_binding.space_id))
+        assert membership is not None
+        assert membership.last_seen_at == binding.last_seen_at == space_binding.last_seen_at
+
+    # With no global nickname, prefer this account's display, then the last
+    # active display across the Person's accounts, including future platforms.
+    async with database.immediate_session() as session:
+        binding = await session.scalar(
+            select(IdentityBindingModel).where(IdentityBindingModel.external_account_id == "61021")
+        )
+        assert binding is not None
+        binding.display_name = ""
+        await session.execute(
+            delete(PersonAliasModel).where(
+                PersonAliasModel.canonical_person_id == person_id,
+                PersonAliasModel.canonical_space_id.is_(None),
+                PersonAliasModel.alias_type == "nickname",
+            )
+        )
+        for account, platform, display_name, status in (
+            ("~foreign", "future-platform", "cross-platform fallback", "active"),
+            ("~~disabled", "qq", "disabled fallback", "disabled"),
+        ):
+            session.add(
+                IdentityBindingModel(
+                    id=str(uuid4()),
+                    person_id=person_id,
+                    platform=platform,
+                    external_account_id=account,
+                    display_name=display_name,
+                    status=status,
+                    first_seen_at=_NOW,
+                    last_seen_at=_NOW,
+                    created_at=_NOW,
+                    updated_at=_NOW,
+                )
+            )
+        other_space = await ensure_v2_space(session, "2002", now=_NOW)
+        session.add(
+            PersonAliasModel(
+                canonical_person_id=person_id,
+                canonical_space_id=other_space,
+                alias="foreign scoped nickname",
+                alias_type="nickname",
+                first_seen_at=_NOW,
+                last_seen_at=_NOW,
+            )
+        )
+    fallback = await people.get_many(("61021", "61029"))
+    assert fallback["61021"].nickname == "cross-platform fallback"
+    assert fallback["61029"].nickname == "alternate display"
+    assert await people.find_group_members_by_exact_name("cross-platform fallback", "2001") == (
+        "61021",
+    )
+    assert not await people.find_group_members_by_exact_name("disabled fallback", "2001")
+    assert not await people.find_group_members_by_exact_name("foreign scoped nickname", "2001")
+
+    # Equal timestamps retain the original latest-id nickname tie rule.
+    async with database.immediate_session() as session:
+        for name in ("tied earlier nickname", "tied later nickname"):
+            session.add(
+                PersonAliasModel(
+                    canonical_person_id=person_id,
+                    canonical_space_id=None,
+                    alias=name,
+                    alias_type="nickname",
+                    first_seen_at=_NOW,
+                    last_seen_at=_NOW,
+                )
+            )
+    tied = await people.get_many(("61021", "61029"), group_id="2001")
+    assert all(profile.nickname == "tied later nickname" for profile in tied.values())
+    assert await people.find_group_members_by_exact_name("tied later nickname", "2001") == (
+        "61021",
+    )

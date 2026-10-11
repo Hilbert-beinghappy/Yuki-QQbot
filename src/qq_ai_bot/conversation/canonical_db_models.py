@@ -370,6 +370,18 @@ class CanonicalConversationRollupJobModel(Base):
             "next_attempt_at",
             "lease_until",
         ),
+        Index(
+            "ix_canonical_rollup_pending_due",
+            "status",
+            text("julianday(next_attempt_at)"),
+            sqlite_where=text("status = 'pending'"),
+        ),
+        Index(
+            "ix_canonical_rollup_processing_due",
+            "status",
+            text("julianday(lease_until)"),
+            sqlite_where=text("status = 'processing'"),
+        ),
     )
 
     conversation_id: Mapped[str] = mapped_column(String(36), primary_key=True)

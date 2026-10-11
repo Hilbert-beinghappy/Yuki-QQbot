@@ -388,8 +388,14 @@ class DreamService:
         embedding_ids: set[int] = set()
         operation_count = 0
         current_map: dict[str, MemoryFact] = {}
+        current_facts = {
+            fact.id: fact
+            for fact in await self._facts.repository.get_facts(
+                tuple(snapshot.id for snapshot in ref_map.values()), session=session
+            )
+        }
         for ref, snapshot in ref_map.items():
-            current = await self._facts.repository.get_fact(snapshot.id, session=session)
+            current = current_facts.get(snapshot.id)
             if (
                 current is None
                 or fact_signature(current) != fact_signature(snapshot)
@@ -475,19 +481,25 @@ class DreamService:
             )
             if result.changed:
                 embedding_ids.update(source.id for source in sources)
-            loaded_outputs: list[MemoryFact] = []
-            for fact_id in result.output_fact_ids:
-                loaded_output = await self._facts.repository.get_fact(fact_id, session=session)
-                if loaded_output is not None:
-                    loaded_outputs.append(loaded_output)
-            output_facts = tuple(loaded_outputs)
+            latest_by_id = {
+                fact.id: fact
+                for fact in await self._facts.repository.get_facts(
+                    tuple(dict.fromkeys((*result.output_fact_ids, *(s.id for s in sources)))),
+                    session=session,
+                )
+            }
+            output_facts = tuple(
+                latest_by_id[fact_id]
+                for fact_id in result.output_fact_ids
+                if fact_id in latest_by_id
+            )
             if len(output_facts) != len(result.output_fact_ids):
                 raise RuntimeError("dream output fact disappeared before commit")
-            latest_sources: dict[int, MemoryFact] = {}
-            for source in sources:
-                latest = await self._facts.repository.get_fact(source.id, session=session)
-                if latest is not None:
-                    latest_sources[source.id] = latest
+            latest_sources = {
+                source.id: latest_by_id[source.id]
+                for source in sources
+                if source.id in latest_by_id
+            }
             await self._repository.commit_operation(
                 operation.id,
                 output_fact_id=result.output_fact_id,
@@ -549,24 +561,19 @@ class DreamService:
             rows = sorted(partitions[partition], key=lambda item: item.fact.id)
             by_id = {item.fact.id: item for item in rows}
             similarities: dict[tuple[int, int], float] = {}
+            degrees = dict.fromkeys(by_id, 0)
             for index, left in enumerate(rows):
                 for right in rows[index + 1 :]:
-                    similarities[(left.fact.id, right.fact.id)] = self._codec.dot(
-                        left.vector, right.vector
-                    )
+                    similarity = self._codec.dot(left.vector, right.vector)
+                    similarities[(left.fact.id, right.fact.id)] = similarity
+                    if similarity >= self._settings.memory_dream_similarity_threshold:
+                        degrees[left.fact.id] += 1
+                        degrees[right.fact.id] += 1
             remaining = set(by_id)
             while remaining:
                 seed = max(
                     remaining,
-                    key=lambda fact_id: (
-                        sum(
-                            self._similarity(fact_id, other, similarities)
-                            >= self._settings.memory_dream_similarity_threshold
-                            for other in remaining
-                            if other != fact_id
-                        ),
-                        -fact_id,
-                    ),
+                    key=lambda fact_id: (degrees[fact_id], -fact_id),
                 )
                 group = [seed]
                 remaining.remove(seed)
@@ -587,6 +594,13 @@ class DreamService:
                     ):
                         group.append(candidate_id)
                         remaining.remove(candidate_id)
+                for removed_id in group:
+                    for fact_id in remaining:
+                        if (
+                            self._similarity(removed_id, fact_id, similarities)
+                            >= self._settings.memory_dream_similarity_threshold
+                        ):
+                            degrees[fact_id] -= 1
                 ids = tuple(sorted(group))
                 if not incremental or changed.intersection(ids):
                     cluster = tuple(by_id[fact_id] for fact_id in ids)
@@ -671,6 +685,12 @@ class DreamService:
     async def _input(
         self, facts: tuple[MemoryFact, ...], *, session: AsyncSession | None = None
     ) -> tuple[DreamInput, dict[str, MemoryFact], str]:
+        if session is None:
+            async with self._facts.repository.transaction(read_snapshot=True) as owned:
+                return await self._input(facts, session=owned)
+        await self._facts.repository.prepare_evidence_rows(
+            tuple(fact.id for fact in facts), session=session
+        )
         ref_map = {f"memory_{index}": fact for index, fact in enumerate(facts, start=1)}
         remaining = self._settings.memory_dream_max_input_characters
         rows: list[DreamMemoryInput] = []
@@ -758,8 +778,8 @@ class DreamService:
     def _fit_input(self, payload: DreamInput) -> DreamInput:
         maximum = self._settings.memory_dream_max_input_characters
         current = payload
-        while len(current.model_dump_json()) > maximum:
-            overflow = len(current.model_dump_json()) - maximum
+        while (size := len(current.model_dump_json())) > maximum:
+            overflow = size - maximum
             rows = list(current.memories)
             changed = False
             for row_index in range(len(rows) - 1, -1, -1):

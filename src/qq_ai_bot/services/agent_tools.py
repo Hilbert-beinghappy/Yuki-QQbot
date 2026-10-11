@@ -14,7 +14,9 @@ from datetime import date, datetime
 from typing import Any, Literal, Protocol, cast
 
 from pydantic import ValidationError
+from sqlalchemy import text
 from sqlalchemy.exc import SQLAlchemyError
+from sqlalchemy.ext.asyncio import AsyncSession
 
 from qq_ai_bot.admin.config_service import RuntimeConfigService
 from qq_ai_bot.admin.models import RuntimeConfigSnapshot
@@ -1441,29 +1443,7 @@ class AgentToolService:
                     return self._result(
                         error=selection.code, detail=selection.detail, data=selection.data
                     )
-                group_id = await self._read_group_selector(target, runtime, default_current=False)
-                if isinstance(group_id, _ToolFailure):
-                    return self._result(
-                        error=group_id.code, detail=group_id.detail, data=group_id.data
-                    )
-                targets = selection.targets
-                if group_id is not None:
-                    requester = self._social_requester(runtime)
-                    if requester is not None:
-                        targets = (
-                            await self._memory_reads.person(
-                                requester, selection.user_id, group_id=group_id
-                            )
-                        ).targets
-                    else:
-                        targets = tuple(item for item in targets if item.group_id == group_id)
-                    if not targets:
-                        return self._result(
-                            error="permission_denied",
-                            detail="指定群范围没有历史关系授权；不可自动换范围重试",
-                            data={"denied_scope": "explicit_group", "query_executed": False},
-                        )
-                scope = ResolvedReadScope(targets=targets)
+                scope = ResolvedReadScope(targets=selection.targets)
             elif kind == "group":
                 group_id = await self._read_group_selector(target, runtime, default_current=False)
                 if isinstance(group_id, _ToolFailure):
@@ -1553,20 +1533,31 @@ class AgentToolService:
                 "invalid_person_selector",
                 "subject_ref、display_name、user_id 必须且只能提供一个",
             )
+        group_id = await self._read_group_selector(arguments, runtime, default_current=False)
+        if isinstance(group_id, _ToolFailure):
+            return group_id
         selector = selector_names[0]
         if selector == "subject_ref":
             subject_ref = arguments.get("subject_ref")
             if not isinstance(subject_ref, str) or not subject_ref:
                 return _ToolFailure("invalid_subject_ref", "subject_ref 必须是非空字符串")
-            resolved = await self._user_id_for_subject_ref(subject_ref, runtime)
-            if isinstance(resolved, _ToolFailure):
-                return resolved
-            return await self._person_memory_selection_for_user(
-                resolved,
-                runtime,
-                resolved_by="subject_ref",
-                subject_ref=subject_ref,
-            )
+            async with self._people.database.sessions() as session, session.begin():
+                await session.execute(text("BEGIN"))
+                owners: dict[str, str] = {}
+                resolved = await self._user_id_for_subject_ref(
+                    subject_ref, runtime, session=session, owners=owners
+                )
+                if isinstance(resolved, _ToolFailure):
+                    return resolved
+                return await self._person_memory_selection_for_user(
+                    resolved,
+                    runtime,
+                    resolved_by="subject_ref",
+                    subject_ref=subject_ref,
+                    selected_group_id=group_id,
+                    session=session,
+                    owners=owners,
+                )
 
         if selector == "display_name":
             display_name = arguments.get("display_name")
@@ -1588,14 +1579,15 @@ class AgentToolService:
                     "ambiguous_person",
                     "存在多个同名人物，请澄清目标或提供真实 @/兼容 ID",
                     {
-                        "candidates": [{"user_id": item} for item in matches[:5]],
-                        "has_more": len(matches) > 5,
+                        "candidates": [{"user_id": item} for item in matches],
+                        "has_more": False,
                     },
                 )
             return await self._person_memory_selection_for_user(
                 matches[0],
                 runtime,
                 resolved_by="display_name",
+                selected_group_id=group_id,
             )
 
         user_id = arguments.get("user_id")
@@ -1605,12 +1597,16 @@ class AgentToolService:
             user_id.strip(),
             runtime,
             resolved_by="user_id",
+            selected_group_id=group_id,
         )
 
     async def _user_id_for_subject_ref(
         self,
         subject_ref: str,
         runtime: ToolRuntime,
+        *,
+        session: AsyncSession,
+        owners: dict[str, str],
     ) -> str | _ToolFailure:
         if runtime.inbound is None:
             if (
@@ -1626,48 +1622,41 @@ class AgentToolService:
         if subject_ref == "replied_message_author":
             candidate = inbound.reply_sender_user_id
             targets = (
-                await self._people.person_reference_ids(
+                await self._people.person_reference_map(
                     (candidate,),
                     speaker_user_id=inbound.sender.user_id,
                     bot_user_id=inbound.bot_user_id,
+                    session=session,
                 )
                 if candidate
-                else ()
+                else {}
             )
             if not targets:
                 return _ToolFailure(
                     "subject_not_found",
                     "本轮没有可查询的回复消息作者",
                 )
-            return targets[0]
+            owners.update(targets)
+            return next(iter(targets))
 
         prefix = "member_"
         if not subject_ref.startswith(prefix):
             return _ToolFailure("invalid_subject_ref", "subject_ref 不是受支持的事件引用")
         user_id = subject_ref.removeprefix(prefix)
-        mentioned = await self._mentioned_people(runtime)
-        if user_id not in mentioned:
-            return _ToolFailure("subject_not_found", "该成员引用在本轮不存在")
-        return user_id
-
-    async def _mentioned_people(self, runtime: ToolRuntime) -> tuple[str, ...]:
-        inbound = runtime.require_inbound()
-        return await self._people.person_reference_ids(
+        references = await self._people.person_reference_map(
             (*inbound.mentioned_user_ids, *runtime.mentioned_user_ids),
             speaker_user_id=inbound.sender.user_id,
             bot_user_id=inbound.bot_user_id,
+            session=session,
         )
-
-    async def _is_person_tool_target(self, user_id: str, runtime: ToolRuntime) -> bool:
-        bot_user_id = runtime.effective_bot_user_id
-        if not bot_user_id:
-            return False
-        targets = await self._people.person_reference_ids(
-            (user_id,),
-            speaker_user_id="",
-            bot_user_id=bot_user_id,
-        )
-        return user_id in targets
+        owners.update(references)
+        representatives: dict[str, str] = {}
+        for account, person_id in references.items():
+            representatives.setdefault(person_id, account)
+        mentioned = tuple(representatives.values())
+        if user_id not in mentioned:
+            return _ToolFailure("subject_not_found", "该成员引用在本轮不存在")
+        return user_id
 
     async def _person_memory_selection_for_user(
         self,
@@ -1676,9 +1665,31 @@ class AgentToolService:
         *,
         resolved_by: str,
         subject_ref: str | None = None,
+        selected_group_id: str | None = None,
+        session: AsyncSession | None = None,
+        owners: dict[str, str] | None = None,
     ) -> _PersonMemorySelection | _ToolFailure:
+        if session is None:
+            async with self._people.database.sessions() as owned_session, owned_session.begin():
+                await owned_session.execute(text("BEGIN"))
+                return await self._person_memory_selection_for_user(
+                    user_id,
+                    runtime,
+                    resolved_by=resolved_by,
+                    subject_ref=subject_ref,
+                    selected_group_id=selected_group_id,
+                    session=owned_session,
+                    owners=owners,
+                )
         inbound = runtime.inbound
-        if not await self._is_person_tool_target(user_id, runtime):
+        if owners is None or user_id not in owners:
+            owners = await self._people.person_reference_map(
+                (user_id,),
+                speaker_user_id="",
+                bot_user_id=runtime.effective_bot_user_id or "",
+                session=session,
+            )
+        if not runtime.effective_bot_user_id or user_id not in owners:
             return _ToolFailure(
                 "permission_denied",
                 f"不能读取 {self._settings.bot_display_name} 身份的个人记忆",
@@ -1687,8 +1698,17 @@ class AgentToolService:
             scope = await self._memory_reads.person(
                 runtime.require_actor().user_id,
                 user_id,
+                group_id=selected_group_id,
+                person_ids=owners,
+                session=session,
             )
             if not scope.targets:
+                if selected_group_id is not None:
+                    return _ToolFailure(
+                        "permission_denied",
+                        "指定群范围没有历史关系授权；不可自动换范围重试",
+                        {"denied_scope": "explicit_group", "query_executed": False},
+                    )
                 return _ToolFailure("permission_denied", "没有本人或历史共同群关系授权")
             return _PersonMemorySelection(
                 user_id=user_id,
@@ -1701,6 +1721,7 @@ class AgentToolService:
             inbound is None
             and runtime.effective_scope_type is ScopeType.PRIVATE
             and user_id == runtime.external_target_id
+            and selected_group_id is None
         ):
             target = MemoryEntityTarget(
                 role=MemoryTargetRole.CURRENT_PERSON,
@@ -1716,12 +1737,20 @@ class AgentToolService:
             )
 
         group_id = inbound.group_id if inbound is not None else runtime.current_group_id
+        if selected_group_id is not None and selected_group_id != group_id:
+            return _ToolFailure(
+                "permission_denied",
+                "指定群范围没有历史关系授权；不可自动换范围重试",
+                {"denied_scope": "explicit_group", "query_executed": False},
+            )
         if group_id is None:
             return _ToolFailure(
                 "permission_denied",
                 "私聊中只能读取本人记忆",
             )
-        members = await self._people.members_in_group((user_id,), group_id)
+        members = await self._people.members_in_group(
+            (user_id,), group_id, person_ids=owners, session=session
+        )
         if user_id not in members:
             return _ToolFailure(
                 "permission_denied",
@@ -1777,8 +1806,8 @@ class AgentToolService:
                 "ambiguous_group",
                 "存在多个同名群，请澄清目标",
                 {
-                    "candidates": [{"group_id": item} for item in matches[:5]],
-                    "has_more": len(matches) > 5,
+                    "candidates": [{"group_id": item} for item in matches],
+                    "has_more": False,
                 },
             )
         return matches[0]

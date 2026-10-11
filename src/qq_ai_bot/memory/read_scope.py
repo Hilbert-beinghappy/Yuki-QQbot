@@ -6,7 +6,10 @@ actor. No durable grant cache: forgetting membership takes effect on the next re
 
 from __future__ import annotations
 
-from sqlalchemy import or_, select
+import json
+from collections.abc import Mapping
+
+from sqlalchemy import func, or_, select, text
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from qq_ai_bot.identity.db_models import (
@@ -96,30 +99,142 @@ class MemoryReadScopeResolver:
         *,
         group_id: str | None = None,
         include_person_groups: bool = True,
+        person_ids: Mapping[str, str] | None = None,
+        session: AsyncSession | None = None,
     ) -> ResolvedReadScope:
-        async with self._database.sessions() as session:
-            requester_id = await self._person(session, requester)
-            person_id = await self._person(session, target)
-            if requester_id is None or person_id is None:
-                return ResolvedReadScope(targets=())
-            shared = await self._groups(session, requester_id)
-            if requester_id != person_id:
-                shared &= await self._groups(session, person_id)
-                if not shared:
-                    return ResolvedReadScope(targets=())
-            if group_id is not None:
-                selected = await session.scalar(
-                    select(SpaceBindingModel.space_id).where(
-                        SpaceBindingModel.platform == "qq",
-                        SpaceBindingModel.external_space_id == group_id,
-                        SpaceBindingModel.status == "active",
+        scopes = await self.people(
+            requester,
+            (target,),
+            group_id=group_id,
+            include_person_groups=include_person_groups,
+            person_ids=person_ids,
+            session=session,
+        )
+        return scopes.get(target, ResolvedReadScope(targets=()))
+
+    async def people(
+        self,
+        requester: str,
+        targets: tuple[str, ...],
+        *,
+        group_id: str | None = None,
+        include_person_groups: bool = True,
+        restrict_to_group: bool = True,
+        person_ids: Mapping[str, str] | None = None,
+        session: AsyncSession | None = None,
+    ) -> dict[str, ResolvedReadScope]:
+        """Batch direct social scopes in one snapshot.
+
+        A caller preparing global Person plus local PersonGroup targets can keep
+        the global scope when the selected group is not shared. Supplied owners
+        come from the caller's canonical projection in this same session.
+        """
+        if session is None:
+            async with self._database.sessions() as owned_session, owned_session.begin():
+                await owned_session.execute(text("BEGIN"))
+                return await self.people(
+                    requester,
+                    targets,
+                    group_id=group_id,
+                    include_person_groups=include_person_groups,
+                    restrict_to_group=restrict_to_group,
+                    person_ids=person_ids,
+                    session=owned_session,
+                )
+        if person_ids is None:
+            values = func.json_each(
+                json.dumps(tuple(dict.fromkeys((requester, *targets))))
+            ).table_valued("value")
+            owners = {
+                account: person_id
+                for account, person_id in (
+                    await session.execute(
+                        select(
+                            IdentityBindingModel.external_account_id, IdentityBindingModel.person_id
+                        ).where(
+                            IdentityBindingModel.platform == "qq",
+                            IdentityBindingModel.status == "active",
+                            IdentityBindingModel.external_account_id.in_(select(values.c.value)),
+                        )
+                    )
+                ).all()
+            }
+        else:
+            owners = dict(person_ids)
+            if requester not in owners:
+                requester_id = await self._person(session, requester)
+                if requester_id is not None:
+                    owners[requester] = requester_id
+        requester_id = owners.get(requester)
+        if requester_id is None:
+            return {}
+        candidate_ids = {owners[target] for target in targets if target in owners}
+        groups_by_person: dict[str, set[str]] = {}
+        if include_person_groups or group_id is not None or candidate_ids - {requester_id}:
+            values = func.json_each(json.dumps(tuple({requester_id, *candidate_ids}))).table_valued(
+                "value"
+            )
+            memberships = (
+                await session.execute(
+                    select(
+                        MembershipModel.canonical_person_id, MembershipModel.canonical_space_id
+                    ).where(
+                        MembershipModel.canonical_person_id.in_(select(values.c.value)),
+                        MembershipModel.canonical_space_id.in_(
+                            select(MembershipModel.canonical_space_id).where(
+                                MembershipModel.canonical_person_id == requester_id
+                            )
+                        ),
                     )
                 )
-                if selected not in shared:
-                    return ResolvedReadScope(targets=())
-                shared = {selected}
+            ).all()
+            for person_id, space_id in memberships:
+                groups_by_person.setdefault(person_id, set()).add(space_id)
+        selected = None
+        if group_id is not None:
+            selected = await session.scalar(
+                select(SpaceBindingModel.space_id).where(
+                    SpaceBindingModel.platform == "qq",
+                    SpaceBindingModel.external_space_id == group_id,
+                    SpaceBindingModel.status == "active",
+                )
+            )
+        group_accounts: dict[str, str] = {}
+        if include_person_groups:
+            if group_id is not None:
+                if selected is not None:
+                    group_accounts[str(selected)] = group_id
+            else:
+                values = func.json_each(
+                    json.dumps(tuple(groups_by_person.get(requester_id, ())))
+                ).table_valued("value")
+                bindings = (
+                    await session.execute(
+                        select(SpaceBindingModel.space_id, SpaceBindingModel.external_space_id)
+                        .where(
+                            SpaceBindingModel.space_id.in_(select(values.c.value)),
+                            SpaceBindingModel.platform == "qq",
+                            SpaceBindingModel.status == "active",
+                        )
+                        .order_by(SpaceBindingModel.space_id, SpaceBindingModel.id)
+                    )
+                ).all()
+                for space_id, account in bindings:
+                    group_accounts.setdefault(space_id, account)
+        result = {}
+        for target in dict.fromkeys(targets):
+            person_id = owners.get(target)
+            if person_id is None:
+                continue
             own = requester_id == person_id
-            targets = [
+            shared = groups_by_person.get(person_id, set())
+            if not own and not shared:
+                continue
+            if group_id is not None:
+                if selected not in shared and restrict_to_group:
+                    continue
+                shared = {str(selected)} if selected in shared else set()
+            entity_targets = [
                 MemoryEntityTarget(
                     scope_type=MemoryScopeType.PERSON,
                     subject_user_id=target,
@@ -130,36 +245,24 @@ class MemoryReadScopeResolver:
                 )
             ]
             if include_person_groups:
-                bindings = (
-                    await session.scalars(
-                        select(SpaceBindingModel)
-                        .where(
-                            SpaceBindingModel.space_id.in_(shared),
-                            SpaceBindingModel.platform == "qq",
-                            SpaceBindingModel.status == "active",
-                        )
-                        .order_by(SpaceBindingModel.space_id, SpaceBindingModel.id)
-                    )
-                ).all()
-                seen: set[str] = set()
-                for binding in bindings:
-                    if binding.space_id in seen:
+                for space_id in sorted(shared):
+                    if space_id not in group_accounts:
                         continue
-                    seen.add(binding.space_id)
-                    targets.append(
+                    entity_targets.append(
                         MemoryEntityTarget(
                             scope_type=MemoryScopeType.PERSON_GROUP,
                             subject_user_id=target,
-                            group_id=group_id or binding.external_space_id,
+                            group_id=group_accounts[space_id],
                             role=(
                                 MemoryTargetRole.CURRENT_PERSON_GROUP
                                 if own
                                 else MemoryTargetRole.REFERENCED_PERSON_GROUP
                             ),
-                            block_id=f"person_group:{person_id}:{binding.space_id}",
+                            block_id=f"person_group:{person_id}:{space_id}",
                         )
                     )
-            return ResolvedReadScope(targets=tuple(targets))
+            result[target] = ResolvedReadScope(targets=tuple(entity_targets))
+        return result
 
     async def group(self, requester: str, group_id: str) -> ResolvedReadScope:
         async with self._database.sessions() as session:
@@ -343,12 +446,14 @@ class MemoryReadScopeResolver:
             return False
 
     async def people_named(self, requester: str, name: str) -> tuple[str, ...]:
-        """Exact names inside authorized relationships, at most six distinct people."""
+        """Complete exact-name candidates inside authorized relationships."""
         async with self._database.sessions() as session:
             requester_id = await self._person(session, requester)
             if requester_id is None:
                 return ()
-            groups = await self._groups(session, requester_id)
+            groups = select(MembershipModel.canonical_space_id).where(
+                MembershipModel.canonical_person_id == requester_id
+            )
             related = select(MembershipModel.canonical_person_id).where(
                 MembershipModel.canonical_space_id.in_(groups)
             )
@@ -373,27 +478,19 @@ class MemoryReadScopeResolver:
                 )
                 .exists()
             )
-            people = (
-                await session.scalars(
-                    select(IdentityBindingModel.person_id)
-                    .where(
-                        IdentityBindingModel.platform == "qq",
-                        IdentityBindingModel.status == "active",
-                        or_(
-                            IdentityBindingModel.person_id == requester_id,
-                            IdentityBindingModel.person_id.in_(related),
-                        ),
-                        or_(
-                            IdentityBindingModel.display_name == name.strip(),
-                            alias_match,
-                            card_match,
-                        ),
-                    )
-                    .distinct()
-                    .order_by(IdentityBindingModel.person_id)
-                    .limit(6)
-                )
-            ).all()
+            people = select(IdentityBindingModel.person_id).where(
+                IdentityBindingModel.platform == "qq",
+                IdentityBindingModel.status == "active",
+                or_(
+                    IdentityBindingModel.person_id == requester_id,
+                    IdentityBindingModel.person_id.in_(related),
+                ),
+                or_(
+                    IdentityBindingModel.display_name == name.strip(),
+                    alias_match,
+                    card_match,
+                ),
+            )
             bindings = (
                 await session.scalars(
                     select(IdentityBindingModel)
@@ -413,7 +510,12 @@ class MemoryReadScopeResolver:
     async def groups_named(self, requester: str, name: str) -> tuple[str, ...]:
         """No live membership probe and no disclosure of inaccessible group names."""
         async with self._database.sessions() as session:
-            groups = await self._groups(session, await self._person(session, requester))
+            requester_id = await self._person(session, requester)
+            if requester_id is None:
+                return ()
+            groups = select(MembershipModel.canonical_space_id).where(
+                MembershipModel.canonical_person_id == requester_id
+            )
             matching = (
                 select(SpaceBindingModel.space_id)
                 .join(CanonicalSpaceModel, CanonicalSpaceModel.id == SpaceBindingModel.space_id)
@@ -428,7 +530,6 @@ class MemoryReadScopeResolver:
                 )
                 .distinct()
                 .order_by(SpaceBindingModel.space_id)
-                .limit(6)
             )
             bindings = (
                 await session.scalars(

@@ -46,6 +46,13 @@ class PersonAliasModel(Base):
         ),
         Index("ix_person_aliases_canonical_person_id", "canonical_person_id"),
         Index("ix_person_aliases_canonical_space_id", "canonical_space_id"),
+        Index(
+            "ix_person_aliases_nickname_current",
+            "canonical_person_id",
+            "last_seen_at",
+            "id",
+            sqlite_where=text("alias_type = 'nickname' AND canonical_space_id IS NULL"),
+        ),
     )
 
     id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)

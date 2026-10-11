@@ -206,17 +206,20 @@ class SubjectContextBuilder:
         resolved = list(context.resolved_subjects)
         refs_by_user: dict[str, str] = {}
         updated: list[MemoryClaim] = []
+        names = tuple(
+            dict.fromkeys(
+                (claim.subject_name or "").strip()
+                for claim in claims
+                if claim.subject_ref == "named_member" and (claim.subject_name or "").strip()
+            )
+        )
+        matches = await self._people.find_group_members_by_normalized_names(names, event.group_id)
         for claim in claims:
             name = (claim.subject_name or "").strip()
             if claim.subject_ref != "named_member" or not name:
                 updated.append(claim)
                 continue
-            matches = await self._people.search_group_member_names(
-                name,
-                event.group_id,
-                minimum_score=0.35,
-            )
-            exact = tuple(item for item in matches if item.exact)
+            exact = matches[name]
             if len(exact) != 1:
                 updated.append(claim)
                 continue

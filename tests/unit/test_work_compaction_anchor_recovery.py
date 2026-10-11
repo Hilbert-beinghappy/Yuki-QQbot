@@ -493,3 +493,77 @@ async def test_optional_note_does_not_reject_repeated_references_or_extra_metada
     assert note["version"] == 2
     assert (await control.repository.get(control.current["id"]))["model_requests"] == 3
     await control.repository.release(control.lease)
+
+
+async def test_actual_compaction_request_has_monotone_complete_unit_pages(
+    database, tmp_path, monkeypatch
+):
+    from copy import deepcopy
+
+    from tests.support.work_compaction_capacity_helpers import _runtime
+
+    from qq_ai_bot.llm.fake import FakeLLMProvider
+    from qq_ai_bot.model_runtime.models import ModelExecutionPriority
+
+    control, session, transcript, _ = await _staged_root(database, tmp_path, stage=False)
+    for index in range(60):
+        transcript.append(
+            ChatMessage("assistant", f"Record {index}: " + '中文\\" observation ' * 120)
+        )
+    await session.save("paired")
+    provider = FakeLLMProvider()
+    runner, runtime = await _runtime(
+        database,
+        control,
+        session.compaction_anchor.request().messages,
+        provider,
+        work_context_window_tokens=8192,
+    )
+    original = session.summary_source
+    checked = []
+
+    class PagePrepared(Exception):
+        pass
+
+    async def inspect_page(**arguments):
+        source = json.loads(await original(**arguments))
+        fits = arguments["fits"]
+        units = (await session.journal.objects.get(source["paging"]["snapshot_ref"]))["units"]
+        unit_refs = {unit["ref"] for unit in units}
+        inherited = set(source["source_refs"]) - unit_refs
+        baseline = deepcopy(source)
+        for key in (
+            "records",
+            "record_source_indices",
+            "model_observations",
+            "effects",
+            "source_fragments",
+        ):
+            baseline.pop(key, None)
+        for end in range(len(units) + 1):
+            candidate = deepcopy(baseline)
+            references = set(inherited)
+            for unit in units[:end]:
+                candidate.setdefault(unit["kind"], []).append(unit["value"])
+                references.add(unit["ref"])
+                if unit["kind"] == "records":
+                    candidate.setdefault("record_source_indices", []).append(unit["index"])
+            candidate["source_refs"] = sorted(references)
+            candidate["paging"]["next_cursor"] = [end, 0]
+            checked.append(fits(json.dumps(candidate, ensure_ascii=False)))
+        assert fits(json.dumps(source, ensure_ascii=False))
+        assert source["paging"]["next_cursor"] < [len(units), 0]
+        assert set(source["source_refs"]) >= inherited
+        raise PagePrepared
+
+    monkeypatch.setattr(session, "summary_source", inspect_page)
+    with pytest.raises(PagePrepared):
+        await runner._compact_work(
+            runtime,
+            ModelExecutionPriority.FOREGROUND,
+            128000,
+            ChatRequest(messages=transcript.request().messages, max_output_tokens=8192),
+        )
+    assert checked[0] and not checked[-1]
+    assert checked == sorted(checked, reverse=True)
+    assert not provider.requests

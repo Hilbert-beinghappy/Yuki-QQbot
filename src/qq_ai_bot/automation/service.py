@@ -6,6 +6,7 @@ import logging
 import time
 from dataclasses import replace
 from datetime import datetime
+from typing import cast
 
 from pydantic import ValidationError
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -160,14 +161,16 @@ class AutomationService:
         while rows := await self._repository.list_directory(
             statuses=(AutomationStatus.ACTIVE, AutomationStatus.PAUSED),
             offset=offset,
+            include_script=True,
         ):
-            matched.extend(
-                entry
-                for entry in rows
-                if entry.record.max_runs == max_runs
-                and entry.record.script.model_dump(mode="json", exclude={"name"}, exclude_none=True)
-                == expected
-            )
+            for entry in rows:
+                record = cast(AutomationRecord, entry.record)
+                if (
+                    record.max_runs == max_runs
+                    and record.script.model_dump(mode="json", exclude={"name"}, exclude_none=True)
+                    == expected
+                ):
+                    matched.append(entry)
             offset += len(rows)
         return tuple(matched)
 

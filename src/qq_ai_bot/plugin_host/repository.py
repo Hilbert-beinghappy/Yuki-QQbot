@@ -543,10 +543,18 @@ class PluginStateRepository:
             )
             if row is None:
                 return None
-            from qq_ai_bot.plugin_host.ownership import require_state_readable
+            from qq_ai_bot.plugin_host.ownership import (
+                project_person_external_id,
+                require_state_readable,
+            )
 
             await require_state_readable(session, row)
-            return await _state_record(session, row)
+            subject = (
+                await project_person_external_id(session, row.canonical_person_id)
+                if row.canonical_person_id
+                else None
+            )
+            return _state_record(row, subject_user_id=subject)
 
     async def list_namespace(
         self,
@@ -576,11 +584,17 @@ class PluginStateRepository:
                     .limit(max(1, min(limit, 1_000)))
                 )
             ).all()
-            from qq_ai_bot.plugin_host.ownership import require_state_readable
+            from qq_ai_bot.plugin_host.ownership import require_live_people
 
-            for row in rows:
-                await require_state_readable(session, row)
-            return tuple([await _state_record(session, row) for row in rows])
+            await require_live_people(
+                session,
+                tuple(
+                    dict.fromkeys(
+                        row.canonical_person_id for row in rows if row.canonical_person_id
+                    )
+                ),
+            )
+            return tuple(_state_record(row) for row in rows)
 
     async def storage_usage_bytes(
         self,
@@ -701,7 +715,7 @@ class PluginStateRepository:
                 )
             )
             assert row is not None
-            return await _state_record(session, row, subject_user_id=projected_subject)
+            return _state_record(row, subject_user_id=projected_subject)
 
     async def delete(
         self,
@@ -845,13 +859,9 @@ def _config_record(
     )
 
 
-async def _state_record(
-    session: AsyncSession, row: PluginStateModel, *, subject_user_id: str | None = None
+def _state_record(
+    row: PluginStateModel, *, subject_user_id: str | None = None
 ) -> PluginStateRecord:
-    if row.canonical_person_id and subject_user_id is None:
-        from qq_ai_bot.plugin_host.ownership import project_person_external_id
-
-        subject_user_id = await project_person_external_id(session, row.canonical_person_id)
     return PluginStateRecord(
         id=row.id,
         plugin_id=row.plugin_id,

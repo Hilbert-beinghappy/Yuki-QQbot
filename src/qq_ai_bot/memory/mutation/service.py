@@ -218,9 +218,15 @@ class MemoryMutationService:
 
         if not source_facts:
             raise ValueError("dream mutation requires source facts")
+        current_by_id = {
+            fact.id: fact
+            for fact in await self._facts.repository.get_facts(
+                tuple(snapshot.id for snapshot in source_facts), session=session
+            )
+        }
         current: list[MemoryFact] = []
         for snapshot in source_facts:
-            fact = await self._facts.repository.get_fact(snapshot.id, session=session)
+            fact = current_by_id.get(snapshot.id)
             if fact is None or fact.status not in {MemoryStatus.ACTIVE, MemoryStatus.CONTESTED}:
                 raise ValueError("dream source changed before commit")
             current.append(fact)

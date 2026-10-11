@@ -465,6 +465,61 @@ class MemoryFactRepository:
         )
         return await project_memory_fact_rows(session, rows)
 
+    async def list_visible_self_facts(
+        self, *, person_id: str | None, space_id: str | None
+    ) -> tuple[MemoryFact, ...]:
+        """Read the current reflection owner's global and local SELF input."""
+        from qq_ai_bot.memory.partition import require_xor_memory_owner
+
+        person_id, space_id = require_xor_memory_owner(person_id, space_id)
+        global_scope = and_(
+            MemoryFactModel.visibility_type == SelfMemoryVisibility.GLOBAL.value,
+            MemoryFactModel.canonical_visibility_person_id.is_(None),
+            MemoryFactModel.canonical_visibility_space_id.is_(None),
+        )
+        local_scope = and_(
+            MemoryFactModel.visibility_type
+            == (
+                SelfMemoryVisibility.GROUP.value if space_id else SelfMemoryVisibility.PRIVATE.value
+            ),
+            MemoryFactModel.canonical_visibility_person_id == person_id,
+            MemoryFactModel.canonical_visibility_space_id == space_id,
+        )
+        conditions = [
+            MemoryFactModel.scope_type == MemoryScopeType.SELF.value,
+            MemoryFactModel.canonical_subject_person_id.is_(None),
+            MemoryFactModel.canonical_subject_space_id.is_(None),
+            MemoryFactModel.review_state != "quarantined",
+            MemoryFactModel.status.in_(
+                (
+                    MemoryStatus.ACTIVE.value,
+                    MemoryStatus.CONTESTED.value,
+                    MemoryStatus.INVALIDATED.value,
+                )
+            ),
+            or_(global_scope, local_scope),
+            or_(
+                MemoryFactModel.status != MemoryStatus.ACTIVE.value,
+                MemoryFactModel.valid_until.is_(None),
+                MemoryFactModel.valid_until > datetime.now(UTC),
+            ),
+        ]
+        async with self._database.sessions() as session:
+            rows = await self._execute_facts_with_count(
+                session,
+                conditions,
+                order_by=(
+                    case(
+                        {"active": 0, "contested": 1, "invalidated": 2},
+                        value=MemoryFactModel.status,
+                    ),
+                    case((global_scope, 0), else_=1),
+                    MemoryFactModel.importance.desc(),
+                    MemoryFactModel.updated_at.desc(),
+                ),
+            )
+            return await project_memory_fact_rows(session, rows)
+
     async def get_fact(
         self,
         fact_id: int,
@@ -488,10 +543,14 @@ class MemoryFactRepository:
     ) -> tuple[MemoryFact, ...]:
         if not fact_ids:
             return ()
-        rows = await self._execute_facts_with_count(
-            session, [MemoryFactModel.id.in_(fact_ids)], order_by=()
-        )
-        return await project_memory_fact_rows(session, rows)
+        unique_ids = tuple(dict.fromkeys(fact_ids))
+        facts: list[MemoryFact] = []
+        for offset in range(0, len(unique_ids), 256):
+            rows = await self._execute_facts_with_count(
+                session, [MemoryFactModel.id.in_(unique_ids[offset : offset + 256])], order_by=()
+            )
+            facts.extend(await project_memory_fact_rows(session, rows))
+        return tuple(facts)
 
     async def get_active_for_target(
         self,
@@ -881,8 +940,9 @@ class MemoryFactRepository:
         source_event_id: int | None,
         actor_user_id: str | None,
         session: AsyncSession,
+        current: MemoryFactModel | None = None,
     ) -> bool:
-        row = await session.get(MemoryFactModel, fact_id)
+        row = current if current is not None else await session.get(MemoryFactModel, fact_id)
         if row is None:
             return False
         now = datetime.now(UTC)
@@ -1776,91 +1836,98 @@ class MemoryJobRepository:
         """Content-free queue readiness; normal sub-hour accumulation is not blocked."""
         now = datetime.now(UTC)
         stale = now - timedelta(minutes=5)
+        job = MemoryJobModel
+        pending = job.status == MemoryJobStatus.PENDING.value
+        processing = job.status == MemoryJobStatus.PROCESSING.value
+        failed = job.status == MemoryJobStatus.FAILED.value
+        has_person = func.coalesce(job.canonical_person_id, "") != ""
+        has_space = func.coalesce(job.canonical_space_id, "") != ""
+        valid_owner = has_person != has_space
+        open_conditions = (
+            job.status.in_(
+                (
+                    MemoryJobStatus.PENDING.value,
+                    MemoryJobStatus.PROCESSING.value,
+                    MemoryJobStatus.FAILED.value,
+                )
+            ),
+        )
         async with self._database.sessions() as session:
-            rows = (
+            await session.execute(text("BEGIN"))
+            summary = (
                 await session.execute(
                     select(
-                        MemoryJobModel.canonical_person_id,
-                        MemoryJobModel.canonical_space_id,
-                        MemoryJobModel.status,
-                        MemoryJobModel.attempts,
-                        MemoryJobModel.next_attempt_at,
-                        MemoryJobModel.created_at,
-                        MemoryJobModel.updated_at,
-                        (
+                        func.sum(case((pending, 1), else_=0)),
+                        func.sum(case((processing, 1), else_=0)),
+                        func.sum(case((failed, 1), else_=0)),
+                        func.sum(case((and_(processing, job.updated_at <= stale), 1), else_=0)),
+                        func.sum(case((~valid_owner, 1), else_=0)),
+                        func.min(case((or_(pending, processing), job.created_at))),
+                    )
+                    .select_from(job)
+                    .join(ChatEventModel, ChatEventModel.id == job.event_id)
+                    .where(*open_conditions)
+                )
+            ).one()
+            owners = (
+                await session.execute(
+                    select(
+                        job.canonical_person_id,
+                        job.canonical_space_id,
+                        func.count(),
+                        func.sum(
                             func.length(ChatEventModel.content)
                             + func.length(ChatEventModel.audio_transcript)
                         ),
-                        MemoryJobModel.error_category,
+                        func.max(case((or_(job.attempts > 0, processing), 1), else_=0)),
+                        func.min(job.created_at),
                     )
-                    .join(ChatEventModel, ChatEventModel.id == MemoryJobModel.event_id)
+                    .join(ChatEventModel, ChatEventModel.id == job.event_id)
                     .where(
-                        MemoryJobModel.status.in_(
-                            (
-                                MemoryJobStatus.PENDING.value,
-                                MemoryJobStatus.PROCESSING.value,
-                                MemoryJobStatus.FAILED.value,
-                            )
-                        )
+                        valid_owner,
+                        or_(
+                            and_(pending, job.next_attempt_at <= now),
+                            and_(processing, job.updated_at <= stale),
+                        ),
                     )
+                    .group_by(job.canonical_person_id, job.canonical_space_id)
                 )
             ).all()
-        owners: dict[tuple[str | None, str | None], list[Any]] = {}
-        failures: dict[str, int] = {}
-        pending = processing = failed = stale_processing = invalid_owner = 0
-        oldest_age = 0
-        for row in rows:
-            status, attempts = str(row[2]), int(row[3])
-            created = row[5].replace(tzinfo=UTC)
-            if status == MemoryJobStatus.PENDING.value:
-                pending += 1
-                oldest_age = max(oldest_age, max(0, int((now - created).total_seconds())))
-            elif status == MemoryJobStatus.PROCESSING.value:
-                processing += 1
-                oldest_age = max(oldest_age, max(0, int((now - created).total_seconds())))
-                stale_processing += int(row[6].replace(tzinfo=UTC) <= stale)
-            else:
-                failed += 1
-                category = str(row[8] or "unknown")[:64]
-                failures[category] = failures.get(category, 0) + 1
-            if bool(row[0]) == bool(row[1]):
-                invalid_owner += 1
-                continue
-            due = row[4].replace(tzinfo=UTC) <= now
-            eligible = (status == MemoryJobStatus.PENDING.value and due) or (
-                status == MemoryJobStatus.PROCESSING.value and row[6].replace(tzinfo=UTC) <= stale
+            category = func.substr(
+                func.coalesce(func.nullif(job.error_category, ""), "unknown"), 1, 64
             )
-            if eligible:
-                owners.setdefault((row[0], row[1]), []).append(
-                    (attempts, created, int(row[7] or 0), status)
-                )
+            failure_rows = await session.execute(
+                select(category, func.count())
+                .join(ChatEventModel, ChatEventModel.id == job.event_id)
+                .where(failed)
+                .group_by(category)
+            )
+            failures = {str(category): int(count) for category, count in failure_rows}
         ready = sum(
             1
-            for items in owners.values()
+            for _person, _space, count, characters, retried, created in owners
             if (
-                any(
-                    attempts > 0 or status == MemoryJobStatus.PROCESSING.value
-                    for attempts, _created, _chars, status in items
-                )
-                or len(items) >= max(1, trigger_count)
-                or sum(chars for _attempts, _created, chars, _status in items)
-                >= max(1, max_characters)
-                or any(
-                    (now - created).total_seconds() >= max_wait_seconds
-                    for _attempts, created, _chars, _status in items
-                )
+                retried
+                or count >= max(1, trigger_count)
+                or int(characters or 0) >= max(1, max_characters)
+                or (now - created.replace(tzinfo=UTC)).total_seconds() >= max_wait_seconds
             )
         )
+        oldest_age = (
+            max(0, int((now - summary[5].replace(tzinfo=UTC)).total_seconds()))
+            if summary[5] is not None
+            else 0
+        )
         return {
-            "pending_events": pending,
-            "processing_events": processing,
-            "failed_events": failed,
-            "stale_processing_events": stale_processing,
+            "pending_events": int(summary[0] or 0),
+            "processing_events": int(summary[1] or 0),
+            "failed_events": int(summary[2] or 0),
+            "stale_processing_events": int(summary[3] or 0),
             "oldest_open_age_seconds": oldest_age,
             "ready_owner_count": ready,
             "waiting_owner_count": max(0, len(owners) - ready),
             "normal_waiting_is_blocked": False,
-            "invalid_owner_count": invalid_owner,
+            "invalid_owner_count": int(summary[4] or 0),
             "failure_categories": dict(sorted(failures.items())),
         }
 

@@ -33,25 +33,6 @@ from qq_ai_bot.persistence.repository_records import (
 from qq_ai_bot.persistence.scoped_event_uow import ScopedEventLedgerUnitOfWork
 
 
-async def _starts_after_event_id_for_scope(session: AsyncSession, scope: ConversationScope) -> int:
-    from qq_ai_bot.conversation.canonical_db_models import (
-        CanonicalConversationModel,
-        ConversationLegacyAliasModel,
-    )
-
-    alias = await session.scalar(
-        select(ConversationLegacyAliasModel).where(
-            ConversationLegacyAliasModel.scope_key == scope.key
-        )
-    )
-    if alias is None:
-        return 0
-    conversation = await session.get(CanonicalConversationModel, alias.conversation_id)
-    if conversation is None:
-        return 0
-    return int(conversation.starts_after_event_id)
-
-
 async def _conversation_id_for_scope(session: AsyncSession, scope: ConversationScope) -> str | None:
     from qq_ai_bot.conversation.canonical_db_models import ConversationLegacyAliasModel
 
@@ -81,16 +62,30 @@ class ConversationReadVersion:
 
 
 async def _read_version(session: AsyncSession, scope: ConversationScope) -> ConversationReadVersion:
-    from qq_ai_bot.conversation.canonical_db_models import CanonicalConversationModel
+    from qq_ai_bot.conversation.canonical_db_models import (
+        CanonicalConversationModel,
+        ConversationLegacyAliasModel,
+    )
 
-    identity = await _conversation_id_for_scope(session, scope)
-    row = await session.get(CanonicalConversationModel, identity) if identity else None
-    return ConversationReadVersion(
-        scope,
-        identity,
-        int(row.generation) if row else 0,
-        int(row.starts_after_event_id) if row else 0,
-        int(row.prompt_source_revision) if row else 0,
+    row = (
+        await session.execute(
+            select(
+                CanonicalConversationModel.id,
+                CanonicalConversationModel.generation,
+                CanonicalConversationModel.starts_after_event_id,
+                CanonicalConversationModel.prompt_source_revision,
+            )
+            .join(
+                ConversationLegacyAliasModel,
+                ConversationLegacyAliasModel.conversation_id == CanonicalConversationModel.id,
+            )
+            .where(ConversationLegacyAliasModel.scope_key == scope.key)
+        )
+    ).one_or_none()
+    return (
+        ConversationReadVersion(scope, *row)
+        if row is not None
+        else ConversationReadVersion(scope, None, 0, 0)
     )
 
 
@@ -361,6 +356,7 @@ class EventLedgerRepository:
     ) -> tuple[ConversationReadVersion, tuple[EventRecord, ...]]:
         """Read the current generation, retaining its version for dispatch validation."""
         async with self._database.sessions() as session:
+            await session.execute(text("BEGIN"))
             version = await _read_version(session, scope)
             if version.conversation_id is None:
                 return version, ()
@@ -428,14 +424,14 @@ class EventLedgerRepository:
         """Read the newest events from the canonical Conversation behind an alias."""
 
         async with self._database.sessions() as session:
-            conversation_id = await _conversation_id_for_scope(session, scope)
-            if conversation_id is None:
+            await session.execute(text("BEGIN"))
+            version = await _read_version(session, scope)
+            if version.conversation_id is None:
                 return ()
-            boundary = await _starts_after_event_id_for_scope(session, scope)
             query = select(ChatEventModel).where(
-                ChatEventModel.canonical_conversation_id == conversation_id,
+                ChatEventModel.canonical_conversation_id == version.conversation_id,
                 keeper_event_clause(),
-                ChatEventModel.id > max(0, after_event_id, boundary),
+                ChatEventModel.id > max(0, after_event_id, version.starts_after_event_id),
             )
             if message_only:
                 query = query.where(ChatEventModel.event_kind == "message")
@@ -473,6 +469,47 @@ class EventLedgerRepository:
         rows.reverse()
         return tuple(_event_record(row) for row in rows)
 
+    async def list_recent_activity(
+        self,
+        scope: ConversationScope,
+        *,
+        conversation_id: str | None = None,
+        limit: int,
+    ) -> tuple[tuple[str, str | None, datetime], ...]:
+        """Read the same recent keeper window without bodies or attachment JSON."""
+        from qq_ai_bot.conversation.canonical_db_models import (
+            CanonicalConversationModel,
+            ConversationLegacyAliasModel,
+        )
+
+        query = (
+            select(
+                ChatEventModel.event_kind, ChatEventModel.author_kind, ChatEventModel.occurred_at
+            )
+            .join(
+                CanonicalConversationModel,
+                CanonicalConversationModel.id == ChatEventModel.canonical_conversation_id,
+            )
+            .where(
+                keeper_event_clause(),
+                ChatEventModel.id > CanonicalConversationModel.starts_after_event_id,
+            )
+        )
+        if conversation_id is not None:
+            query = query.where(CanonicalConversationModel.id == conversation_id)
+        else:
+            query = query.join(
+                ConversationLegacyAliasModel,
+                ConversationLegacyAliasModel.conversation_id == CanonicalConversationModel.id,
+            ).where(ConversationLegacyAliasModel.scope_key == scope.key)
+        async with self._database.sessions() as session:
+            rows = (
+                (await session.execute(query.order_by(ChatEventModel.id.desc()).limit(limit)))
+                .tuples()
+                .all()
+            )
+        return tuple(reversed(rows))
+
     async def list_scope_before(
         self,
         scope: ConversationScope,
@@ -484,15 +521,15 @@ class EventLedgerRepository:
         """Return the bounded scope prefix preceding one ledger event id."""
 
         async with self._database.sessions() as session:
-            conversation_id = await _conversation_id_for_scope(session, scope)
-            if conversation_id is None:
+            await session.execute(text("BEGIN"))
+            version = await _read_version(session, scope)
+            if version.conversation_id is None:
                 return ()
-            boundary = await _starts_after_event_id_for_scope(session, scope)
             query = select(ChatEventModel).where(
-                ChatEventModel.canonical_conversation_id == conversation_id,
+                ChatEventModel.canonical_conversation_id == version.conversation_id,
                 keeper_event_clause(),
                 ChatEventModel.id < before_event_id,
-                ChatEventModel.id > boundary,
+                ChatEventModel.id > version.starts_after_event_id,
             )
             if message_only:
                 query = query.where(ChatEventModel.event_kind == "message")
@@ -516,14 +553,14 @@ class EventLedgerRepository:
         message_only: bool = False,
     ) -> tuple[EventRecord, ...]:
         async with self._database.sessions() as session:
-            conversation_id = await _conversation_id_for_scope(session, scope)
-            if conversation_id is None:
+            await session.execute(text("BEGIN"))
+            version = await _read_version(session, scope)
+            if version.conversation_id is None:
                 return ()
-            boundary = await _starts_after_event_id_for_scope(session, scope)
             query = select(ChatEventModel).where(
-                ChatEventModel.canonical_conversation_id == conversation_id,
+                ChatEventModel.canonical_conversation_id == version.conversation_id,
                 keeper_event_clause(),
-                ChatEventModel.id > max(after_event_id, boundary),
+                ChatEventModel.id > max(after_event_id, version.starts_after_event_id),
             )
             if message_only:
                 query = query.where(ChatEventModel.event_kind == "message")
@@ -553,35 +590,9 @@ class EventLedgerRepository:
         the range contains no other events or replaces publication source CAS.
         A changed version returns no bodies so the caller can reject its plan.
         """
-        from qq_ai_bot.conversation.canonical_db_models import (
-            CanonicalConversationModel,
-            ConversationLegacyAliasModel,
-        )
-
         async with self._database.sessions() as session:
             await session.execute(text("BEGIN"))
-            row = (
-                await session.execute(
-                    select(
-                        CanonicalConversationModel.id,
-                        CanonicalConversationModel.generation,
-                        CanonicalConversationModel.starts_after_event_id,
-                        CanonicalConversationModel.prompt_source_revision,
-                    )
-                    .join(
-                        ConversationLegacyAliasModel,
-                        ConversationLegacyAliasModel.conversation_id
-                        == CanonicalConversationModel.id,
-                    )
-                    .where(ConversationLegacyAliasModel.scope_key == expected.scope.key)
-                    .limit(1)
-                )
-            ).one_or_none()
-            version = (
-                ConversationReadVersion(expected.scope, *row)
-                if row is not None
-                else ConversationReadVersion(expected.scope, None, 0, 0)
-            )
+            version = await _read_version(session, expected.scope)
             if version != expected or version.conversation_id is None:
                 return version, ()
             lower = max(after_event_id, version.starts_after_event_id)
@@ -673,43 +684,48 @@ class EventLedgerRepository:
     ) -> tuple[EventRecord | None, tuple[EventRecord, ...], tuple[EventRecord, ...]]:
         """Read nearby events strictly inside the current scope generation."""
 
-        center = await self.get_event(event_id)
-        if center is None:
-            return None, (), ()
-        if message_only and center.event_kind != "message":
-            return None, (), ()
         async with self._database.sessions() as session:
-            conversation_id = await _conversation_id_for_scope(session, scope)
-            if conversation_id is None or center.canonical_conversation_id != conversation_id:
+            await session.execute(text("BEGIN"))
+            version = await _read_version(session, scope)
+            if version.conversation_id is None:
                 return None, (), ()
-            boundary = await _starts_after_event_id_for_scope(session, scope)
-        if center.id <= boundary:
-            return None, (), ()
-        earlier = (
-            tuple(
-                row
-                for row in await self.list_scope_before(
-                    scope,
-                    before_event_id=center.id,
-                    limit=before,
-                    message_only=message_only,
-                )
-                if row.id > boundary
+            query = select(ChatEventModel).where(
+                ChatEventModel.canonical_conversation_id == version.conversation_id,
+                ChatEventModel.id > version.starts_after_event_id,
+                keeper_event_clause(),
             )
-            if before > 0
-            else ()
-        )
-        later = (
-            await self.list_scope_after(
-                scope,
-                after_event_id=center.id,
-                limit=after,
-                message_only=message_only,
+            if message_only:
+                query = query.where(ChatEventModel.event_kind == "message")
+            center = await session.scalar(query.where(ChatEventModel.id == event_id))
+            if center is None:
+                return None, (), ()
+            earlier = (
+                (
+                    await session.scalars(
+                        query.where(ChatEventModel.id < event_id)
+                        .order_by(ChatEventModel.id.desc())
+                        .limit(before)
+                    )
+                ).all()
+                if before > 0
+                else ()
             )
-            if after > 0
-            else ()
-        )
-        return center, earlier, later
+            later = (
+                (
+                    await session.scalars(
+                        query.where(ChatEventModel.id > event_id)
+                        .order_by(ChatEventModel.id)
+                        .limit(after)
+                    )
+                ).all()
+                if after > 0
+                else ()
+            )
+            return (
+                _event_record(center),
+                tuple(_event_record(row) for row in reversed(earlier)),
+                tuple(_event_record(row) for row in later),
+            )
 
     async def hydrate_rebuild_subjects(self, event: EventRecord) -> EventRecord:
         """Recover deterministic mention/reply metadata in the exact Conversation."""
@@ -743,6 +759,7 @@ class EventLedgerRepository:
                 reply_sender = referenced.sender_user_id
         from qq_ai_bot.identity.event_author import (
             canonical_person_reference_ids,
+            project_event_authors,
             same_platform_presence_external_ids,
         )
 
@@ -752,16 +769,25 @@ class EventLedgerRepository:
                 event.sender_user_id,
                 *await same_platform_presence_external_ids(session),
             }
+            candidates = tuple(user_id for user_id in mentions if user_id not in blocked)
+            reply_candidates = (
+                (reply_sender,) if reply_sender is not None and reply_sender not in blocked else ()
+            )
+            authors = await project_event_authors(
+                session, sender_user_ids=(*candidates, *reply_candidates)
+            )
             mention_ids = await canonical_person_reference_ids(
                 session,
-                tuple(user_id for user_id in mentions if user_id not in blocked),
+                candidates,
                 speaker_user_id=event.sender_user_id,
+                authors=authors,
             )
             reply_ids = (
                 await canonical_person_reference_ids(
                     session,
-                    (reply_sender,),
+                    reply_candidates,
                     speaker_user_id=event.sender_user_id,
+                    authors=authors,
                 )
                 if reply_sender is not None and reply_sender not in blocked
                 else ()
@@ -796,15 +822,21 @@ class EventLedgerRepository:
     ) -> tuple[EventRecord, ...]:
         """Search with trigram FTS, falling back to bounded LIKE for short terms."""
 
-        if scope is not None:
-            async with self._database.sessions() as session:
-                resolved = await _conversation_id_for_scope(session, scope)
-            if resolved is None or (conversation_id is not None and conversation_id != resolved):
-                return ()
-            conversation_id = resolved
         conditions: list[str] = [sql_keeper_event_predicate("ce")]
         params: dict[str, Any] = {"limit": limit}
         has_search_bound = bool(user_id or group_id or after or before)
+        if scope is not None:
+            conditions.extend(
+                (
+                    "ce.canonical_conversation_id = (SELECT conversation_id "
+                    "FROM conversation_legacy_aliases WHERE scope_key = :scope_key)",
+                    "ce.id > (SELECT c.starts_after_event_id FROM canonical_conversations AS c "
+                    "JOIN conversation_legacy_aliases AS a ON a.conversation_id = c.id "
+                    "WHERE a.scope_key = :scope_key)",
+                )
+            )
+            params["scope_key"] = scope.key
+            has_search_bound = True
         if conversation_id is not None:
             conditions.append("ce.canonical_conversation_id = :conversation_id")
             conditions.append(
@@ -832,12 +864,28 @@ class EventLedgerRepository:
         prefix = f" AND {' AND '.join(conditions)}" if conditions else ""
         stripped = keyword.strip()
         if len(stripped) >= 3:
+            bounds = ""
+            matches = "SELECT rowid FROM chat_events_fts WHERE chat_events_fts MATCH :keyword"
+            if has_search_bound:
+                bounded_events = "SELECT ce.id FROM chat_events AS ce WHERE " + " AND ".join(
+                    conditions
+                )
+                bounds = (
+                    "WITH search_bounds AS MATERIALIZED (SELECT ("
+                    + bounded_events
+                    + " ORDER BY ce.id ASC LIMIT 1) AS first_id, ("
+                    + bounded_events
+                    + " ORDER BY ce.id DESC LIMIT 1) AS last_id) "
+                )
+                matches += (
+                    " AND rowid >= (SELECT first_id FROM search_bounds)"
+                    " AND rowid <= (SELECT last_id FROM search_bounds)"
+                )
             sql = text(
-                """
-                SELECT ce.* FROM chat_events AS ce
-                JOIN chat_events_fts AS fts ON fts.rowid = ce.id
-                WHERE chat_events_fts MATCH :keyword
-                """
+                bounds
+                + "SELECT ce.* FROM chat_events AS ce WHERE ce.id IN ("
+                + matches
+                + ")"
                 + prefix
                 + " ORDER BY ce.occurred_at DESC, ce.id DESC LIMIT :limit"
             )

@@ -10,6 +10,8 @@ from dataclasses import dataclass, replace
 from datetime import UTC
 from typing import Any
 
+from sqlalchemy import text
+
 from qq_ai_bot.admin.models import RuntimeConfigSnapshot
 from qq_ai_bot.automation.registry import CapabilityExecutionContext
 from qq_ai_bot.config import Settings
@@ -1020,19 +1022,34 @@ class ContextAssembler:
             return subjects
 
         reply_user_id = inbound.reply_sender_user_id
-        targets = await self._people.person_reference_ids(
-            (
-                *inbound.mentioned_user_ids,
-                *((reply_user_id,) if reply_user_id else ()),
-            ),
-            speaker_user_id=inbound.sender.user_id,
-            bot_user_id=inbound.bot_user_id,
+        references = (
+            *inbound.mentioned_user_ids,
+            *((reply_user_id,) if reply_user_id else ()),
         )
-        mentioned = tuple(
-            user_id for user_id in targets if user_id in set(inbound.mentioned_user_ids)
-        )
-        members = await self._people.members_in_group(targets, group_id) if targets else frozenset()
-        profiles = await self._people.get_many(tuple(members), group_id=group_id) if members else {}
+        if not references:
+            return subjects
+        async with self._people.database.sessions() as session, session.begin():
+            await session.execute(text("BEGIN"))
+            owners = await self._people.person_reference_map(
+                references,
+                speaker_user_id=inbound.sender.user_id,
+                bot_user_id=inbound.bot_user_id,
+                session=session,
+            )
+            representatives: dict[str, str] = {}
+            for user_id, person_id in owners.items():
+                representatives.setdefault(person_id, user_id)
+            targets = tuple(representatives.values())
+            profiles = await self._people.get_many(
+                targets,
+                group_id=group_id,
+                person_ids=owners,
+                members_only=True,
+                session=session,
+            )
+        members = frozenset(profiles)
+        mentioned_ids = set(inbound.mentioned_user_ids)
+        mentioned = tuple(user_id for user_id in targets if user_id in mentioned_ids)
 
         for user_id in mentioned:
             if user_id not in members:
@@ -1047,29 +1064,9 @@ class ContextAssembler:
                     else user_id,
                 }
             )
-        reply_targets = (
-            await self._people.person_reference_ids(
-                (reply_user_id,),
-                speaker_user_id=inbound.sender.user_id,
-                bot_user_id=inbound.bot_user_id,
-            )
-            if reply_user_id
-            else ()
-        )
-        reply_rep = next((user_id for user_id in reply_targets if user_id in members), None)
-        if reply_rep is None and reply_targets:
-            for candidate in targets:
-                if candidate not in members:
-                    continue
-                collapsed = await self._people.person_reference_ids(
-                    (reply_user_id or "", candidate),
-                    speaker_user_id="",
-                    bot_user_id=inbound.bot_user_id,
-                )
-                if len(collapsed) == 1:
-                    reply_rep = candidate
-                    break
-        if reply_rep is not None:
+        reply_person_id = owners.get(reply_user_id.strip()) if reply_user_id else None
+        reply_rep = representatives.get(reply_person_id) if reply_person_id else None
+        if reply_rep is not None and reply_rep in members:
             person = profiles.get(reply_rep)
             subjects.append(
                 {

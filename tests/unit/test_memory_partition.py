@@ -6,12 +6,16 @@ from datetime import UTC, datetime
 from uuid import uuid4
 
 import pytest
-from sqlalchemy import select, text
+from sqlalchemy import delete, select, text, update
+from tests.conftest import make_settings
+from tests.support.user_profiles_helpers import inbound, observe_members
 
 from qq_ai_bot.conversation.canonical_db_models import (
     CanonicalConversationModel,
     ConversationLegacyAliasModel,
 )
+from qq_ai_bot.domain.conversations import ScopeType
+from qq_ai_bot.domain.profiles import UserProfileSnapshot
 from qq_ai_bot.identity.canonical_repository import IDENTITY_PLATFORM, ensure_person, ensure_space
 from qq_ai_bot.identity.db_models import (
     CanonicalPersonModel,
@@ -19,6 +23,8 @@ from qq_ai_bot.identity.db_models import (
     IdentityBindingModel,
     SpaceBindingModel,
 )
+from qq_ai_bot.memory.enums import MemoryScopeType, MemoryTargetRole
+from qq_ai_bot.memory.extraction import MemoryClaim
 from qq_ai_bot.memory.partition import (
     MemoryPartitionResolutionError,
     format_canonical_memory_partition,
@@ -26,9 +32,13 @@ from qq_ai_bot.memory.partition import (
     resolve_memory_partition_for_event,
     resolve_memory_partition_from_scope,
 )
+from qq_ai_bot.memory.read_scope import MemoryReadScopeResolver
 from qq_ai_bot.memory.runtime.partition_lookup import DatabaseMemoryPartitionLookup
+from qq_ai_bot.memory.subjects import SubjectContextBuilder, SubjectResolver
+from qq_ai_bot.memory.targets import MemoryTargetResolver
 from qq_ai_bot.persistence.database import Database
-from qq_ai_bot.persistence.models import ChatEventModel
+from qq_ai_bot.persistence.models import ChatEventModel, MembershipModel
+from qq_ai_bot.persistence.repository_records import EventRecord
 
 _NOW = datetime(2026, 8, 24, tzinfo=UTC)
 
@@ -245,3 +255,283 @@ async def test_conversation_uuid_cannot_be_used_as_memory_owner(database: Databa
                 session, _event(message_id="conversation-owner", peer="1103")
             )
     assert exc.value.reason == "conversation_uuid"
+
+
+@pytest.mark.asyncio
+async def test_targets_keep_sixth_mention_and_reply_after_five_people(database: Database) -> None:
+    from dataclasses import replace
+
+    user_ids = tuple(str(62001 + index) for index in range(7))
+    people = await observe_members(database, ("1001", *user_ids))
+    message = replace(
+        inbound(
+            "references", message_id="references", group_id="2001", mentioned_user_ids=user_ids[:6]
+        ),
+        reply_sender_user_id=user_ids[-1],
+    )
+    targets = await MemoryTargetResolver(people).resolve(message, include_self=True)
+    assert targets[0].role is MemoryTargetRole.CURRENT_SELF
+    person_targets = tuple(
+        target for target in targets if target.scope_type is MemoryScopeType.PERSON
+    )
+    local_targets = tuple(
+        target for target in targets if target.scope_type is MemoryScopeType.PERSON_GROUP
+    )
+    assert tuple(target.subject_user_id for target in person_targets) == ("1001", *user_ids)
+    assert tuple(target.subject_user_id for target in local_targets) == ("1001", *user_ids)
+    assert all(target.group_id == "2001" for target in local_targets)
+    assert sum(target.scope_type is MemoryScopeType.GROUP for target in targets) == 1
+
+
+@pytest.mark.asyncio
+async def test_event_refs_keep_reply_role_for_another_binding_of_a_mentioned_person(
+    database: Database,
+    monkeypatch,
+) -> None:
+    from dataclasses import replace
+
+    from qq_ai_bot.conversation.rollup.models import RollupPolicyConfig
+    from qq_ai_bot.conversation.rollup.repository import ConversationRollupRepository
+    from qq_ai_bot.conversation.rollup.service import ConversationRollupService
+    from qq_ai_bot.persistence.event_repository import EventLedgerRepository
+    from qq_ai_bot.services.context_assembler import ContextAssembler
+    from qq_ai_bot.time.service import TimeContextService
+
+    user_ids = tuple(str(62021 + index) for index in range(7))
+    people = await observe_members(database, ("1001", *user_ids[:6]))
+    async with database.immediate_session() as session:
+        person_id = await ensure_person(session, user_ids[-1], now=_NOW)
+        binding = await session.scalar(
+            select(IdentityBindingModel).where(
+                IdentityBindingModel.external_account_id == user_ids[0]
+            )
+        )
+        assert binding is not None
+        session.add(
+            IdentityBindingModel(
+                id=str(uuid4()),
+                person_id=binding.person_id,
+                platform="qq",
+                external_account_id="62999",
+                display_name="reply account",
+                first_seen_at=_NOW,
+                last_seen_at=_NOW,
+                created_at=_NOW,
+                updated_at=_NOW,
+            )
+        )
+    settings = make_settings(database.url)
+    config = RollupPolicyConfig()
+    assembler = ContextAssembler(
+        settings=settings,
+        ledger=EventLedgerRepository(database),
+        people=people,
+        time_service=TimeContextService(database),
+        rollup_repository=ConversationRollupRepository(database, config),
+        rollup_service=ConversationRollupService(models=None, config=config, timeout_seconds=1),
+    )
+    message = replace(
+        inbound("refs", message_id="bound-refs", group_id="2001", mentioned_user_ids=user_ids),
+        reply_sender_user_id="62999",
+    )
+    current = UserProfileSnapshot(
+        user_id="1001",
+        scope_type=ScopeType.GROUP,
+        group_id="2001",
+        nickname="event name",
+        group_card="event card",
+    )
+    get_many = people.get_many
+    changed = False
+
+    async def forget_after_owner_projection(*args, **kwargs):
+        nonlocal changed
+        if not changed:
+            changed = True
+            async with database.immediate_session() as writer:
+                first = await writer.scalar(
+                    select(IdentityBindingModel.person_id).where(
+                        IdentityBindingModel.external_account_id == user_ids[0]
+                    )
+                )
+                forgotten = await writer.scalar(
+                    select(IdentityBindingModel.person_id).where(
+                        IdentityBindingModel.external_account_id == user_ids[2]
+                    )
+                )
+                await writer.execute(
+                    update(MembershipModel)
+                    .where(MembershipModel.canonical_person_id == first)
+                    .values(group_card="changed after projection")
+                )
+                await writer.execute(
+                    delete(MembershipModel).where(MembershipModel.canonical_person_id == forgotten)
+                )
+        return await get_many(*args, **kwargs)
+
+    monkeypatch.setattr(people, "get_many", forget_after_owner_projection)
+    subjects = await assembler._event_bound_memory_refs(message, current)
+    members = tuple(item for item in subjects if item["subject_ref"].startswith("member_"))
+    assert tuple(item["user_id"] for item in members) == user_ids[:6]
+    reply = next(item for item in subjects if item["subject_ref"] == "replied_message_author")
+    assert reply["user_id"] == user_ids[0]
+    assert reply["display_name"] == f"card-{user_ids[0]}" and changed
+    assert subjects[0]["display_name"] == "event card"
+    assert person_id not in {item.get("user_id") for item in subjects}
+    refreshed = await assembler._event_bound_memory_refs(message, current)
+    assert not any(item.get("user_id") == user_ids[2] for item in refreshed)
+    assert (
+        next(item for item in refreshed if item["subject_ref"] == "replied_message_author")[
+            "display_name"
+        ]
+        == "changed after projection"
+    )
+
+
+@pytest.mark.asyncio
+async def test_batch_person_scopes_use_direct_membership_and_forgetting_takes_effect(
+    database: Database,
+) -> None:
+    people = await observe_members(database, ("1001", "62041"), group_id="2001")
+    await observe_members(database, ("62041", "62042"), group_id="2002")
+    await observe_members(database, ("1001",), group_id="2999")
+    resolver = MemoryReadScopeResolver(database)
+    batch = await resolver.people("1001", ("1001", "62041", "62042", "404"))
+    assert set(batch) == {"1001", "62041"}
+    assert {target.group_id for target in batch["62041"].targets if target.group_id} == {"2001"}
+    assert (await resolver.person("1001", "62041", group_id="2999")).targets == ()
+    message = inbound(
+        "other group",
+        message_id="other-group",
+        group_id="2999",
+        mentioned_user_ids=("62041", "62042"),
+    )
+    targets = await MemoryTargetResolver(people).resolve(message)
+    assert any(
+        target.subject_user_id == "62041" and target.scope_type is MemoryScopeType.PERSON
+        for target in targets
+    )
+    assert not any(
+        target.subject_user_id in {"62041", "62042"}
+        and target.scope_type is MemoryScopeType.PERSON_GROUP
+        for target in targets
+    )
+    assert not any(target.subject_user_id == "62042" for target in targets)
+    async with database.immediate_session() as session:
+        binding = await session.scalar(
+            select(IdentityBindingModel).where(IdentityBindingModel.external_account_id == "62041")
+        )
+        group = await session.scalar(
+            select(SpaceBindingModel).where(SpaceBindingModel.external_space_id == "2001")
+        )
+        assert binding is not None and group is not None
+        membership = await session.get(MembershipModel, (binding.person_id, group.space_id))
+        assert membership is not None
+        await session.delete(membership)
+    assert (await resolver.person("1001", "62041")).targets == ()
+
+
+@pytest.mark.asyncio
+async def test_normalized_claim_names_resolve_complete_exact_candidates_without_fuzzy_selection(
+    database: Database,
+) -> None:
+    repeated = tuple(str(62061 + index) for index in range(7))
+    people = await observe_members(database, ("1001", "62060", *repeated))
+    await people.observe(user_id="62060", nickname="Ａ-lpHa", group_id="2001", group_card="")
+    for user_id in repeated:
+        await people.observe(user_id=user_id, nickname="同名", group_id="2001", group_card="")
+    assert await people.find_group_members_by_exact_name("alpha", "2001") == ()
+    assert await people.find_group_members_by_exact_name("Ａ-lpHa", "2001") == ("62060",)
+    exact = await people.find_group_members_by_normalized_names(
+        ("alpha", "A lp-ha", "同名"), "2001"
+    )
+    assert tuple(item.user_id for item in exact["alpha"]) == ("62060",)
+    assert exact["alpha"] == exact["A lp-ha"]
+    assert len(exact["同名"]) == len(repeated)
+    fuzzy = await people.search_group_member_names("同名", "2001", limit=len(repeated))
+    assert tuple(item.user_id for item in fuzzy) == repeated
+    assert all(item.exact for item in fuzzy)
+    event = EventRecord(
+        id=1,
+        bot_user_id="9999",
+        platform_message_id="claims",
+        scope_type=ScopeType.GROUP,
+        sender_user_id="1001",
+        direction="inbound",
+        content="declarations",
+        visual_summary="",
+        segments=(),
+        occurred_at=_NOW,
+        group_id="2001",
+        sender_nickname="event nickname",
+    )
+    claims = tuple(
+        MemoryClaim(
+            subject_ref="named_member",
+            subject_name=name,
+            scope_type=MemoryScopeType.PERSON_GROUP,
+            memory_key=f"claim-{index}",
+            category="declared",
+            content="reported fact",
+            evidence_quote="declarations",
+        )
+        for index, name in enumerate(("alpha", "A lp-ha", "同名", "alph"))
+    )
+    builder = SubjectContextBuilder(people)
+    resolved, context = await builder.resolve_claim_names(
+        event, claims, SubjectResolver.context(event)
+    )
+    assert resolved[0].subject_ref == resolved[1].subject_ref != "named_member"
+    assert resolved[2:] == claims[2:]
+    subject = context.resolve(f"{resolved[0].subject_ref}:person_group")
+    assert subject is not None and subject.subject_user_id == "62060"
+    displayed = await builder.build(event)
+    assert displayed.available_subjects[0].display_label == "event nickname（ID 1001）"
+
+
+@pytest.mark.asyncio
+async def test_exact_tool_ambiguity_reports_all_authorized_people_and_groups(
+    database: Database,
+) -> None:
+    from qq_ai_bot.memory.repository import MemoryFactRepository
+    from qq_ai_bot.memory.service import MemoryFactService
+    from qq_ai_bot.persistence.repositories import AgentActionRepository, EventLedgerRepository
+    from qq_ai_bot.services.agent_tools import AgentToolService, ToolRuntime, _ToolFailure
+
+    user_ids = tuple(str(62081 + index) for index in range(8))
+    people = await observe_members(database, ("1001", *user_ids))
+    for user_id in user_ids:
+        await people.observe(user_id=user_id, nickname="共同名字", group_id="2001", group_card="")
+    groups = tuple(str(62101 + index) for index in range(8))
+    for group_id in groups:
+        await observe_members(database, ("1001",), group_id=group_id)
+    async with database.immediate_session() as session:
+        for group_id in groups:
+            binding = await session.scalar(
+                select(SpaceBindingModel).where(SpaceBindingModel.external_space_id == group_id)
+            )
+            assert binding is not None
+            space = await session.get(CanonicalSpaceModel, binding.space_id)
+            assert space is not None
+            space.name = "共同群名"
+    tools = AgentToolService(
+        settings=make_settings(database.url),
+        ledger=EventLedgerRepository(database),
+        memories=MemoryFactService(MemoryFactRepository(database)),
+        actions=AgentActionRepository(database),
+    )
+    runtime = ToolRuntime(
+        inbound=inbound("choose target", message_id="ambiguity", group_id="2001"),
+        gateway=None,
+        allow_generic_onebot=False,
+    )
+    people_failure = await tools._resolve_person_memory_selection(
+        {"display_name": "共同名字"}, runtime
+    )
+    group_failure = await tools._read_group_selector(
+        {"group_name": "共同群名"}, runtime, default_current=False
+    )
+    assert isinstance(people_failure, _ToolFailure) and people_failure.code == "ambiguous_person"
+    assert {item["user_id"] for item in people_failure.data["candidates"]} == set(user_ids)
+    assert isinstance(group_failure, _ToolFailure) and group_failure.code == "ambiguous_group"
+    assert {item["group_id"] for item in group_failure.data["candidates"]} == set(groups)

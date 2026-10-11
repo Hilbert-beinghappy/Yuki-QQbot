@@ -1916,27 +1916,53 @@ class WorkRepository:
         from qq_ai_bot.persistence.models import ChatEventModel
 
         async with self.database.sessions() as discovery:
-            candidate_ids = tuple(
-                await discovery.scalars(
-                    select(inputs.c.id)
-                    .where(
-                        inputs.c.state == "pending",
-                        inputs.c.ready.is_(False),
-                        or_(
-                            inputs.c.prepare_owner != process_id,
-                            inputs.c.created < time.time() - 120,
-                        ),
+            await discovery.execute(text("BEGIN"))
+            rows = (
+                (
+                    await discovery.execute(
+                        select(
+                            inputs.c.id,
+                            ChatEventModel.id.label("event_id"),
+                            ChatEventModel.content,
+                        )
+                        .outerjoin(ChatEventModel, ChatEventModel.id == inputs.c.event_id)
+                        .where(
+                            inputs.c.state == "pending",
+                            inputs.c.ready.is_(False),
+                            or_(
+                                inputs.c.prepare_owner != process_id,
+                                inputs.c.created < time.time() - 120,
+                            ),
+                        )
+                        .limit(128)
                     )
-                    .limit(128)
                 )
+                .mappings()
+                .all()
             )
-        if not candidate_ids:
+        if not rows:
             return
+        prepared = {
+            row["id"]: encode_json(
+                {
+                    "text": "[输入准备因重启中断；附件尚未读取，按 event_id 查询原消息]\n"
+                    f"{row['content'][:5000]}"
+                }
+            )
+            for row in rows
+            if row["event_id"] is not None
+        }
+        candidate_ids = tuple(row["id"] for row in rows)
         async with self.database.immediate_session() as session:
             rows = (
                 (
                     await session.execute(
-                        select(inputs)
+                        select(
+                            inputs.c.id,
+                            inputs.c.work_id,
+                            ChatEventModel.id.label("event_id"),
+                        )
+                        .outerjoin(ChatEventModel, ChatEventModel.id == inputs.c.event_id)
                         .where(
                             inputs.c.state == "pending",
                             inputs.c.id.in_(candidate_ids),
@@ -1952,41 +1978,35 @@ class WorkRepository:
                 .mappings()
                 .all()
             )
-            for row in rows:
-                event = (
-                    await session.get(ChatEventModel, row["event_id"]) if row["event_id"] else None
+            prepared = {
+                row["id"]: prepared[row["id"]] for row in rows if row["event_id"] is not None
+            }
+            cancelled = [row["id"] for row in rows if row["event_id"] is None]
+            work_ids = {row["work_id"] for row in rows if row["id"] in prepared and row["work_id"]}
+            if cancelled:
+                await session.execute(
+                    update(inputs).where(inputs.c.id.in_(cancelled)).values(state="cancelled")
                 )
-                if event is None:
-                    await session.execute(
-                        update(inputs).where(inputs.c.id == row["id"]).values(state="cancelled")
+            if prepared:
+                await session.execute(
+                    update(inputs)
+                    .where(inputs.c.id.in_(prepared))
+                    .values(ready=True, payload_json=case(prepared, value=inputs.c.id))
+                )
+            if work_ids:
+                await session.execute(
+                    update(work)
+                    .where(
+                        work.c.id.in_(work_ids),
+                        work.c.state.in_(("waiting_external", "waiting_user")),
                     )
-                else:
-                    content = (
-                        "[输入准备因重启中断；附件尚未读取，按 event_id 查询原消息]\n"
-                        f"{event.content[:5000]}"
+                    .values(
+                        state="queued",
+                        reason="input_repaired",
+                        revision=work.c.revision + 1,
+                        updated=time.time(),
                     )
-                    await session.execute(
-                        update(inputs)
-                        .where(inputs.c.id == row["id"])
-                        .values(
-                            ready=True,
-                            payload_json=encode_json({"text": content}),
-                        )
-                    )
-                    if row["work_id"]:
-                        await session.execute(
-                            update(work)
-                            .where(
-                                work.c.id == row["work_id"],
-                                work.c.state.in_(("waiting_external", "waiting_user")),
-                            )
-                            .values(
-                                state="queued",
-                                reason="input_repaired",
-                                revision=work.c.revision + 1,
-                                updated=time.time(),
-                            )
-                        )
+                )
 
     async def reclaim_terminal(self) -> None:
         """Keep the latest 128 terminal work receipts; never evict an active work."""

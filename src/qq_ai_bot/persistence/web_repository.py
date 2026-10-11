@@ -5,7 +5,7 @@ from __future__ import annotations
 from datetime import UTC, datetime, timedelta
 from typing import Any, cast
 
-from sqlalchemy import delete, func, select
+from sqlalchemy import delete, select
 from sqlalchemy.engine import CursorResult
 
 from qq_ai_bot.conversation.correlation import (
@@ -197,19 +197,23 @@ class WebSearchSourceRepository:
 
         normalized = normalize_public_url(url)
         async with self._database.sessions() as session:
-            count = await session.scalar(
-                select(func.count(WebSearchSourceModel.id))
-                .join(
-                    WebSearchRunModel,
-                    WebSearchSourceModel.run_id == WebSearchRunModel.id,
-                )
-                .where(
-                    WebSearchRunModel.conversation_key == conversation_key[:255],
-                    self._source_filter(trigger_event_id, execution_id),
-                    WebSearchSourceModel.url == normalized,
+            return bool(
+                await session.scalar(
+                    select(
+                        select(WebSearchSourceModel.id)
+                        .join(
+                            WebSearchRunModel,
+                            WebSearchSourceModel.run_id == WebSearchRunModel.id,
+                        )
+                        .where(
+                            WebSearchRunModel.conversation_key == conversation_key[:255],
+                            self._source_filter(trigger_event_id, execution_id),
+                            WebSearchSourceModel.url == normalized,
+                        )
+                        .exists()
+                    )
                 )
             )
-            return bool(count)
 
     @staticmethod
     def _source_filter(trigger_event_id: int | None, execution_id: str | None) -> Any:

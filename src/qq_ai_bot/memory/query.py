@@ -37,12 +37,10 @@ class MemoryQueryBuilder:
         self,
         inbound: InboundMessage,
         *,
-        max_referenced: int,
         self_recall: bool = False,
     ) -> tuple[MemoryEntityTarget, ...]:
         return await self._targets.resolve(
             inbound,
-            max_referenced=max_referenced,
             include_self=self_recall,
         )
 

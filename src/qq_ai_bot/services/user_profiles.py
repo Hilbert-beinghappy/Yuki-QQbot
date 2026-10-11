@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import asyncio
 import logging
 import re
 import time
@@ -20,7 +19,6 @@ from qq_ai_bot.persistence.repositories import PeopleRepository
 logger = logging.getLogger(__name__)
 
 _PROFILE_NAME_LIMIT = 128
-PROFILE_LOOKUP_TIMEOUT_SECONDS = 0.25
 _CONTROL_CHARACTERS = re.compile(r"[\x00-\x1f\x7f]")
 _WHITESPACE = re.compile(r"\s+")
 
@@ -104,8 +102,7 @@ class UserProfileService:
         resolved = ProfileResolution.from_sender(lookup_message.sender)
         if resolver is not None:
             try:
-                async with asyncio.timeout(PROFILE_LOOKUP_TIMEOUT_SECONDS):
-                    resolved = await resolver.resolve(lookup_message)
+                resolved = await resolver.resolve(lookup_message)
             except Exception as exc:
                 logger.warning(
                     "profile_resolve_failed exception_category=%s",
@@ -131,16 +128,23 @@ class UserProfileService:
         nickname = sanitize_profile_name(resolved.nickname)
         group_card = sanitize_profile_name(resolved.group_card)
         existing: UserProfileSnapshot | None = None
-        try:
-            existing = await self._repository.get(
-                user_id=message.sender.user_id,
-                group_id=message.group_id,
-            )
-        except (OSError, RuntimeError, SQLAlchemyError) as exc:
-            logger.warning(
-                "profile_read_failed exception_category=%s",
-                type(exc).__name__,
-            )
+        needs_fallback = (
+            not resolved.nickname_known
+            if message.scope_type is ScopeType.PRIVATE
+            else not resolved.group_card_known
+        )
+        if needs_fallback:
+            try:
+                existing = await self._repository.get(
+                    user_id=message.sender.user_id,
+                    group_id=message.group_id,
+                    include_nickname=message.scope_type is ScopeType.PRIVATE,
+                )
+            except (OSError, RuntimeError, SQLAlchemyError) as exc:
+                logger.warning(
+                    "profile_read_failed exception_category=%s",
+                    type(exc).__name__,
+                )
 
         if message.scope_type is ScopeType.PRIVATE:
             if not resolved.nickname_known:

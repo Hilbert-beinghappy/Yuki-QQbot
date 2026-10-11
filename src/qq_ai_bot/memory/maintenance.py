@@ -7,7 +7,9 @@ import logging
 from dataclasses import dataclass
 from datetime import UTC, datetime
 
+from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
+from sqlalchemy.orm import load_only
 
 from qq_ai_bot.admin.config_service import RuntimeConfigService
 from qq_ai_bot.config import Settings
@@ -15,6 +17,7 @@ from qq_ai_bot.memory.enums import MemoryInvalidationReason
 from qq_ai_bot.memory.metrics import MemoryLifecycleMetrics
 from qq_ai_bot.memory.models import MemoryFact
 from qq_ai_bot.memory.service import MemoryFactService
+from qq_ai_bot.persistence.models import MemoryFactModel
 
 logger = logging.getLogger(__name__)
 
@@ -101,6 +104,8 @@ class MemoryMaintenanceWorker:
         rows = await self._facts.repository.list_expired_candidates(
             now=now, limit=runtime.batch_limit
         )
+        if not rows:
+            return 0
 
         async def invalidate(owned: AsyncSession) -> int:
             await self._facts.prepare_evidence_write(
@@ -121,17 +126,27 @@ class MemoryMaintenanceWorker:
         session: AsyncSession,
     ) -> int:
         changed = 0
+        current = {
+            fact.id: fact
+            for fact in await session.scalars(
+                select(MemoryFactModel)
+                .options(load_only(MemoryFactModel.status, MemoryFactModel.conflict_state))
+                .where(
+                    MemoryFactModel.id.in_(tuple(row.id for row in rows)),
+                    MemoryFactModel.valid_until <= now,
+                )
+            )
+        }
         for candidate in rows:
-            fact = await self._facts.repository.get_fact(candidate.id, session=session)
+            fact = current.get(candidate.id)
             if fact is None:
-                continue
-            if fact.valid_until is None or fact.valid_until > now:
                 continue
             if await self._facts.invalidate_fact(
                 fact.id,
                 reason=MemoryInvalidationReason.EXPIRED,
                 actor_user_id=None,
                 session=session,
+                current=fact,
             ):
                 changed += 1
         return changed

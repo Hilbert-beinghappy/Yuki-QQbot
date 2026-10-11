@@ -15,6 +15,7 @@ from tests.support.model_executor import InjectedModelExecutor
 
 from qq_ai_bot.domain.conversations import ScopeType
 from qq_ai_bot.domain.messages import ChatResponse, ToolCall, ToolFunction
+from qq_ai_bot.identity.canonical_repository import ensure_presence
 from qq_ai_bot.identity.db_models import (
     CanonicalPersonModel,
     CanonicalSpaceModel,
@@ -36,11 +37,17 @@ from qq_ai_bot.memory.dream.models import (
     DreamRunMode,
 )
 from qq_ai_bot.memory.dream.repository import (
+    DreamCandidate,
+    DreamCandidateLoad,
     DreamRepository,
     fact_signature,
 )
 from qq_ai_bot.memory.dream.service import DreamService
 from qq_ai_bot.memory.dream.worker import DreamWorker
+from qq_ai_bot.memory.embedding.codec import Float32VectorCodec
+from qq_ai_bot.memory.embedding.models import EmbeddingProviderProfile, EmbeddingVector
+from qq_ai_bot.memory.embedding.repository import MemoryEmbeddingRepository
+from qq_ai_bot.memory.embedding.text import EmbeddingDocumentBuilder
 from qq_ai_bot.memory.enums import (
     MemoryAuthority,
     MemoryConflictState,
@@ -68,6 +75,8 @@ from qq_ai_bot.memory.service import MemoryFactService
 from qq_ai_bot.model_runtime.structured import StructuredTaskRunner
 from qq_ai_bot.persistence.database import Database
 from qq_ai_bot.persistence.models import (
+    ChatEventModel,
+    MemoryEmbeddingModel,
     MemoryEvidenceModel,
     MemoryFactModel,
     MemoryFactRelationModel,
@@ -163,6 +172,155 @@ def _empty_dream_statistics() -> DreamPlanStatistics:
         isolated_facts=0,
         estimated_model_calls=0,
     )
+
+
+async def test_cluster_degree_updates_preserve_seed_ties_and_incremental_checkpoints():
+    now = datetime(2026, 10, 12, tzinfo=UTC)
+    vectors = ((1.0, 0.0), (1.0, 1.0), (0.0, 1.0), (-1.0, 1.0), (-1.0, 0.0))
+    candidates = tuple(
+        DreamCandidate(
+            fact=MemoryFact(
+                id=index,
+                scope_type=MemoryScopeType.SELF,
+                visibility_type=SelfMemoryVisibility.GLOBAL,
+                kind=MemoryKind.FACT,
+                memory_key=f"chain:{index}",
+                category="profile",
+                content=f"chain fact {index}",
+                normalized_content=f"chain fact {index}",
+                importance=3,
+                confidence=1,
+                source_type=MemorySourceType.AUTOMATIC,
+                status=MemoryStatus.ACTIVE,
+                created_at=now,
+                updated_at=now,
+            ),
+            bot_user_id="self",
+            vector=EmbeddingVector(values=values, dimensions=2),
+            signature=f"chain-signature-{index}",
+        )
+        for index, values in enumerate(vectors, start=1)
+    )
+    loaded = DreamCandidateLoad(candidates, len(candidates), 0, 0)
+    planner = object.__new__(DreamService)
+    planner._settings = make_settings("sqlite+aiosqlite:///:memory:").model_copy(
+        update={"memory_dream_similarity_threshold": 0.6, "memory_dream_max_cluster_size": 2}
+    )
+    planner._codec = Float32VectorCodec()
+    clusters, isolated = await planner._clusters(loaded, incremental=False)
+    assert tuple(tuple(item.fact.id for item in group) for group in clusters) == (
+        (1, 2),
+        (3, 4),
+        (5,),
+    )
+    assert not isolated
+
+    async def checkpoints():
+        return {item.fact.id: item.signature for item in candidates[:-1]}
+
+    planner._repository = SimpleNamespace(checkpoint_map=checkpoints)
+    changed_clusters, changed_isolated = await planner._clusters(loaded, incremental=True)
+    assert tuple(tuple(item.fact.id for item in group) for group in changed_clusters) == ((5,),)
+    assert not changed_isolated
+
+
+async def test_candidate_provenance_includes_hidden_bot_and_cluster_preserves_original_ids(
+    database,
+):
+    mutations, facts, ledger, dreams = _services(database)
+    sources = tuple(
+        [
+            await _fact_with_evidence(
+                facts,
+                ledger,
+                message_id=f"full-provenance-{index}",
+                memory_key=f"full-provenance:{index}",
+                content=f"original source {index}",
+            )
+            for index in range(2)
+        ]
+    )
+    async with database.immediate_session() as session:
+        await ensure_presence(session, "88002")
+    hidden, _ = await ledger.append(
+        bot_user_id="88002",
+        platform_message_id="hidden-other-bot",
+        scope_type=ScopeType.GROUP,
+        sender_user_id="1001",
+        direction="inbound",
+        content="hidden provenance",
+        group_id="3001",
+    )
+    documents = EmbeddingDocumentBuilder(template_version=1, max_characters=4000)
+    profile = await MemoryEmbeddingRepository(database).ensure_profile(
+        EmbeddingProviderProfile(
+            provider_id="fake",
+            model_id="provenance",
+            dimensions=2,
+            document_template_version=1,
+            endpoint_identity="https://example.invalid/provenance",
+        )
+    )
+    now = datetime.now(UTC)
+    async with database.immediate_session() as session:
+        await session.execute(
+            update(ChatEventModel)
+            .where(ChatEventModel.id == hidden.id)
+            .values(suppression_status="duplicate", utterance_fingerprint="c" * 64)
+        )
+        session.add(
+            MemoryEvidenceModel(
+                fact_id=sources[0].id,
+                event_id=hidden.id,
+                source_speaker_user_id="1001",
+                relation="self_statement",
+                confidence=1,
+                authority="self_report",
+                excerpt="hidden provenance",
+                created_at=now,
+            )
+        )
+        session.add_all(
+            [
+                MemoryEmbeddingModel(
+                    fact_id=fact.id,
+                    profile_id=profile.id,
+                    content_hash=documents.content_hash(fact),
+                    vector_blob=Float32VectorCodec().encode(
+                        EmbeddingVector(values=(1.0, 0.0), dimensions=2)
+                    ),
+                    created_at=now,
+                    updated_at=now,
+                )
+                for fact in sources
+            ]
+        )
+    loaded = await dreams.load_candidates(profile_id=profile.id, dimensions=2, documents=documents)
+    assert [item.fact.id for item in loaded.candidates] == [fact.id for fact in sources]
+    assert loaded.eligible_facts == 2 and loaded.missing_embeddings == 0
+    assert loaded.ambiguous_bot_facts == 1
+    assert loaded.candidates[0].fact.evidence_count == 1
+    assert {item.partition_identity for item in loaded.candidates} == {
+        loaded.candidates[0].partition_identity
+    }
+    original_ids = (sources[1].id, sources[0].id)
+    cluster = SimpleNamespace(fact_ids=original_ids)
+    assert tuple(fact.id for fact in await dreams.cluster_facts(cluster)) == original_ids
+    assert await dreams.cluster_facts(SimpleNamespace(fact_ids=(*original_ids, 999999))) == ()
+    service = object.__new__(DreamService)
+    service._settings, service._facts, service._mutations = (
+        make_settings(database.url),
+        facts,
+        mutations,
+    )
+    payload, ref_map, fingerprint = await service._input(sources)
+    async with facts.repository.transaction(read_snapshot=True) as session:
+        await facts.repository.prepare_evidence_rows(original_ids, session=session)
+        prepared_payload, prepared_map, prepared_fingerprint = await service._input(
+            sources, session=session
+        )
+    assert prepared_payload == payload and prepared_map == ref_map
+    assert prepared_fingerprint == fingerprint
 
 
 @pytest.mark.asyncio

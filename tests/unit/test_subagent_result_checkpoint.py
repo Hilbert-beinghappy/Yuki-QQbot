@@ -53,6 +53,88 @@ async def _completed_child(
     return repo, workers, parent_control, lease, identity, checkpoint
 
 
+async def test_archive_rechecks_new_active_descendant_after_discovery(
+    database, tmp_path, monkeypatch
+):
+    import asyncio
+    from contextlib import asynccontextmanager
+
+    repo, workers, parent_lease, root, identity = await stack(database, tmp_path)
+    child_lease = await workers.acquire(identity)
+    await repo.checkpoint(child_lease, identity, {"original": "verified result"}, models=2, tools=3)
+    await repo.accept_control(
+        child_lease,
+        identity,
+        {"action": "complete", "call_key": "original-complete", "result": "verified result"},
+    )
+    child = await repo.get(identity)
+    await repo.transition(child_lease, identity, child["revision"], "completed")
+    await workers.finish(child_lease)
+    await repo.release(child_lease)
+    await repo.checkpoint(parent_lease, root["id"], {"original": "retained root"})
+    current = await repo.get(root["id"])
+    await repo.transition(parent_lease, root["id"], current["revision"], "completed")
+    async with database.immediate_session() as writer:
+        await writer.execute(
+            update(work)
+            .where(work.c.id.in_((root["id"], identity)))
+            .values(updated=time.time() - 8 * 86400)
+        )
+    original_root = await repo.get(root["id"])
+    original_receipt = await workers.related(root["id"], identity)
+    assert original_root["state"] == "completed"
+    assert original_receipt["state"] == "completed" and original_receipt["archived_at"] is None
+    original_writer = database.immediate_session
+    discovered, changed = asyncio.Event(), asyncio.Event()
+
+    @asynccontextmanager
+    async def archive_writer():
+        discovered.set()
+        await asyncio.wait_for(changed.wait(), timeout=10)
+        async with original_writer() as writer:
+            yield writer
+
+    monkeypatch.setattr(database, "immediate_session", archive_writer)
+    maintenance = asyncio.create_task(workers.maintain())
+    try:
+        await asyncio.wait_for(discovered.wait(), timeout=10)
+        monkeypatch.setattr(database, "immediate_session", original_writer)
+        # The retained worker resumes on its original ID without reopening root.
+        await workers.resume(parent_lease, root["id"], identity, key="real-resume")
+        descendant = await workers.start(
+            parent_lease, identity, "new-active-descendant", {"goal": "continue original evidence"}
+        )
+        current = await repo.get(identity)
+        await repo.transition(parent_lease, identity, current["revision"], "completed")
+        original_child = await repo.get(identity)
+        original_descendant = await repo.get(descendant)
+        async with database.sessions() as reader:
+            original_budget = dict(
+                (await reader.execute(select(budgets).where(budgets.c.root_id == root["id"])))
+                .mappings()
+                .one()
+            )
+        assert original_child["state"] == "completed"
+        assert original_descendant["state"] == "queued"
+        assert original_descendant["parent_work_id"] == identity
+        assert (await repo.get(root["id"])) == original_root
+    finally:
+        changed.set()
+        await maintenance
+    assert await repo.get(root["id"]) == original_root
+    assert await repo.get(identity) == original_child
+    assert await repo.get(descendant) == original_descendant
+    after = await workers.related(root["id"], identity)
+    assert after["archived_at"] is None and after["result_json"] == original_receipt["result_json"]
+    assert (await workers.related(identity, descendant))["archived_at"] is None
+    async with database.sessions() as reader:
+        assert dict(
+            (await reader.execute(select(budgets).where(budgets.c.root_id == root["id"])))
+            .mappings()
+            .one()
+        ) == original_budget
+
+
 async def test_large_note_completion_notifies_and_result_reads_original_checkpoint(
     database, tmp_path
 ):

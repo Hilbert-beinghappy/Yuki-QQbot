@@ -175,7 +175,6 @@ class MemoryContextService:
     ) -> tuple[MemoryEntityTarget, ...]:
         return await self._queries.resolve_targets(
             inbound,
-            max_referenced=runtime.memory.max_referenced_targets,
             self_recall=self_recall and runtime.memory.self_enabled,
         )
 

@@ -180,6 +180,31 @@ class ModelInvocationRepository:
             rows = (await session.execute(statement)).all()
         return {str(row[0]): self._stats(row[1:]) for row in rows}
 
+    async def stats_summary(
+        self,
+    ) -> tuple[ModelStats, dict[str, ModelStats], dict[str, ModelStats]]:
+        """Aggregate one snapshot, then sum its task/profile groups."""
+        statement = self._stats_statement(
+            ModelInvocationModel.task, ModelInvocationModel.profile_id
+        ).group_by(ModelInvocationModel.task, ModelInvocationModel.profile_id)
+        async with self._database.sessions() as session:
+            rows = (await session.execute(statement)).all()
+        by_task: dict[str, list[Sequence[Any]]] = {}
+        by_profile: dict[str, list[Sequence[Any]]] = {}
+        for row in rows:
+            values = row[2:]
+            by_task.setdefault(project_model_task(str(row[0])), []).append(values)
+            by_profile.setdefault(str(row[1]), []).append(values)
+
+        def combined(groups: Sequence[Sequence[Any]]) -> ModelStats:
+            return self._stats([sum(row[index] or 0 for row in groups) for index in range(12)])
+
+        return (
+            combined([row[2:] for row in rows]),
+            {key: combined(groups) for key, groups in by_task.items()},
+            {key: combined(groups) for key, groups in by_profile.items()},
+        )
+
     async def recent_errors(self, *, limit: int) -> tuple[ModelInvocationRecord, ...]:
         if limit <= 0:
             raise ValueError("limit must be positive")
@@ -194,10 +219,8 @@ class ModelInvocationRepository:
         return tuple(self._record(row) for row in rows)
 
     @staticmethod
-    def _stats_statement(group_column: Any | None = None) -> Any:
-        columns: list[Any] = []
-        if group_column is not None:
-            columns.append(group_column)
+    def _stats_statement(*group_columns: Any) -> Any:
+        columns: list[Any] = list(group_columns)
         columns.extend(
             (
                 func.count(ModelInvocationModel.id),
@@ -217,7 +240,8 @@ class ModelInvocationRepository:
                         type_=ModelInvocationModel.id.type,
                     )
                 ),
-                func.coalesce(func.avg(ModelInvocationModel.latency_seconds), 0.0),
+                func.coalesce(func.sum(ModelInvocationModel.latency_seconds), 0.0),
+                func.count(ModelInvocationModel.latency_seconds),
             )
         )
         return select(*columns)
@@ -239,7 +263,7 @@ class ModelInvocationRepository:
             cache_creation_5m_input_tokens=int(values[7] or 0),
             cache_creation_1h_input_tokens=int(values[8] or 0),
             unknown_usage=int(values[9] or 0),
-            average_latency_seconds=float(values[10] or 0),
+            average_latency_seconds=float(values[10] or 0) / int(values[11]) if values[11] else 0,
         )
 
     @staticmethod

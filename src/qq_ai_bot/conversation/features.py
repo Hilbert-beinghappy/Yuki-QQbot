@@ -12,9 +12,9 @@ from itertools import pairwise
 
 from qq_ai_bot.admin.models import RuntimeConfigSnapshot
 from qq_ai_bot.conversation.participation import AdmissionFeatures, AdmissionSignalHint
+from qq_ai_bot.domain.identity import AuthorKind
 from qq_ai_bot.domain.messages import InboundMessage
 from qq_ai_bot.persistence.repositories import EventLedgerRepository
-from qq_ai_bot.persistence.repository_records import EventRecord
 from qq_ai_bot.services.policies import replies_to_bot
 
 _HISTORY_LIMIT = 10
@@ -53,17 +53,12 @@ class AdmissionFeatureBuilder:
 
         del runtime
         current_time = now or datetime.now(UTC)
-        if inbound.conversation_id:
-            recent = await self._ledger.list_canonical_recent(
-                inbound.conversation_id,
-                limit=_HISTORY_LIMIT + 1,
-            )
-        else:
-            recent = await self._ledger.list_scope_recent(
-                inbound.scope(),
-                limit=_HISTORY_LIMIT + 1,
-            )
-        metrics = self._metrics(recent, inbound.bot_user_id, current_time)
+        recent = await self._ledger.list_recent_activity(
+            inbound.scope(),
+            conversation_id=inbound.conversation_id,
+            limit=_HISTORY_LIMIT + 1,
+        )
+        metrics = self._metrics(recent, current_time)
         return AdmissionFeatures(
             scope_type=inbound.scope_type,
             text=content,
@@ -84,20 +79,19 @@ class AdmissionFeatureBuilder:
 
     @staticmethod
     def _metrics(
-        rows: tuple[EventRecord, ...],
-        _bot_user_id: str,
+        rows: tuple[tuple[str, str | None, datetime], ...],
         now: datetime,
     ) -> _ConversationMetrics:
-        human = [row for row in rows if row.event_kind == "message" and row.author_is_human()]
-        bot = [row for row in rows if row.event_kind == "message" and row.author_is_yuki()]
-        messages = [row for row in rows if row.event_kind == "message"]
+        human = [row for row in rows if row[0] == "message" and row[1] == AuthorKind.PERSON]
+        bot = [row for row in rows if row[0] == "message" and row[1] == AuthorKind.YUKI]
+        messages = [row for row in rows if row[0] == "message"]
         normalized_now = AdmissionFeatureBuilder._aware_utc(now)
         intervals = [
             max(
                 0.0,
                 (
-                    AdmissionFeatureBuilder._aware_utc(right.occurred_at)
-                    - AdmissionFeatureBuilder._aware_utc(left.occurred_at)
+                    AdmissionFeatureBuilder._aware_utc(right[2])
+                    - AdmissionFeatureBuilder._aware_utc(left[2])
                 ).total_seconds(),
             )
             for left, right in pairwise(human)
@@ -106,21 +100,21 @@ class AdmissionFeatureBuilder:
             (
                 index
                 for index, row in enumerate(rows)
-                if row.event_kind == "message" and row.author_is_yuki()
+                if row[0] == "message" and row[1] == AuthorKind.YUKI
             ),
             default=-1,
         )
         pending = sum(
             1
             for row in rows[last_bot_index + 1 :]
-            if row.event_kind == "message" and row.author_is_human()
+            if row[0] == "message" and row[1] == AuthorKind.PERSON
         )
         last_time = (
-            AdmissionFeatureBuilder._aware_utc(messages[-1].occurred_at)
+            AdmissionFeatureBuilder._aware_utc(messages[-1][2])
             if messages
             else normalized_now
         )
-        last_bot_time = AdmissionFeatureBuilder._aware_utc(bot[-1].occurred_at) if bot else None
+        last_bot_time = AdmissionFeatureBuilder._aware_utc(bot[-1][2]) if bot else None
         return _ConversationMetrics(
             pending=pending,
             bot_count=len(bot),
@@ -131,7 +125,7 @@ class AdmissionFeatureBuilder:
                 if last_bot_time is not None
                 else None
             ),
-            last_was_bot=bool(messages and messages[-1].author_is_yuki()),
+            last_was_bot=bool(messages and messages[-1][1] == AuthorKind.YUKI),
         )
 
     @staticmethod
