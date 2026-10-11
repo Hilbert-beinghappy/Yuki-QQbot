@@ -5,7 +5,7 @@ from __future__ import annotations
 import hashlib
 from datetime import UTC, datetime
 
-from sqlalchemy import func, or_, select, text, update
+from sqlalchemy import func, or_, select, update
 from sqlalchemy.dialects.sqlite import insert
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -67,7 +67,6 @@ async def claim_initiative(
     now = datetime.now(UTC)
     async with database.sessions() as session, session.begin():
         session.autoflush = False
-        await session.execute(text("BEGIN"))
         # The cursor is per run: a late receipt for an older run cannot be skipped
         # merely because a newer run was already reflected.
         runs = list(

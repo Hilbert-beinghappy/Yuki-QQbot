@@ -9,7 +9,7 @@ from collections.abc import Sequence
 from datetime import UTC, datetime, timedelta
 from typing import Any, cast
 
-from sqlalchemy import and_, func, or_, select, text, update
+from sqlalchemy import and_, func, or_, select, update
 from sqlalchemy.dialects.sqlite import insert
 from sqlalchemy.engine import CursorResult
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -332,7 +332,6 @@ class SelfReflectionRepository:
         now = datetime.now(UTC)
         async with self._database.sessions() as session, session.begin():
             session.autoflush = False
-            await session.execute(text("BEGIN"))
             runtime = await session.get(MemorySelfReflectionRuntimeModel, 1)
             if runtime is None:
                 maximum = int(await session.scalar(select(func.max(ChatEventModel.id))) or 0)
@@ -499,7 +498,6 @@ class SelfReflectionRepository:
         now = datetime.now(UTC)
         async with self._database.sessions() as session, session.begin():
             session.autoflush = False
-            await session.execute(text("BEGIN"))
             used = 0
             available = min(1, max_sessions, max(0, max_daily_calls - used))
             if available <= 0:
@@ -762,15 +760,26 @@ class SelfReflectionRepository:
                     "processed_characters": input_characters,
                 }
                 if retry is not None:
-                    retry.status = "processing"
-                    retry.started_at = now
-                    retry.completed_at = None
-                    retry.cycle_id = cycle_id
-                    retry.attempt_count += 1
-                    retry.input_fingerprint = fingerprint
-                    retry.processed_events = len(event_rows)
-                    retry.processed_characters = input_characters
-                    run_id = retry.id
+                    run_id = await session.scalar(
+                        update(MemorySelfReflectionRunModel)
+                        .where(
+                            MemorySelfReflectionRunModel.id == retry.id,
+                            MemorySelfReflectionRunModel.status == "failed",
+                        )
+                        .values(
+                            status="processing",
+                            started_at=now,
+                            completed_at=None,
+                            cycle_id=cycle_id,
+                            attempt_count=MemorySelfReflectionRunModel.attempt_count + 1,
+                            input_fingerprint=fingerprint,
+                            processed_events=len(event_rows),
+                            processed_characters=input_characters,
+                        )
+                        .returning(MemorySelfReflectionRunModel.id)
+                    )
+                    if run_id is None:
+                        return tuple(claimed)
                 else:
                     conflict, conflict_where = self._run_conflict_target(row)
                     insert_stmt = insert(MemorySelfReflectionRunModel).values(**run_values)
@@ -785,7 +794,7 @@ class SelfReflectionRepository:
                         insert_stmt.returning(MemorySelfReflectionRunModel.id)
                     )
                     if inserted_id is None:
-                        continue
+                        return tuple(claimed)
                     run_id = inserted_id
                 claimed.append(
                     SelfReflectionBatch(
@@ -927,7 +936,6 @@ class SelfReflectionRepository:
         now = datetime.now(UTC)
         async with self._database.sessions() as session, session.begin():
             session.autoflush = False
-            await session.execute(text("BEGIN"))
             run = await session.get(MemorySelfReflectionRunModel, batch.run_id)
             if run is None or run.status != "processing":
                 return
@@ -964,7 +972,6 @@ class SelfReflectionRepository:
 
         async with self._database.sessions() as session, session.begin():
             session.autoflush = False
-            await session.execute(text("BEGIN"))
             run = await session.get(MemorySelfReflectionRunModel, run_id)
             if run is None or run.status != "processing":
                 return None
@@ -986,7 +993,6 @@ class SelfReflectionRepository:
         now = datetime.now(UTC)
         async with self._database.sessions() as session, session.begin():
             session.autoflush = False
-            await session.execute(text("BEGIN"))
             rows = (
                 await session.scalars(
                     select(MemorySelfReflectionRunModel).where(
