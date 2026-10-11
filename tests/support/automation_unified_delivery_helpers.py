@@ -9,6 +9,7 @@ from tests.support.social_identity_cases import social_env
 from qq_ai_bot.automation.executor import AutomationExecutor
 from qq_ai_bot.automation.gateway import OneBotAutomationGateway
 from qq_ai_bot.automation.handlers import AutomationCapabilityHandlers
+from qq_ai_bot.automation.models import AutomationLimits
 from qq_ai_bot.automation.registry import build_capability_registry
 from qq_ai_bot.automation.repository import AutomationRepository
 from qq_ai_bot.automation.service import AutomationService
@@ -30,6 +31,11 @@ async def setup_run(
     mode="send",
     principal="person",
     worker=None,
+    trigger=None,
+    max_runs=None,
+    superusers_csv=None,
+    context=None,
+    limits=None,
 ):
     env = await social_env(database, tmp_path)
     if delivery == "self_private":
@@ -59,7 +65,11 @@ async def setup_run(
 
     provider = FakeLLMProvider(responder=respond)
     settings = make_settings(
-        database.url, automation_enabled=True, enabled_groups_csv="20001", runtime_work_enabled=True
+        database.url,
+        automation_enabled=True,
+        enabled_groups_csv="20001",
+        runtime_work_enabled=True,
+        **({"superusers_csv": superusers_csv} if superusers_csv is not None else {}),
     )
     if worker is not None:
         import hashlib
@@ -126,12 +136,22 @@ async def setup_run(
             "name": "delivery regression",
             "goal": "完成任务",
             "strategy": strategy,
-            "trigger": {"type": "after", "seconds": 60},
+            "trigger": trigger or {"type": "after", "seconds": 60},
             "delivery": {"target": delivery},
+            **({"context": context} if context is not None else {}),
         },
         actor=actor,
         conversation_key="group:80001:20001",
+        max_runs=max_runs,
     )
+    if limits is not None:
+        row = await service.update(
+            row.id,
+            row.script.model_copy(update={"limits": AutomationLimits.model_validate(limits)}),
+            actor=actor,
+            conversation_key="group:80001:20001",
+        )
+        plan = plan.model_copy(update={"script": row.script})
     run = await repository.create_run(
         row.id, scheduled_for=row.next_run_at, actual_started_at=chat._time.clock.now()
     )
@@ -140,7 +160,6 @@ async def setup_run(
         registry=registry,
         repository=repository,
         time_service=chat._time,
-        router=env.router,
         gateway_factory=gateway,
     )
     return SimpleNamespace(

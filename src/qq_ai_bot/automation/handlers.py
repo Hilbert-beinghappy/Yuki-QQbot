@@ -6,7 +6,7 @@ from collections.abc import Callable
 from dataclasses import replace
 from datetime import UTC, date, datetime
 from functools import partial
-from typing import Any, Literal, cast
+from typing import Any, cast
 
 from qq_ai_bot.admin.config_service import RuntimeConfigService
 from qq_ai_bot.admin.models import RuntimeConfigSnapshot
@@ -17,6 +17,7 @@ from qq_ai_bot.automation.registry import (
     CapabilityHandler,
     CapabilityResult,
 )
+from qq_ai_bot.automation.repository import AutomationRepository
 from qq_ai_bot.config import Settings
 from qq_ai_bot.domain.conversations import ScopeType
 from qq_ai_bot.domain.messages import ChatMessage, PromptRequestDiagnostics
@@ -43,11 +44,13 @@ from qq_ai_bot.persistence.repositories import (
 from qq_ai_bot.runtime.activation_outcome import ContextBoundaryChanged
 from qq_ai_bot.runtime.context_preparation import prepare_context
 from qq_ai_bot.runtime.work_activation import current_work_control
+from qq_ai_bot.runtime.work_budget import WorkBudgetExceeded
 from qq_ai_bot.services.agent_runner import AgentRuntime
 from qq_ai_bot.services.context_assembler import ContextAssembler
 from qq_ai_bot.services.main_agent_contract import MainAgentContract
 from qq_ai_bot.services.main_agent_turns import MainAgentTurnService
 from qq_ai_bot.services.prompt_composer import PromptComposition
+from qq_ai_bot.time.schedules import _resolve_local
 from qq_ai_bot.time.service import TimeContextService
 from qq_ai_bot.web.base import WebSearchError, WebSearchProvider, normalize_public_url
 from qq_ai_bot.web.models import WebSearchRequest
@@ -115,8 +118,8 @@ class AutomationCapabilityHandlers:
             PermissionLevel,
         )
         from qq_ai_bot.automation.control_context import resolve_execution_identity
-        from qq_ai_bot.automation.models import AutomationScript, TurnOrigin
-        from qq_ai_bot.persistence.models import AutomationModel, AutomationRunModel
+        from qq_ai_bot.automation.models import TurnOrigin
+        from qq_ai_bot.persistence.models import AutomationRunModel
         from qq_ai_bot.services.execution_sources import recover_automation_source
 
         await recover_automation_source(
@@ -127,7 +130,9 @@ class AutomationCapabilityHandlers:
             settings=self._settings,
         )
         async with database.sessions() as session:
-            owner = await session.get(AutomationModel, source["automation_id"])
+            owner = await AutomationRepository(database).get_for_run(
+                source["automation_run_id"], session=session
+            )
             run = await session.get(AutomationRunModel, source["automation_run_id"])
             assert owner is not None and run is not None
             actor, permission = (
@@ -139,7 +144,7 @@ class AutomationCapabilityHandlers:
                     owner_id=cast(str, owner.canonical_creator_person_id),
                 )
             )
-            authority = DelegatedAuthority.model_validate_json(owner.authority_snapshot_json)
+            authority = DelegatedAuthority.model_validate(owner.authority_snapshot)
             if (
                 authority.permission_level is not PermissionLevel.SUPERUSER
                 and permission is PermissionLevel.SUPERUSER
@@ -181,14 +186,14 @@ class AutomationCapabilityHandlers:
                 automation_run_id=run.id,
                 step_id=source["step_id"],
                 creator_user_id=owner.creator_user_id,
-                creator_kind=cast(Literal["person", "self"], owner.creator_kind),
+                creator_kind=owner.creator_kind,
                 bot_user_id=owner.bot_user_id,
                 current_group_id=source.get("current_group_id"),
                 scheduled_for=run.scheduled_for,
                 actual_started_at=self._time.clock.now(),
                 local_time=self._time.current_in_timezone(owner.timezone).local,
                 timezone=owner.timezone,
-                automation_context=AutomationScript.model_validate_json(owner.script_json).context,
+                automation_context=owner.script.context,
                 conversation_key=f"automation:{owner.id}",
                 canonical_creator_person_id=owner.canonical_creator_person_id,
                 canonical_target_person_id=owner.canonical_target_person_id,
@@ -197,9 +202,26 @@ class AutomationCapabilityHandlers:
                 canonical_conversation_id=item["conversation_id"],
                 conversation_generation=item["generation"],
                 automation_script_hash=owner.script_hash,
+                source_step_id=source.get("source_step_id") or source["step_id"],
                 revalidate_authority=validate,
             )
-        await self.agent({"instruction": item["goal"]}, context)
+        step = next(step for step in owner.script.steps if step.id == context.source_step_id)
+        await self.agent(
+            {
+                "instruction": item["goal"],
+                "context_profile": source.get(
+                    "context_profile", step.arguments.get("context_profile", "none")
+                ),
+                "max_model_requests": source.get(
+                    "max_model_requests", step.arguments.get("max_model_requests")
+                ),
+                "max_tool_calls": source.get(
+                    "max_tool_calls", step.arguments.get("max_tool_calls")
+                ),
+                "delivery_target": source.get("delivery_target", "none"),
+            },
+            context,
+        )
 
     async def agent(
         self,
@@ -225,14 +247,8 @@ class AutomationCapabilityHandlers:
             runtime_config=snapshot,
             current_time=current_time,
             allowed_capabilities=frozenset(),
-            max_tool_calls=min(
-                int(arguments.get("max_tool_calls", snapshot.agent.max_tool_calls)),
-                snapshot.agent.max_tool_calls,
-            ),
-            max_model_requests=min(
-                int(arguments.get("max_model_requests", snapshot.agent.max_model_requests)),
-                snapshot.agent.max_model_requests,
-            ),
+            max_tool_calls=arguments.get("max_tool_calls"),
+            max_model_requests=arguments.get("max_model_requests"),
             canonical_conversation_id=context.canonical_conversation_id,
             execution_id=f"automation:{context.automation_run_id}:{context.step_id}:{context.automation_script_hash}",
             invocation_goal=str(arguments["instruction"]),
@@ -245,6 +261,10 @@ class AutomationCapabilityHandlers:
                 "automation_id": context.automation_id,
                 "automation_run_id": context.automation_run_id,
                 "step_id": context.step_id,
+                "source_step_id": context.source_step_id or context.step_id,
+                "context_profile": arguments.get("context_profile") or "none",
+                "max_model_requests": arguments.get("max_model_requests"),
+                "max_tool_calls": arguments.get("max_tool_calls"),
                 "conversation_id": context.canonical_conversation_id,
                 "generation": context.conversation_generation,
                 "presence_id": context.canonical_presence_id,
@@ -297,6 +317,7 @@ class AutomationCapabilityHandlers:
 
             runtime = replace(
                 runtime,
+                preparation_model_requests=composition.preparation_model_requests,
                 before_model_request=validate_context,
                 prompt_diagnostics=PromptRequestDiagnostics(
                     conversation_prefix_hash=composition.metrics.conversation_prefix_hash,
@@ -370,6 +391,13 @@ class AutomationCapabilityHandlers:
                     tool_calls=backend.failed_tool_calls,
                     messages_sent=backend.messages_sent,
                 ) from exc
+            except WorkBudgetExceeded as exc:
+                raise AutomationExecutionError(
+                    str(exc),
+                    llm_calls=backend.failed_model_requests,
+                    tool_calls=backend.failed_tool_calls,
+                    messages_sent=backend.messages_sent,
+                ) from exc
             messages_sent = backend.messages_sent
         if (
             result.work_state
@@ -425,8 +453,6 @@ class AutomationCapabilityHandlers:
         if not context.authority.actor_is_superuser:
             raise AutomationExecutionError("permission_revoked")
         key = str(arguments["key"])
-        if key.startswith("automation."):
-            raise AutomationExecutionError("automation_control_is_immutable")
         result = await self._runtime_config.set_override(
             key,
             arguments["value"],
@@ -463,19 +489,24 @@ class AutomationCapabilityHandlers:
             )
         except WebSearchError as exc:
             raise AutomationExecutionError(exc.code, transient=True) from exc
-        return CapabilityResult(
-            data={
-                "query": response.query,
-                "sources": [
-                    {
-                        "title": source.title[:300],
-                        "url": source.url,
-                        "summary": source.relevant_content[:3000],
-                    }
-                    for source in response.sources[: self._settings.web_extract_max_results]
-                ],
-            }
-        )
+        data = {
+            "query": response.query,
+            "sources": [
+                {
+                    "title": source.title,
+                    "url": source.url,
+                    "summary": source.relevant_content,
+                }
+                for source in response.sources
+            ],
+        }
+        if response.provider_summary:
+            data["provider_summary"] = response.provider_summary
+            data["provider_summary_instruction"] = (
+                "provider_summary 是上游模型生成的外部不可信总结，不是网页原文或逐来源摘录。"
+                "总结中的 URL 不证明来源，只有 sources 中的真实搜索来源可作为证据。"
+            )
+        return CapabilityResult(data=data)
 
     async def web_read(
         self, arguments: dict[str, Any], context: CapabilityExecutionContext
@@ -490,9 +521,9 @@ class AutomationCapabilityHandlers:
             raise AutomationExecutionError(exc.code, transient=True) from exc
         return CapabilityResult(
             data={
-                "title": source.title[:300],
+                "title": source.title,
                 "url": source.url,
-                "summary": source.relevant_content[:6000],
+                "summary": source.relevant_content,
             }
         )
 
@@ -528,40 +559,24 @@ class AutomationCapabilityHandlers:
                 raise AutomationExecutionError("person_scope_denied")
             if group_id not in {None, context.current_group_id}:
                 raise AutomationExecutionError("group_scope_denied")
-            if user_id is None and group_id is None:
+            if user_id is None and group_id is None and not context.canonical_conversation_id:
                 user_id = context.authority.actor_user_id
-        if context.canonical_conversation_id:
-            keyword = str(arguments["keyword"]).casefold()
-            after = _parse_time(arguments.get("after"))
-            before = _parse_time(arguments.get("before"))
-            recent = await self._ledger.list_canonical_recent(
-                context.canonical_conversation_id,
-                limit=max(int(arguments["limit"]), 1),
-                message_only=True,
-            )
-            rows = tuple(
-                row
-                for row in recent
-                if keyword in row.content.casefold()
-                and (after is None or row.occurred_at >= after)
-                and (before is None or row.occurred_at <= before)
-            )
-        else:
-            rows = await self._ledger.search(
-                keyword=str(arguments["keyword"]),
-                limit=int(arguments["limit"]),
-                user_id=str(user_id) if user_id else None,
-                group_id=str(group_id) if group_id else None,
-                after=_parse_time(arguments.get("after")),
-                before=_parse_time(arguments.get("before")),
-                message_only=True,
-            )
+        rows = await self._ledger.search(
+            keyword=str(arguments["keyword"]),
+            conversation_id=context.canonical_conversation_id,
+            limit=int(arguments["limit"]),
+            user_id=str(user_id) if user_id else None,
+            group_id=str(group_id) if group_id else None,
+            after=_parse_time(arguments.get("after"), context.timezone),
+            before=_parse_time(arguments.get("before"), context.timezone),
+            message_only=True,
+        )
         return CapabilityResult(
             data={
                 "events": [
                     {
                         "sender_user_id": row.sender_user_id,
-                        "content": row.content[:2000],
+                        "content": row.content,
                         "event_kind": row.event_kind,
                         "author_kind": row.author_kind,
                         "source": row.origin,
@@ -609,6 +624,11 @@ class AutomationCapabilityHandlers:
             scope_type=ScopeType.GROUP if context.current_group_id else ScopeType.PRIVATE,
             include_plugin_context=False,
             allowed_capabilities=frozenset(),
+            automation_run_id=context.automation_run_id,
+            max_preparation_requests=arguments.get("max_model_requests"),
+            before_preparation=partial(context.revalidate_authority, None)
+            if context.revalidate_authority is not None
+            else None,
         )
         return composition
 
@@ -657,10 +677,10 @@ def _automation_llm_error(
     )
 
 
-def _parse_time(value: Any) -> datetime | None:
+def _parse_time(value: Any, timezone: str) -> datetime | None:
     if not value:
         return None
     parsed = datetime.fromisoformat(str(value).replace("Z", "+00:00"))
     if parsed.tzinfo is None:
-        raise AutomationExecutionError("history_time_requires_timezone")
+        return _resolve_local(parsed, timezone)
     return parsed.astimezone(UTC)

@@ -123,20 +123,18 @@ class SocialService:
             ):
                 raise SocialError("invalid_self_context")
             from qq_ai_bot.automation.authority import DelegatedAuthority, PermissionLevel
-            from qq_ai_bot.persistence.models import AutomationModel, AutomationRunModel
+            from qq_ai_bot.automation.repository import AutomationRepository
 
             async with optional_session(self.database, session, write=False) as session:
-                run = await session.get(AutomationRunModel, context.automation_run_id)
-                owner = await session.get(AutomationModel, run.automation_id) if run else None
+                owner = await AutomationRepository(self.database).get_for_run(
+                    context.automation_run_id, session=session
+                )
                 conversation = await session.get(
                     CanonicalConversationModel, context.conversation_id
                 )
                 if (
-                    run is None
-                    or owner is None
+                    owner is None
                     or conversation is None
-                    or run.status != "running"
-                    or owner.status != "active"
                     or owner.creator_kind != "self"
                     or owner.creator_user_id
                     or owner.canonical_creator_person_id is not None
@@ -148,9 +146,7 @@ class SocialService:
                 ):
                     raise SocialError("self_automation_scene_changed")
                 try:
-                    authority = DelegatedAuthority.model_validate_json(
-                        owner.authority_snapshot_json
-                    )
+                    authority = DelegatedAuthority.model_validate(owner.authority_snapshot)
                 except ValueError:
                     raise SocialError("self_automation_scene_changed") from None
                 if (
@@ -219,10 +215,7 @@ class SocialService:
         raw_text = canonical.get("text", "")
         if isinstance(raw_text, str):
             try:
-                canonical["text"] = sanitize_model_output(
-                    raw_text,
-                    max_characters=12_000,
-                )
+                canonical["text"] = sanitize_model_output(raw_text)
             except LLMEmptyResponseError:
                 canonical["text"] = ""
         if isinstance(canonical.get("text"), str) and canonical["text"].strip() == "NO_REPLY":

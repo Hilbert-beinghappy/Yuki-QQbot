@@ -46,6 +46,7 @@ class ControlAutomationQueryAdapter:
         key = _key(request, kind, scope)
         stmt = select(
             model.id,
+            model.version_id,
             model.status,
             model.scheduled_for,
             model.actual_started_at.label("started_at"),
@@ -108,6 +109,7 @@ class ControlAutomationQueryAdapter:
     async def list_automation_steps(
         self, request: PageRequest, *, automation_id: int, run_id: int | None = None
     ) -> Page[ActivityView]:
+        """Page existing legacy audits; new runs use their original cursor and effect receipts."""
         _id(automation_id)
         if run_id is not None:
             _id(run_id)

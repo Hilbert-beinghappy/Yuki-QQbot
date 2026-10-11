@@ -1,4 +1,4 @@
-"""Tavily REST search/extract provider with bounded retries and output."""
+"""Tavily REST search/extract provider."""
 
 from __future__ import annotations
 
@@ -14,9 +14,6 @@ import httpx
 
 from qq_ai_bot.web.base import WebSearchError, normalize_public_url
 from qq_ai_bot.web.models import WebSearchRequest, WebSearchResponse, WebSearchSource
-
-_SOURCE_CONTENT_LIMIT = 2500
-_SNIPPET_LIMIT = 1000
 
 
 class TavilyWebSearchProvider:
@@ -36,7 +33,7 @@ class TavilyWebSearchProvider:
         if not api_key:
             raise ValueError("TAVILY_API_KEY is required")
         self._search_depth = search_depth
-        self._extract_max_results = min(max(1, extract_max_results), 3)
+        self._extract_max_results = extract_max_results
         self._max_retries = min(max(0, max_retries), 1)
         self._semaphore = asyncio.Semaphore(global_concurrency)
         self._authorization_header = f"Bearer {api_key}"
@@ -56,7 +53,7 @@ class TavilyWebSearchProvider:
             "query": query,
             "topic": request.topic,
             "search_depth": self._search_depth,
-            "max_results": min(max(1, request.max_results), 5),
+            "max_results": request.max_results,
             "include_answer": False,
             "include_raw_content": False,
             "include_images": False,
@@ -75,17 +72,18 @@ class TavilyWebSearchProvider:
         extract_limit = (
             self._extract_max_results
             if request.extract_max_results is None
-            else max(1, min(request.extract_max_results, 3))
+            else request.extract_max_results
         )
         selected = candidates[:extract_limit]
         extracted: dict[str, str] = {}
         partial_failure = False
-        try:
-            extracted, partial_failure = await self._extract_batch(
-                tuple(source.url for source in selected), query
-            )
-        except WebSearchError:
-            partial_failure = True
+        if selected:
+            try:
+                extracted, partial_failure = await self._extract_batch(
+                    tuple(source.url for source in selected)
+                )
+            except WebSearchError:
+                partial_failure = True
 
         sources = tuple(
             WebSearchSource(
@@ -94,11 +92,11 @@ class TavilyWebSearchProvider:
                 url=source.url,
                 domain=source.domain,
                 snippet=source.snippet,
-                relevant_content=extracted.get(source.url, source.snippet)[:_SOURCE_CONTENT_LIMIT],
+                relevant_content=extracted.get(source.url, source.snippet),
                 published_at=source.published_at,
                 provider_score=source.provider_score,
             )
-            for source in selected
+            for source in candidates
         )
         return WebSearchResponse(
             query=query,
@@ -111,7 +109,7 @@ class TavilyWebSearchProvider:
     async def extract(self, url: str, query: str) -> WebSearchSource:
         normalized = normalize_public_url(url)
         intent = _validated_query(query or "读取用户指定的网页")
-        extracted, partial_failure = await self._extract_batch((normalized,), intent)
+        extracted, partial_failure = await self._extract_batch((normalized,))
         content = extracted.get(normalized, "")
         if partial_failure or not content:
             raise WebSearchError("extract_failed", "网页正文提取失败")
@@ -121,14 +119,13 @@ class TavilyWebSearchProvider:
             title=domain,
             url=normalized,
             domain=domain,
-            snippet=content[:_SNIPPET_LIMIT],
-            relevant_content=content[:_SOURCE_CONTENT_LIMIT],
+            snippet=content,
+            relevant_content=content,
         )
 
     async def _extract_batch(
         self,
         urls: tuple[str, ...],
-        query: str,
     ) -> tuple[dict[str, str], bool]:
         data = await self._post_json(
             "/extract",
@@ -136,8 +133,6 @@ class TavilyWebSearchProvider:
                 "urls": list(urls),
                 "extract_depth": "basic",
                 "format": "markdown",
-                "query": query,
-                "chunks_per_source": 3,
                 "include_images": False,
             },
         )
@@ -157,7 +152,7 @@ class TavilyWebSearchProvider:
             except WebSearchError:
                 continue
             if normalized in urls:
-                extracted[normalized] = content.strip()[:_SOURCE_CONTENT_LIMIT]
+                extracted[normalized] = content.strip()
         failed = data.get("failed_results")
         has_failed_results = isinstance(failed, list) and bool(failed)
         return extracted, has_failed_results or len(extracted) != len(urls)
@@ -189,10 +184,10 @@ class TavilyWebSearchProvider:
             sources.append(
                 WebSearchSource(
                     source_id=_source_id(normalized, query),
-                    title=title.strip()[:300],
+                    title=title.strip(),
                     url=normalized,
                     domain=domain,
-                    snippet=(snippet.strip()[:_SNIPPET_LIMIT] if isinstance(snippet, str) else ""),
+                    snippet=(snippet.strip() if isinstance(snippet, str) else ""),
                     relevant_content="",
                     published_at=_parse_datetime(
                         item.get("published_at") or item.get("published_date")
@@ -258,8 +253,6 @@ def _validated_query(query: str) -> str:
     normalized = " ".join(query.split())
     if not normalized:
         raise WebSearchError("invalid_query", "搜索词不能为空")
-    if len(normalized) > 400:
-        raise WebSearchError("invalid_query", "搜索词不能超过 400 个字符")
     return normalized
 
 

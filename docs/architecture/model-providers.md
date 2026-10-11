@@ -56,7 +56,9 @@ Gemini 的 Google Search 与函数工具同请求在当前 Cloud Code 代理路�
 Tavily 是可选的网页读取与失败降级后端。没有 Tavily 时仍可取得真实 grounding 来源 URL/标题，
 并保留同一搜索响应已有的 `provider_summary`（明确标为上游模型生成的不可信总结，非网页
 原文或逐来源摘录）。仅在已有真实 grounding 时输出总结，其正文 URL 不参与来源认定。
-总结按现有工具字符限额裁剪，超额时先缩短总结再处理真实来源；旧缓存缺该字段仍可读取。
+来源、已返网页正文和总结保留原件，再交既有结果预算器整理展示或保存artifact；
+Provider和调用入口不提前缩减来源、正文或总结。明确请求的数量原样交真实上游，
+Tavily extract不再带用于选择相关chunks的query；不会为保已有来源额外抓页。
 不虚构网页正文，`read_webpage` 明确返回 `extract_unavailable`。模型配置保存时按发起工具
 调用的任务连接热切换桥。
 已开始的 Runner 将搜索后端与模型连接一起固定至该轮结束；热保存只影响后续 Runner。

@@ -13,6 +13,7 @@ import pytest
 from PIL import Image
 from sqlalchemy import delete, update
 
+from qq_ai_bot.automation.authority import DelegatedAuthority, PermissionLevel
 from qq_ai_bot.automation.models import TurnOrigin
 from qq_ai_bot.capabilities.results import ToolExecutionResult
 from qq_ai_bot.domain.conversations import ScopeType
@@ -295,8 +296,15 @@ async def test_plugin_prefix_delegation_cannot_authorize_another_selected_action
         bot_user_id="99999",
         inbound=inbound,
         actor_person_id=person_id,
-        delegated_authority=SimpleNamespace(
-            creator_user_id="10001", canonical_creator_person_id=person_id
+        delegated_authority=DelegatedAuthority(
+            creator_user_id=inbound.sender.user_id,
+            canonical_creator_person_id=person_id,
+            bot_user_id=inbound.bot_user_id,
+            created_from_message_id=inbound.message_id,
+            created_at=datetime.now(UTC).isoformat(),
+            permission_level=PermissionLevel.USER,
+            granted_capabilities=(action, "plugin.example.plugin.tool.other"),
+            capability_schema_versions={action: 1, "plugin.example.plugin.tool.other": 1},
         ),
         allowed_capabilities=frozenset({"plugin.example.plugin.tool.other"}),
     )

@@ -1,4 +1,4 @@
-"""Sequential DSL executor with hard limits, audit, and uncertain-send handling."""
+"""Execute the original DSL cursor and preserve its effect receipts and usage."""
 
 from __future__ import annotations
 
@@ -10,6 +10,7 @@ from dataclasses import dataclass, replace
 from datetime import datetime
 from typing import Any
 
+from pydantic import BaseModel
 from sqlalchemy import select
 
 from qq_ai_bot.automation.authority import (
@@ -19,11 +20,9 @@ from qq_ai_bot.automation.authority import (
 )
 from qq_ai_bot.automation.context import AutomationBindError, bind_automation_conversation
 from qq_ai_bot.automation.gateway import ProactiveGatewayError
-from qq_ai_bot.automation.model_delivery import classify_model_delivery
 from qq_ai_bot.automation.models import (
     AutomationRecord,
     AutomationRunRecord,
-    AutomationStatus,
     ExecutionResult,
     RetryPolicy,
     RiskClass,
@@ -40,11 +39,7 @@ from qq_ai_bot.automation.repository import AutomationRepository
 from qq_ai_bot.automation.templates import TemplateError, resolve_templates
 from qq_ai_bot.config import Settings
 from qq_ai_bot.control_plane.principal import ControlPrincipal, PrincipalSource
-from qq_ai_bot.conversation.canonical_db_models import (
-    CanonicalConversationModel,
-    PersonActiveRouteModel,
-    SpaceActiveRouteModel,
-)
+from qq_ai_bot.conversation.canonical_db_models import CanonicalConversationModel
 from qq_ai_bot.domain.identity import PersonId, PrincipalId
 from qq_ai_bot.identity.db_models import (
     CanonicalPersonModel,
@@ -52,16 +47,10 @@ from qq_ai_bot.identity.db_models import (
     PresenceModel,
     SpaceBindingModel,
 )
-from qq_ai_bot.identity.routing import PresenceRouter, RouteSendError
+from qq_ai_bot.model_runtime.dispatch_guard import model_dispatch_guard
 from qq_ai_bot.runtime.principal import SELF, PrincipalRef
+from qq_ai_bot.runtime.work_budget import WorkBudgetExceeded, charge_automation_run
 from qq_ai_bot.time.service import TimeContextService
-
-_SEND_CAPABILITIES = frozenset(
-    {
-        "social.send_message",
-        "social.poke_person",
-    }
-)
 
 logger = logging.getLogger(__name__)
 _RUN_USAGE_FIELDS = ("steps_completed", "llm_calls", "tool_calls", "messages_sent")
@@ -117,14 +106,12 @@ class AutomationExecutor:
         repository: AutomationRepository,
         time_service: TimeContextService,
         gateway_factory: Callable[[CapabilityExecutionContext], object] | None = None,
-        router: PresenceRouter | None = None,
     ) -> None:
         self._settings = settings
         self._registry = registry
         self._repository = repository
         self._time = time_service
         self._gateway_factory = gateway_factory
-        self._router = router
 
     async def execute(
         self,
@@ -135,6 +122,22 @@ class AutomationExecutor:
     ) -> ExecutionResult:
         from qq_ai_bot.automation.work_cursor import load as load_cursor
 
+        if run.status is not RunStatus.RUNNING:
+            return ExecutionResult(
+                status=run.status,
+                **{field: getattr(run, field) for field in _RUN_USAGE_FIELDS},
+                error_category=run.error_category,
+                summary=run.result_summary,
+            )
+        original = await self._repository.get_for_run(run.id)
+        if original is None:
+            return ExecutionResult(
+                status=RunStatus.UNCERTAIN,
+                error_category="missing_original_run_version",
+                **{field: getattr(run, field) for field in _RUN_USAGE_FIELDS},
+                summary=run.result_summary,
+            )
+        automation = original.model_copy(update={"claimed_by": automation.claimed_by})
         phase, cursor = await load_cursor(
             self._repository._database, run.id, automation.script_hash
         )
@@ -142,15 +145,30 @@ class AutomationExecutor:
             field: max(getattr(run, field), int(cursor.get(field, 0)))
             for field in _RUN_USAGE_FIELDS
         }
-        result = await self._execute(
-            automation,
-            run,
-            phase=phase,
-            cursor={**cursor, **usage},
-            current_group_id=current_group_id,
-        )
+        if phase == "ready" and cursor.get("next_step") == len(automation.script.steps):
+            result = ExecutionResult(
+                status=RunStatus.SUCCEEDED,
+                **usage,
+                summary={"output_steps": list(cursor.get("outputs", {}))},
+            )
+        else:
+            result = await self._execute(
+                automation,
+                run,
+                phase=phase,
+                cursor={**cursor, **usage},
+                current_group_id=current_group_id,
+            )
         # Preflight rejection is still the same run, including when its cursor
         # belongs to an older script. It must not erase committed usage/evidence.
+        from qq_ai_bot.runtime.work_budget_schema import automation_budgets
+
+        async with self._repository._database.sessions() as reader:
+            models = await reader.scalar(
+                select(automation_budgets.c.models).where(automation_budgets.c.run_id == run.id)
+            )
+        if models is not None:
+            usage["llm_calls"] = max(usage["llm_calls"], models)
         return result.model_copy(
             update={
                 **{field: max(value, getattr(result, field)) for field, value in usage.items()},
@@ -167,7 +185,7 @@ class AutomationExecutor:
         cursor: dict[str, Any],
         current_group_id: str | None,
     ) -> ExecutionResult:
-        snapshot = await self._begin_execution(automation)
+        snapshot = await self._begin_execution(automation, run.id)
         if isinstance(snapshot, ExecutionResult):
             return snapshot
         if snapshot.record.script_hash != automation.script_hash:
@@ -180,9 +198,6 @@ class AutomationExecutor:
         )
         if current_group_id is None:
             current_group_id = authority.current_group_id
-        blocked_send = await self._revalidate_canonical_send(automation)
-        if blocked_send is not None:
-            return blocked_send
         local = self._time.at(run.actual_started_at, automation.timezone)
         authority_context = AuthorityContext(
             origin=TurnOrigin.SCHEDULED_AUTOMATION,
@@ -196,7 +211,7 @@ class AutomationExecutor:
         )
 
         async def revalidate_authority(capability: str | None) -> None:
-            fresh = await self._begin_execution(automation)
+            fresh = await self._begin_execution(automation, run.id)
             if isinstance(fresh, ExecutionResult):
                 raise AutomationExecutionError(
                     fresh.error_category or "delegated_authority_revoked"
@@ -216,7 +231,7 @@ class AutomationExecutor:
                 raise AutomationExecutionError("capability_not_delegated")
 
         builtins: dict[str, Any] = {
-            "creator_user_id": automation.creator_user_id,
+            "creator_user_id": snapshot.actor_user_id,
             "bot_user_id": automation.bot_user_id,
             "automation_id": automation.id,
             "automation_run_id": run.id,
@@ -246,7 +261,6 @@ class AutomationExecutor:
         tool_calls = int(cursor.get("tool_calls", 0))
         messages_sent = int(cursor.get("messages_sent", 0))
         next_step = int(cursor.get("next_step", 0))
-        pending_usage = dict(cursor.get("pending_usage", {"models": 0, "tools": 0}))
         active_before = float(cursor.get("active_seconds", 0))
         activated_at = time.monotonic()
 
@@ -264,7 +278,6 @@ class AutomationExecutor:
                     "messages_sent": messages_sent,
                     "next_step": index,
                     "work_id": work_id,
-                    "pending_usage": pending_usage,
                     "active_seconds": active_before + time.monotonic() - activated_at,
                 },
                 expected_owner=automation.claimed_by,
@@ -298,22 +311,12 @@ class AutomationExecutor:
             return ExecutionResult(
                 status=RunStatus.BLOCKED, error_category="work_conversation_unavailable"
             )
-        send_capabilities = {
-            item.name for item in self._registry.list() if item.risk_class is RiskClass.SEND
-        }
-        model_deliveries = {
-            index
-            for index in range(len(automation.script.steps))
-            if classify_model_delivery(
-                automation.script, index, send_capabilities=send_capabilities
-            )
-        }
         dispatched = False
         completed_result: CapabilityResult | None = None
         result_usage_recorded = False
         active_definition: AutomationCapability | None = None
         active_context: CapabilityExecutionContext | None = None
-        active_arguments: dict[str, Any] = {}
+        active_arguments: Any = {}
         effect_evidence: dict[str, Any] = {}
 
         def mark_dispatch() -> None:
@@ -360,7 +363,7 @@ class AutomationExecutor:
         try:
             async with asyncio.timeout(
                 None
-                if automation.script.uses_runtime_budget
+                if automation.script.limits.timeout_seconds is None
                 else max(0, automation.script.limits.timeout_seconds - active_before)
             ):
                 for index, step in enumerate(automation.script.steps):
@@ -373,21 +376,31 @@ class AutomationExecutor:
                     active_context = None
                     active_arguments = {}
                     effect_evidence = {}
-                    if index in model_deliveries:
-                        raise AutomationExecutionError("model_delivery_requires_agent_send")
                     definition = self._registry.require(step.call)
                     active_definition = definition
                     if step.call not in allowed:
                         raise AutomationExecutionError("capability_not_delegated")
-                    try:
-                        resolved = resolve_templates(
-                            step.arguments,
-                            builtins=builtins,
-                            step_outputs=outputs,
-                        )
-                        arguments = definition.validate_arguments(resolved)
-                    except (TemplateError, ValueError) as exc:
-                        raise AutomationExecutionError("runtime_argument_validation") from exc
+                    resume_plugin = bool(
+                        phase == "agent"
+                        and index == next_step
+                        and cursor.get("work_id")
+                        and definition.provider_plugin_id is not None
+                    )
+                    if not resume_plugin:
+                        try:
+                            resolved = resolve_templates(
+                                step.arguments,
+                                builtins=builtins,
+                                step_outputs=outputs,
+                            )
+                            arguments = definition.validate_arguments(resolved)
+                            if (
+                                isinstance(arguments, BaseModel)
+                                and definition.provider_plugin_id is None
+                            ):
+                                arguments = arguments.model_dump()
+                        except (TemplateError, ValueError) as exc:
+                            raise AutomationExecutionError("runtime_argument_validation") from exc
                     context = CapabilityExecutionContext(
                         authority=authority_context,
                         automation_id=automation.id,
@@ -420,13 +433,8 @@ class AutomationExecutor:
                             gateway=self._gateway_factory(context),
                         )
                     started = self._time.clock.now()
-                    active_context, active_arguments = context, arguments
-                    resume_plugin = bool(
-                        phase == "agent"
-                        and index == next_step
-                        and cursor.get("work_id")
-                        and definition.provider_plugin_id is not None
-                    )
+                    active_context = context
+                    active_arguments = arguments if not resume_plugin else {}
                     await checkpoint(
                         "agent" if resume_plugin or step.call in {"yuki.agent"} else "dispatching",
                         index,
@@ -465,7 +473,6 @@ class AutomationExecutor:
                                 str(cursor["work_id"]),
                                 definition,
                                 context,
-                                pending_usage,
                             )
                         else:
                             result = await self._execute_capability(
@@ -490,17 +497,6 @@ class AutomationExecutor:
                             else "failed"
                         )
                         step_error = None if step_status == "cancelled" else exc.category
-                        await self._repository.record_step(
-                            run_id=run.id,
-                            step_id=step.id,
-                            capability=step.call,
-                            status=step_status,
-                            input_summary=_summary(arguments),
-                            output_summary={},
-                            started_at=started,
-                            finished_at=finished,
-                            error_category=step_error,
-                        )
                         self._log_step(
                             automation,
                             run,
@@ -514,8 +510,6 @@ class AutomationExecutor:
                         raise
                     finished = self._time.clock.now()
                     if result.pending_work_id is not None:
-                        pending_usage["models"] += result.llm_calls
-                        pending_usage["tools"] += result.tool_calls
                         llm_calls += result.llm_calls
                         tool_calls += result.tool_calls
                         messages_sent += result.messages_sent
@@ -535,17 +529,6 @@ class AutomationExecutor:
                             messages_sent=messages_sent,
                             summary={"pending_work_id": result.pending_work_id},
                         )
-                    await self._repository.record_step(
-                        run_id=run.id,
-                        step_id=step.id,
-                        capability=step.call,
-                        status="succeeded",
-                        input_summary=_summary(arguments),
-                        output_summary=_summary(result.data),
-                        started_at=started,
-                        finished_at=finished,
-                        error_category=None,
-                    )
                     self._log_step(
                         automation,
                         run,
@@ -571,7 +554,6 @@ class AutomationExecutor:
                         tool_calls=tool_calls,
                         messages_sent=messages_sent,
                     )
-                    pending_usage = {"models": 0, "tools": 0}
                     await checkpoint("ready", index + 1)
         except TimeoutError:
             uncertain, confirmed, evidence = await failure_evidence()
@@ -624,7 +606,6 @@ class AutomationExecutor:
                 "target_missing",
                 "operation_unavailable",
                 "agent_work_blocked",
-                "legacy_model_delivery_requires_update",
             }:
                 return ExecutionResult(
                     status=RunStatus.BLOCKED,
@@ -675,10 +656,10 @@ class AutomationExecutor:
         )
 
     async def _begin_execution(
-        self, claimed: AutomationRecord, *, allow_completed: bool = False
+        self, claimed: AutomationRecord, run_id: int
     ) -> _ExecutionSnapshot | ExecutionResult:
         async with self._repository._database.sessions() as session:
-            current = await self._repository.get(claimed.id, session=session)
+            current = await self._repository.get_for_run(run_id, session=session)
             if current is None:
                 return ExecutionResult(
                     status=RunStatus.BLOCKED,
@@ -696,14 +677,6 @@ class AutomationExecutor:
                     status=RunStatus.BLOCKED,
                     error_category="state_mismatch",
                     summary={"reason": "claimed canonical identity is stale"},
-                )
-            if current.status is not AutomationStatus.ACTIVE and not (
-                allow_completed and current.status is AutomationStatus.COMPLETED
-            ):
-                return ExecutionResult(
-                    status=RunStatus.BLOCKED,
-                    error_category="automation_inactive",
-                    summary={"reason": "automation is not active"},
                 )
             blocked = await self._validate_canonical_identity(session, current)
             if blocked is not None:
@@ -734,12 +707,6 @@ class AutomationExecutor:
                 if item.permits(current_permission)
                 and item.name in original_authority.granted_capabilities
             )
-            if not {step.call for step in current.script.steps}.issubset(allowed):
-                return ExecutionResult(
-                    status=RunStatus.BLOCKED,
-                    error_category="delegated_authority_revoked",
-                    summary={"reason": "required capability is no longer delegated"},
-                )
             return _ExecutionSnapshot(
                 record=current,
                 allowed=allowed,
@@ -772,7 +739,6 @@ class AutomationExecutor:
                     error_category="target_disabled",
                     summary={"reason": "canonical person is missing or disabled"},
                 )
-            route = await session.get(PersonActiveRouteModel, person_id)
         else:
             space = await session.get(CanonicalSpaceModel, space_id or "")
             if space is None or not space.enabled:
@@ -781,13 +747,6 @@ class AutomationExecutor:
                     error_category="target_disabled",
                     summary={"reason": "canonical space is missing or disabled"},
                 )
-            route = await session.get(SpaceActiveRouteModel, space_id)
-        if route is not None and route.paused:
-            return ExecutionResult(
-                status=RunStatus.BLOCKED,
-                error_category="paused",
-                summary={"reason": "active route is paused"},
-            )
         return None
 
     async def _canonical_creator_principal(
@@ -865,37 +824,10 @@ class AutomationExecutor:
         )
         return principal, current_permission, execution_user_id
 
-    async def _revalidate_canonical_send(
-        self, automation: AutomationRecord
-    ) -> ExecutionResult | None:
-        needs_send = bool(_SEND_CAPABILITIES.intersection(automation.required_capabilities))
-        if not needs_send:
-            return None
-        if self._router is None:
-            return ExecutionResult(
-                status=RunStatus.BLOCKED,
-                error_category="operation_unavailable",
-                summary={"reason": "canonical send requires PresenceRouter"},
-            )
-        person_id = automation.canonical_target_person_id
-        space_id = automation.canonical_target_space_id
-        try:
-            if person_id:
-                await self._router.resolve_send_for_person(person_id)
-            elif space_id:
-                await self._router.resolve_send_for_space(space_id)
-        except RouteSendError as exc:
-            return ExecutionResult(
-                status=RunStatus.BLOCKED,
-                error_category=exc.category,
-                summary={"reason": "send route is not uniquely live"},
-            )
-        return None
-
     async def _execute_capability(
         self,
         definition: AutomationCapability,
-        arguments: dict[str, Any],
+        arguments: BaseModel | dict[str, Any],
         context: CapabilityExecutionContext,
         *,
         on_dispatch: Callable[[], None],
@@ -909,6 +841,16 @@ class AutomationExecutor:
             and definition.name not in {"yuki.agent"}
             else 1
         )
+        admitted_models = 0
+
+        async def admit_native_request() -> None:
+            nonlocal admitted_models
+            if context.revalidate_authority is not None:
+                await context.revalidate_authority(definition.name)
+            async with self._repository._database.immediate_session() as writer:
+                await charge_automation_run(writer, context.automation_run_id, models=1, tools=0)
+            admitted_models += 1
+
         for attempt in range(attempts):
             dispatched = False
             try:
@@ -916,12 +858,21 @@ class AutomationExecutor:
                     await context.revalidate_authority(definition.name)
                 dispatched = True
                 on_dispatch()
-                return await definition.handler(arguments, context)
+                if definition.name == "yuki.agent":
+                    return await definition.handler(arguments, context)
+                with model_dispatch_guard(admit_native_request):
+                    result = await definition.handler(arguments, context)
+                return replace(result, llm_calls=max(result.llm_calls, admitted_models))
             except ProactiveGatewayError as exc:
-                raise AutomationExecutionError(exc.category, uncertain=exc.uncertain) from exc
+                raise AutomationExecutionError(
+                    exc.category, uncertain=exc.uncertain, llm_calls=admitted_models
+                ) from exc
             except AutomationExecutionError as exc:
+                exc.llm_calls = max(exc.llm_calls, admitted_models)
                 if not exc.transient or attempt + 1 >= attempts:
                     raise
+            except WorkBudgetExceeded as exc:
+                raise AutomationExecutionError(str(exc), llm_calls=admitted_models) from exc
             except Exception as exc:
                 from qq_ai_bot.runtime.work_repository import WorkConflict
 
@@ -934,6 +885,7 @@ class AutomationExecutor:
                 )
                 raise AutomationExecutionError(
                     "capability_execution_failed",
+                    llm_calls=admitted_models,
                     uncertain=dispatched
                     and definition.risk_class in {RiskClass.SEND, RiskClass.MUTATE},
                 ) from exc
@@ -947,15 +899,15 @@ class AutomationExecutor:
         tool_calls: int,
         messages_sent: int,
     ) -> None:
+        limits = automation.script.limits
+        if limits.max_messages is not None and messages_sent > limits.max_messages:
+            raise AutomationExecutionError("message_limit_exceeded")
         if automation.script.uses_runtime_budget:
             return
-        limits = automation.script.limits
-        if llm_calls > limits.max_llm_calls:
+        if limits.max_llm_calls is not None and llm_calls > limits.max_llm_calls:
             raise AutomationExecutionError("llm_limit_exceeded")
-        if tool_calls > limits.max_tool_calls:
+        if limits.max_tool_calls is not None and tool_calls > limits.max_tool_calls:
             raise AutomationExecutionError("tool_limit_exceeded")
-        if messages_sent > limits.max_messages:
-            raise AutomationExecutionError("message_limit_exceeded")
 
     @staticmethod
     def _log_step(
@@ -984,15 +936,3 @@ class AutomationExecutor:
             status,
             error_category,
         )
-
-
-def _summary(value: dict[str, Any]) -> dict[str, Any]:
-    summary: dict[str, Any] = {"keys": sorted(value)[:50]}
-    for key in ("user_id", "group_id", "action", "status", "ok"):
-        if key in value:
-            summary[key] = value[key]
-    for key in ("text", "content", "relevant_content"):
-        item = value.get(key)
-        if isinstance(item, str):
-            summary[f"{key}_characters"] = len(item)
-    return summary

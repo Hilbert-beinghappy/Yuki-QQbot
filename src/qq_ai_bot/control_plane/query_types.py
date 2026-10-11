@@ -1294,7 +1294,7 @@ class AutomationView:
         object.__setattr__(
             self, "automation_id", _require_int(self.automation_id, "automation_id", minimum=1)
         )
-        if type(self.name) is not str or not self.name or len(self.name) > 128:
+        if type(self.name) is not str or not self.name:
             raise ValueError("name must be a nonempty display token")
         require_opaque_token(self.status, name="status", max_length=16)
         object.__setattr__(self, "run_count", _require_int(self.run_count, "run_count"))

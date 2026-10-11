@@ -9,6 +9,7 @@ from pydantic import Field, model_validator
 
 from qq_ai_bot.automation.models import StrictModel, TurnOrigin
 from qq_ai_bot.config import Settings
+from yuki_plugin_sdk.models import PermissionLevel as SdkPermissionLevel
 
 
 class PermissionLevel(StrEnum):
@@ -72,3 +73,12 @@ def permission_for_accounts(settings: Settings, account_ids: Iterable[str]) -> P
     if any(item in settings.superusers for item in account_ids):
         return PermissionLevel.SUPERUSER
     return PermissionLevel.USER
+
+
+def _permission_level_allowed(
+    level: PermissionLevel | SdkPermissionLevel, actor_is_superuser: bool
+) -> bool:
+    if level == PermissionLevel.USER:
+        return True
+    # trusted/moderator are reserved and cannot currently be assigned.
+    return level == PermissionLevel.SUPERUSER and actor_is_superuser

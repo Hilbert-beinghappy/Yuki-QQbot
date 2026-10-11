@@ -137,9 +137,10 @@ Work 或假 initiative。`join/stay/quiet` 不必逐轮填写，没报不清空�
 绑定缺失就保持未知，不能从后来当前话题补造。查询和反馈沿原主执行链，不增加逐轮审核模型。
 
 新建 `agentic` 和 `auto` 任务统一编译为一个 `yuki.agent` 步骤，
-由同一主 Agent 显式调用 `send_message`。`generated` 输入和 `yuki.generate` 新执行入口已退役；
-历史原回执按原 ID 读取，不再走生成正文后追加 DSL 发送的路径。固定工具 schema、
-提示词前缀和 Provider 设置不因此改变。
+完整保存用户的 goal、constraints 与 delivery；不裁剪编码后的指令，不重复注入通用规则。
+主 Agent 用 `send_message` 显式交付。手工 DSL 明确声明的受权 Social SEND 也可读取前步模型
+或其衍生结果，沿原目标、operation 与回执执行；没有声明发送的内部 final 不被补发。
+`generated` 和 `yuki.generate` 新执行入口已退役；历史回执沿原 ID 保存，不重新派发。
 静态字面量提醒由 DSL 调用 `social.send_message`，与主 Agent 使用相同的 Social
 路由、净化和持久发送回执，不进入模型循环。SELF 与用户创建的提醒走同一合同；
 SELF 只可投递到原群。`delivery=none` 只执行内部工作，不会产生可见提醒。
@@ -166,11 +167,8 @@ worker 合同 4）。direct 与 Code 共用原结束入口，把 Agent 的结束
 合法无工具 final（包括空正文）走同一结束路径；正文供内部结果，QQ 仍须显式发送。旧 unknown、暂停子目标、产物标签与辅助通知不否决业务完成，查询仍保存实际失败和未知事实。
 恢复先读 accepted_control，配齐原调用后由同一 writer 收尾，不再购买模型确认完成；没有持久响应的丢进程请求不自动重购。真实输入和目标修改沿原边界接续。
 
-历史脚本保留原 run/step、script_hash、工作 ID、预算与游标。旧模型正文尾发不再执行：
-可以定位原工作及目标且已有完整成功证据时，记录跳过该尾步；未知则停在 uncertain，
-无确认或结构变形则 blocked，要求更新任务。尚未派发的旧 `yuki.generate + 发送` 脚本
-直接要求更新，不改写资料包或重建执行链；已开始的主工作仍按原身份恢复。
-新建和更新也拒绝模型输出通过 DSL 文本、语音、插件发送等旁路外发。
+历史脚本保留原 run/step、script_hash、工作 ID、预算、游标与已发生回执。
+步骤是否完成、发送是否确认沿原执行事实读取，不按模型依赖或正文分类新增收尾门槛。
 
 Social 回执来源键保留 128 字符以内的旧键；超长完整内部身份统一映射为版本化 SHA256。
 写入、查找和交付核验使用同一映射，不截断原执行 ID，也不改变任务恢复和预算身份。
@@ -223,7 +221,8 @@ SDK 回调等待约 5 秒可返回 `work_id/state/pending`；等待不是模型�
 `agent.result(work_id)` 不依赖已经退出的 ContextVar，但核对插件所有权、批准版本、权限和 generation。
 等待原因随结果返回；`agent.resume(work_id, text, request_id=...)` 将补充资料追加到原工作。
 相同 request_id 重放幂等，不同内容冲突；不新建 work，不重置历史或预算。
-接纳前超时取消准备，接纳后回调退出不取消 Host 工作。完成句柄至少保留 7 天，超过保留期查询明确返回已归档。
+接纳前超时取消准备，接纳后回调退出不取消 Host 工作。`return_to_caller` 的原同步结果
+保留供调用方读取，不按七天期限回收；查询不重新执行模型或工具。
 插件停止时取消进程内任务，保留已接纳工作和回执；失效授权不得继续执行或自行发送。
 没有真实事件的 SDK 调用仍须用目标明确的通知 API，禁止补造用户。
 主 Agent 正在执行插件工具时，插件递归调用主生成会被拒绝，不能抢占父锁或绕开总预算。
@@ -425,18 +424,23 @@ SubagentScheduler 同样启动以恢复原子任务；新子任务接纳关闭�
 
 ## 预算、等待与异常
 
-自动化创建在最终短 writer 中复核永久创建者、当前权限、SELF 场景及 active 数量上限；
-同 creation key 的原结果先于容量拒绝。普通 create/update/pause/resume/cancel/run_now
+自动化创建在最终短 writer 中复核永久创建者、当前权限与 SELF 场景；
+同 creation key 读取原创建版本，不重新校验已经过去的首次日期。普通 create/update/pause/resume/cancel/run_now
 与强制管理审计共用事务，审计失败一同回滚，before 使用写时实际版本；resume/run_now
 保留原准入 policy。读取目录不授予修改权限，修改按当前 canonical owner 或 superuser 核验。
 
 每段默认 24 次模型请求、32 次业务工具调用，单段用尽仅让出并排队续跑。新主任务、子任务
 及自动化 run 没有默认累计次数上限；root/run 持久计数不清零，显式有限限额仍同事务预留。
+未声明段限额的非 Work 自动化不制造段门；模型与工具在真实派发处消费原 Run 累计账本。
+无 Work 时，明确有限段额或累计预算耗尽沿原失败事实退出，不返回固定停止文字冒充普通成功。
 旧已登记的有限预算保留原值，不因升级、换步骤、重启或取结果获得新额度。纯 DSL 保留原声明限制。
-旧含 Yuki 生成步骤的脚本采用 runtime 预算，不因旧外层 1 次模型 / 2 次工具限制拒绝已完成工作。
-自动化的旧累计激活时间限制不再作为主 Agent 总寿命；Provider 请求超时和总预算仍有效。
+含 Yuki 生成步骤的脚本采用原 Run/Work 累计账本，显式及旧存有限值仍消费原上限。
+准备阶段及辅助搜索的实际模型请求也记入原 Run；纯结果读取不转计另一个 Work 的旧累计。
+自动化不制造累计激活期限；原脚本明示或已存的有限 timeout 由原 Run 外层按 active_seconds 消费，
+等待期间不计为这段活动执行。独立 WorkScheduler 没有因此新增墙钟计时器；Provider 请求超时和原总预算仍有效。
 
-真实 Provider 请求只在 `TaskModelExecutor` 统一接纳。后台与维护请求合计不超过
+主模型请求在 `TaskModelExecutor` 统一接纳；AutomationWorker 不再按模型池 N−1 限制整项任务。
+后台与维护请求合计不超过
 `max(1, N-1)`，总请求不超过 N；N 大于 1 时保留一个前台名额，N 为 1 时串行并优先
 接纳已排队的前台。普通持久后台请求使用不可抢占的 `BACKGROUND`；SELF 自省等
 最佳努力任务仍可被前台抢占，`REQUIRED` 压缩按前台必需工作接纳。
@@ -464,22 +468,28 @@ Work、工作者与自动化的续租任务由原激活 task 监督。续租返�
 续租只对具有明确 SQLite `BUSY` 扩展错误码的错误，在最后确认的租约到期前有界重试；
 `LOCKED` 不按外部 writer 繁忙重试。renew 与 meter 分别记录失败阶段，meter 写入失败
 不在心跳中重放。等待 writer 后的自动化续租也在 SQL 执行时检查原 claim 尚未到期。
-新 run 与保存原 script_hash 的初始 ready 游标在同一事务登记；登记后重启恢复同一个 run。
-恢复当前时段的历史 running run 若缺少游标，明确记为 uncertain/missing_initial_run_cursor，
-保留已有计数、预算与结果，不补造空游标或重新执行业务步骤。旧版本已经跳过时段的历史
-孤立记录不倒追执行。前置权限、路由或配置拒绝同样保留累计计数；旧工作者不能重新载入
-新领取者身份来通过执行检查。
+新 run 与原 owner/slot、既存 version 唯一引用及初始 ready 游标在同一短事务登记；
+version 保存该次原 script、delegation 和已绑定 canonical 目标，更新后的定义供新 run 使用。
+登记后重启恢复同一个 run，改名或新授权不覆写旧目标；缺失旧版本事实不按 hash、日期或当前角色猜补。
+运行时 creator_user_id 模板变量使用该原永久 Person 当前已解析的执行账号；历史创建账号仍作来源元数据，
+不拿旧 QQ 账号替代当前执行范围，也不随账号切换提高原委托权限。
+恢复已接纳的历史 running run 时，只消费原 run、版本、游标及回执，不按当前时段重新派发。
+缺少初始游标的旧 run 明确记为 uncertain/missing_initial_run_cursor，保留已有计数、预算与结果，
+不补造空游标或重新执行业务步骤；缺失原版本也不按当前定义补造。
+前置权限、路由或配置拒绝同样保留累计计数；旧工作者不能重新载入新领取者身份来通过执行检查。
 停机等待有界，取消后按持久检查点恢复。插件自主轮不会因两次会话变动直接放弃。
 
 超时的写入和发送可能已经提交。插件副作用不因 transient_once 自动重试，未知结果携带
 `uncertain` 回执，同一原调用不再取得派发资格；其他独立调用仍可执行。读取可按声明重试。
-自动化收到插件任务句柄后查询该 work，不重新执行产生句柄的 handler。
+自动化仅通过 Host 私有类型化结果取得真实插件 Work/Social 事实，不从普通业务 JSON 的
+state、pending、work_id、usage 或 uncertain 字段推断控制、预算或回执。同步和异步读取保同一
+SDK结果投影；原 waiting/suspended 不当成功，查询不重计旧累计或重执行 handler。
 未取得可核验结果的外层 dispatch 恢复为 uncertain，不猜测成功或重跑。
 DSL 外层 deadline 在权限复核后区分实际进入 handler 的 SEND/MUTATE 与纯 READ、
 尚未通过验证的步骤：前者没有终态效果证据时保留 uncertain，后两者保持 failed。
 原 cursor、run/step 请求键和 Social receipt 不重建；单效果的已确认回执可以说明
-accepted/failed，部分复合交付不充当整个步骤已完成的证据。效果已确认但步骤记账失败
-仍报告运行失败，并保留已确认投递计数；恢复只读原 dispatch，不再次调用 handler。
+accepted/failed，部分复合交付不充当整个步骤已完成的证据。步骤结果保存在原 cursor 和领域
+回执，不等待独立 step 审计 writer；真正检查点失败仍保原已确认效果，不再次调用 handler。
 
 普通回答无需接纳 Work。模型最终文字可结束内部循环，但不触发发送；
 工作完成由 Agent 提交决定，原 writer 收拢实际所属执行。发送是否成功只看显式发送回执，

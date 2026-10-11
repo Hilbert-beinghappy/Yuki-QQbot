@@ -12,6 +12,7 @@ imports no platform, database, Provider or Work code.
 from __future__ import annotations
 
 import json
+from itertools import count
 
 from qq_ai_bot.agent_core.events import EventStream
 from qq_ai_bot.agent_core.model_boundary import (
@@ -61,7 +62,7 @@ def fail_truncated_calls(
 
 async def run_agent_loop(
     *,
-    max_requests: int,
+    max_requests: int | None,
     model: ModelBoundary,
     invocation: InvocationBoundary,
     settlement: TurnSettlement,
@@ -77,7 +78,9 @@ async def run_agent_loop(
     stream.emit(AgentEvent("agent_start"))
     try:
         # Admission may stop before this activation's request budget is spent.
-        for index in range(max_requests):
+        for index in count():
+            if max_requests is not None and index >= max_requests:
+                break
             if await model.begin(index) is STOP:
                 break
             stream.emit(AgentEvent("turn_start", index=index))

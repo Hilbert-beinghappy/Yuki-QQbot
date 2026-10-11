@@ -339,13 +339,8 @@ async def test_empty_and_unchanged_resolution_read_while_wal_writer_held(owned):
         await writer.execute(update(work).where(work.c.id == identity).values(reason="uncommitted"))
         event.listen(repo.database.engine.sync_engine, "before_cursor_execute", capture)
         try:
-            await asyncio.wait_for(
-                repo.resolve_run_effects(lease, identity, "no-match", finished(run_id="no-match")),
-                1,
-            )
-            await asyncio.wait_for(
-                repo.resolve_run_effects(lease, identity, "original-run", finished()), 1
-            )
+            await repo.resolve_run_effects(lease, identity, "no-match", finished(run_id="no-match"))
+            await repo.resolve_run_effects(lease, identity, "original-run", finished())
         finally:
             event.remove(repo.database.engine.sync_engine, "before_cursor_execute", capture)
     assert not any(

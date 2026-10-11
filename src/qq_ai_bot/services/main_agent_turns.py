@@ -126,6 +126,8 @@ class MainAgentTurnService:
         read_scope: str | None = None,
         allowed_capabilities: frozenset[str] = frozenset(),
         before_preparation: Callable[[], Awaitable[None]] | None = None,
+        automation_run_id: int | None = None,
+        max_preparation_requests: int | None = None,
     ) -> PromptComposition:
         with self.executions.track():
             active = current_work_control.get()
@@ -368,10 +370,26 @@ class MainAgentTurnService:
                         ).read_version_matches(version):
                             raise WorkConflict("observation_compaction_source_changed")
                         if not dispatched:
-                            if preparation_requests + 1 >= runtime.agent.max_model_requests:
+                            if (
+                                max_preparation_requests is not None
+                                and preparation_requests >= max_preparation_requests
+                            ):
+                                from qq_ai_bot.runtime.work_budget import WorkBudgetExceeded
+
+                                raise WorkBudgetExceeded("agent_segment_budget_exhausted")
+                            if (
+                                active is not None or automation_run_id is None
+                            ) and preparation_requests + 1 >= runtime.agent.max_model_requests:
                                 raise WorkConflict("model_request_budget")
                             if active is not None:
                                 await active.reserve_request(auxiliary=True)
+                            elif automation_run_id is not None:
+                                from qq_ai_bot.runtime.work_budget import charge_automation_run
+
+                                async with repository.database.immediate_session() as writer:
+                                    await charge_automation_run(
+                                        writer, automation_run_id, models=1, tools=0
+                                    )
                             preparation_requests += 1
                             dispatched = True
 
@@ -790,7 +808,40 @@ class MainAgentTurnService:
                 await validate()
 
         runtime = replace(runtime, before_model_request=validate_prepared)
-        return await self._runner.run(
+        prepaid = 0
+        if (
+            control is not None
+            and runtime.invocation_source is not None
+            and runtime.invocation_source.get("owner") == "automation"
+        ):
+            prepaid = runtime.preparation_model_requests
+            runtime = replace(
+                runtime,
+                preparation_model_requests=0,
+                max_model_requests=(
+                    runtime.max_model_requests - prepaid
+                    if runtime.max_model_requests is not None
+                    else None
+                ),
+            )
+        if (
+            control is None
+            and runtime.origin.value == "scheduled_automation"
+            and runtime.invocation_source is not None
+            and runtime.invocation_source.get("owner") == "automation"
+        ):
+            from qq_ai_bot.runtime.work_budget import charge_automation_run
+
+            assert self._invocations is not None
+            database = self._invocations.database
+            run_id = int(runtime.invocation_source["automation_run_id"])
+
+            async def admit_model_request() -> None:
+                async with database.immediate_session() as writer:
+                    await charge_automation_run(writer, run_id, models=1, tools=0)
+
+            runtime = replace(runtime, admit_model_request=admit_model_request)
+        result = await self._runner.run(
             messages,
             replace(
                 runtime,
@@ -799,6 +850,7 @@ class MainAgentTurnService:
             ),
             backend,
         )
+        return replace(result, model_requests=result.model_requests + prepaid)
 
 
 def _hash(value: object) -> str:

@@ -13,6 +13,7 @@ from typing import Protocol, cast
 
 from pydantic import BaseModel, ValidationError
 
+from qq_ai_bot.automation.authority import _permission_level_allowed
 from qq_ai_bot.capabilities.results import ToolExecutionResult
 from qq_ai_bot.domain.messages import ChatImage, ChatTool
 from qq_ai_bot.plugin_host.audit import PluginAuditService
@@ -25,7 +26,7 @@ from qq_ai_bot.plugin_host.facades import HostPluginContext
 from qq_ai_bot.plugin_host.repository import PluginInstallationRepository
 from qq_ai_bot.services.agent_tools import ToolRuntime
 from yuki_plugin_sdk.errors import PluginPermissionError
-from yuki_plugin_sdk.models import PermissionLevel, RetryPolicy, RiskClass
+from yuki_plugin_sdk.models import RetryPolicy, RiskClass
 from yuki_plugin_sdk.namespace import default_plugin_namespace
 from yuki_plugin_sdk.permissions import PluginPermission
 from yuki_plugin_sdk.registrar import ToolRegistration
@@ -383,17 +384,12 @@ class PluginCapabilityAdapter:
         )
 
 
-def _permission_level_allowed(level: PermissionLevel, actor_is_superuser: bool) -> bool:
-    if level is PermissionLevel.USER:
-        return True
-    # trusted/moderator are reserved and cannot currently be assigned.
-    return level is PermissionLevel.SUPERUSER and actor_is_superuser
-
-
 def _validated_result(value: object, output_model: type[BaseModel]) -> PluginResult:
     if isinstance(value, PluginResult):
         return value
-    if isinstance(value, BaseModel):
+    if isinstance(value, output_model):
+        validated = value
+    elif isinstance(value, BaseModel):
         validated = output_model.model_validate(value.model_dump(mode="python"))
     else:
         validated = output_model.model_validate(value)

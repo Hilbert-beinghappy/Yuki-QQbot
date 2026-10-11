@@ -14,7 +14,11 @@ from qq_ai_bot.config import Settings
 from qq_ai_bot.conversation.canonical_db_models import CanonicalConversationModel
 from qq_ai_bot.conversation.hydrate import bump_canonical_generation
 from qq_ai_bot.persistence.database import Database
-from qq_ai_bot.persistence.models import AutomationModel, CanonicalGenerationResetModel
+from qq_ai_bot.persistence.models import (
+    AutomationModel,
+    AutomationVersionModel,
+    CanonicalGenerationResetModel,
+)
 
 
 async def reset_all(database: Database, batch_id: str, *, apply: bool) -> dict[str, int]:
@@ -96,6 +100,25 @@ async def reset_all(database: Database, batch_id: str, *, apply: bool) -> dict[s
                 authority["conversation_generation"] = generation
                 automation.authority_snapshot_json = json.dumps(
                     authority, ensure_ascii=False, separators=(",", ":")
+                )
+                version = await session.scalar(
+                    select(func.max(AutomationVersionModel.version)).where(
+                        AutomationVersionModel.automation_id == automation.id
+                    )
+                )
+                session.add(
+                    AutomationVersionModel(
+                        automation_id=automation.id,
+                        version=int(version or 0) + 1,
+                        script_json=automation.script_json,
+                        script_hash=automation.script_hash,
+                        authority_snapshot_json=automation.authority_snapshot_json,
+                        canonical_target_person_id=automation.canonical_target_person_id,
+                        canonical_target_space_id=automation.canonical_target_space_id,
+                        canonical_presence_id=automation.canonical_presence_id,
+                        updated_by="system:canonical_generation_reset",
+                        created_at=datetime.now(UTC),
+                    )
                 )
                 automation.updated_at = datetime.now(UTC)
                 summary["self_automations_rebound"] += 1

@@ -55,14 +55,14 @@ class ToolInvocationCoordinator:
         backend: CoordinatedToolBackend | None,
         runtime: Any,
         *,
-        remaining_calls: int,
+        remaining_calls: int | None,
         max_parallel_calls: int,
         before_execute: Callable[[ToolCall], Awaitable[str | None]] | None = None,
         chain_id: str = "",
         request_sequence: int = 0,
         manifest_revision: str = "",
     ) -> CoordinatedToolResult:
-        if remaining_calls < 0 or max_parallel_calls <= 0:
+        if (remaining_calls is not None and remaining_calls < 0) or max_parallel_calls <= 0:
             raise ValueError("tool call budgets must be non-negative and parallelism positive")
         if backend is None:
             unavailable = json.dumps(
@@ -115,7 +115,7 @@ class ToolInvocationCoordinator:
                     rejected_ids.add(call.id)
                     return False
             counted = counts_toward_limit(call)
-            if counted and counted_executions >= remaining_calls:
+            if counted and remaining_calls is not None and counted_executions >= remaining_calls:
                 overflow_ids.add(call.id)
                 return False
             if counted:

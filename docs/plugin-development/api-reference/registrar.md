@@ -23,7 +23,7 @@ class ToolMetadata(StrictModel):
     risk: RiskClass = read
     schema_version: int = 1
     allowed_origins: frozenset[TurnOrigin] = {user_message}
-    timeout_seconds: float = 10  # >0, <=600
+    timeout_seconds: float | None = None  # explicit values are >0
     retry_policy: RetryPolicy = none
     namespace: str = ""  # empty → Host fills plugin.{plugin_id}
     aliases: tuple[str, ...] = ()  # <=8, lowercase, unique
@@ -57,6 +57,10 @@ class BackgroundServiceMetadata(StrictModel):
     max_concurrency: int = 1  # 1..64
     restart_policy: RestartPolicy = never
 ```
+
+Tool和Automation Action未声明期限时不制造外层超时；作者明确的期限、真实外部请求超时与取消
+仍沿原执行处生效。输入在派发前只解析一次，typed handler收到声明的模型实例；返回的对应
+output实例不再dump后重复解析。TRUSTED/MODERATOR仍是未指派的保留角色，不降成USER执行。
 
 ## Registration containers
 

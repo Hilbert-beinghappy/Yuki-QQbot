@@ -14,6 +14,7 @@ from urllib.parse import urlsplit
 
 import httpx
 
+from qq_ai_bot.model_runtime.dispatch_guard import check_model_dispatch
 from qq_ai_bot.runtime.work_activation import current_work_control
 from qq_ai_bot.services.media_resolver import MediaResolutionError, MediaResolver
 from qq_ai_bot.vision.models import MediaReference
@@ -81,8 +82,8 @@ class DeepSeekSearchBridge:
 
     async def search(self, request: WebSearchRequest) -> WebSearchResponse:
         query = " ".join(request.query.split())
-        if not 1 <= len(query) <= 400:
-            raise WebSearchError("invalid_query", "搜索词须为 1–400 字符")
+        if not query:
+            raise WebSearchError("invalid_query", "搜索词不能为空")
         key = hashlib.sha256(
             self._cache_namespace
             + json.dumps(asdict(request), sort_keys=True, default=str).encode()
@@ -113,7 +114,7 @@ class DeepSeekSearchBridge:
             "system": (
                 "你是检索服务。只搜索提供的问题，优先查找符合日期和主题要求的来源。"
                 "无法核实来源日期时不要宣称已满足日期限制。"
-                "必须调用 web_search，最多两次；不要猜测来源，最后用一句话结束。"
+                "必须调用 web_search；不要猜测来源。"
             ),
             "messages": [
                 {
@@ -121,13 +122,15 @@ class DeepSeekSearchBridge:
                     "content": json.dumps(constraints, ensure_ascii=False, default=str),
                 }
             ],
-            "tools": [{"type": "web_search_20250305", "name": "web_search", "max_uses": 2}],
+            "tools": [{"type": "web_search_20250305", "name": "web_search"}],
             "tool_choice": {"type": "auto"},
         }
         control = current_work_control.get()
         if control is not None:
             await control.validate()
             await control.reserve_request(auxiliary=True)
+        else:
+            await check_model_dispatch()
         try:
             # No retries: a timeout may already have consumed search/model credits.
             async with self.client.stream(
@@ -141,8 +144,6 @@ class DeepSeekSearchBridge:
                 raw = bytearray()
                 async for chunk in response.aiter_bytes():
                     raw.extend(chunk)
-                    if len(raw) > 2 * 1024 * 1024:
-                        raise WebSearchError("search_response_too_large", "搜索响应超过上限")
             value = json.loads(raw)
         except (httpx.HTTPError, ValueError) as exc:
             raise WebSearchError("search_failed", "DeepSeek 搜索请求失败") from exc
@@ -183,12 +184,12 @@ class DeepSeekSearchBridge:
                 except WebSearchError:
                     continue
                 text = item.get("content", "")
-                snippet = text[:1000] if isinstance(text, str) else ""
+                snippet = text if isinstance(text, str) else ""
                 found.setdefault(
                     url,
                     WebSearchSource(
                         hashlib.sha256(f"{url}\x1f{request.query}".encode()).hexdigest()[:24],
-                        str(item.get("title") or url)[:300],
+                        str(item.get("title") or url),
                         url,
                         urlsplit(url).hostname or "",
                         snippet,
@@ -198,7 +199,7 @@ class DeepSeekSearchBridge:
                 )
         if not found:
             raise WebSearchError("no_search_evidence", "没有返回真实的搜索来源")
-        sources = list(found.values())[: max(1, min(request.max_results, 5))]
+        sources = list(found.values())
         partial = value.get("stop_reason") != "end_turn" or search_error
         for index in range(
             min(
@@ -206,7 +207,6 @@ class DeepSeekSearchBridge:
                 request.extract_max_results
                 if request.extract_max_results is not None
                 else self.extract_max_results,
-                3,
             )
         ):
             try:
@@ -245,9 +245,7 @@ class DeepSeekSearchBridge:
             parser.feed(text)
             text = "\n".join(parser.parts)
         lines = [" ".join(line.split()) for line in text.splitlines() if line.strip()]
-        terms = query.casefold().split()
-        matches = [line for line in lines if any(term in line.casefold() for term in terms)]
-        content = "\n".join(matches or lines)[:2500]
+        content = "\n".join(lines)
         if not content:
             raise WebSearchError("empty_page", "网页正文为空")
         return WebSearchSource(
@@ -255,7 +253,7 @@ class DeepSeekSearchBridge:
             urlsplit(normalized).hostname or "",
             normalized,
             urlsplit(normalized).hostname or "",
-            content[:1000],
+            content,
             content,
             provider="direct_http",
         )

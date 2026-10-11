@@ -6,7 +6,6 @@ import asyncio
 import logging
 import time
 from contextlib import AbstractAsyncContextManager, AbstractContextManager
-from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any, cast
 
@@ -1018,12 +1017,6 @@ class ApplicationContainer:
                 emoji_deleted = await self.emoji_admin.cleanup_expired()
                 if emoji_deleted:
                     logger.info("emoji_assets_cleaned count=%d", emoji_deleted)
-                automation_runs_deleted = await self.automation_repository.cleanup_runs(
-                    before=datetime.now(UTC)
-                    - timedelta(days=self.settings.automation_run_retention_days)
-                )
-                if automation_runs_deleted:
-                    logger.info("automation_runs_cleaned count=%d", automation_runs_deleted)
                 plugin_state_deleted = await self.plugin_state.cleanup_expired()
                 media_artifacts_deleted = await self.plugin_media_artifacts.cleanup()
                 if media_artifacts_deleted:

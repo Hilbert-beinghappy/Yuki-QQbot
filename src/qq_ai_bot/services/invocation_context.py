@@ -20,8 +20,8 @@ class InvocationContextFactory:
         *,
         current_time: TimeContext,
         allowed_capabilities: frozenset[str],
-        max_tool_calls: int,
-        max_model_requests: int,
+        max_tool_calls: int | None,
+        max_model_requests: int | None,
     ) -> AgentRuntime:
         config = source.runtime_config
         bot = source.effective_bot_user_id

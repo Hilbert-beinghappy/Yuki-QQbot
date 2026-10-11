@@ -280,14 +280,7 @@ async def test_scheduled_child_runs_without_a_fabricated_message_or_initiative(
         finished_at=case.clock.now(),
         worker_id=owner,
     )
-    await case.repository.finish_automation_run(
-        case.row.id,
-        worker_id=owner,
-        status=result.status,
-        next_run_at=None,
-        now=case.clock.now(),
-        max_consecutive_failures=3,
-    )
+    await case.repository.release_claim(case.row.id, worker_id=owner)
     original_parent = await repository.get(parent["id"])
     lease = await repository.acquire(parent["conversation_id"], parent["generation"])
     workers = SubagentRepository(repository)
@@ -656,7 +649,9 @@ async def test_derived_automation_rechecks_original_superuser_before_actual_effe
     from qq_ai_bot.runtime.work_budget_schema import budgets
     from qq_ai_bot.runtime.work_scheduler import WorkScheduler
 
-    case = await setup_run(database, tmp_path, delivery="none", mode="silent")
+    case = await setup_run(
+        database, tmp_path, delivery="none", mode="silent", superusers_csv="10001"
+    )
     settings = case.executor._settings
     settings.superusers_csv = "9001"
     del settings.__dict__["superusers"]
@@ -676,11 +671,6 @@ async def test_derived_automation_rechecks_original_superuser_before_actual_effe
                 updated_at=case.clock.now(),
             )
         )
-        owner = await writer.get(AutomationModel, case.row.id)
-        authority = json.loads(owner.authority_snapshot_json)
-        authority["permission_level"] = "superuser"
-        owner.authority_snapshot_json = json.dumps(authority)
-    case.row = await case.repository.get(case.row.id)
     case.chat.set_admin_tools(
         AdminCapabilityService(
             settings=settings,

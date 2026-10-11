@@ -114,7 +114,6 @@ class AutomationModule:
             repository=repository,
             time_service=self._time_service,
             gateway_factory=gateway_factory,
-            router=self._presence_router,
         )
         worker = AutomationWorker(
             settings=self._settings,

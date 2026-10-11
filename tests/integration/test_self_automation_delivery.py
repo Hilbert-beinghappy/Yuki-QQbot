@@ -123,7 +123,6 @@ async def test_self_daily_agent_runs_without_borrowing_a_person(database, tmp_pa
         registry=registry,
         repository=repository,
         time_service=chat._time,
-        router=env.router,
         gateway_factory=lambda context: None,
     ).execute(row, run)
     assert result.status is RunStatus.SUCCEEDED, result
@@ -166,7 +165,6 @@ async def test_self_static_reminder_uses_social_receipt_and_replay(database, tmp
         registry=registry,
         repository=repository,
         time_service=time_service,
-        router=env.router,
     )
     result = await executor.execute(row, run)
     assert result.status is RunStatus.SUCCEEDED, result

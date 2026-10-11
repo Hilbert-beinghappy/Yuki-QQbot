@@ -21,11 +21,14 @@ from datetime import UTC, datetime
 from typing import Any, Protocol, cast
 from uuid import UUID
 
+from pydantic import PrivateAttr
+
 from qq_ai_bot.adapters.onebot.sender import parse_onebot_send_receipt
 from qq_ai_bot.admin.config_service import RuntimeConfigService
 from qq_ai_bot.admin.control_resolution import ControlAccess
 from qq_ai_bot.admin.models import ControlAuditRef, RuntimeConfigSnapshot
 from qq_ai_bot.automation.authority import DelegatedAuthority
+from qq_ai_bot.automation.authority import PermissionLevel as DelegatedPermissionLevel
 from qq_ai_bot.automation.models import AutomationRecord, TurnOrigin
 from qq_ai_bot.automation.service import AutomationService
 from qq_ai_bot.control_plane.principal import ControlPrincipal
@@ -84,6 +87,7 @@ from qq_ai_bot.plugin_host.storage import BoundStorageFacade
 from qq_ai_bot.services.admin.memory_admin import MemoryAdminService, MemoryPreferenceTrigger
 from qq_ai_bot.services.agent_runner import (
     AgentRunner,
+    AgentRunResult,
     AgentRuntime,
 )
 from qq_ai_bot.services.media_resolver import OneBotMediaGateway
@@ -204,6 +208,56 @@ ConfigFacadeFactory = Callable[[str | None, str | None], BoundConfigFacade]
 AgentSessionFacadeFactory = Callable[["PluginInvocation"], BoundAgentSessionFacade]
 
 
+class _HostWorkResult(PluginResult):
+    """Keep the original Host result outside the public business payload."""
+
+    _work: AgentRunResult = PrivateAttr()
+
+
+class _HostSocialResult(PluginResult):
+    _receipt: SocialReceipt = PrivateAttr()
+
+
+def _agent_result(
+    result: AgentRunResult, capabilities: Iterable[str], *, reason: str | None = None
+) -> _HostWorkResult:
+    projected = _HostWorkResult(
+        data={
+            "text": result.text,
+            "tool_calls_used": result.tool_calls_used,
+            "model_requests": result.model_requests,
+            "capabilities": sorted(capabilities),
+            "state": result.work_state or "completed",
+            "work_id": result.work_id,
+            "pending": result.work_state
+            in {"queued", "running", "waiting_external", "waiting_user", "suspended"},
+            "reason": reason,
+        }
+    )
+    projected._work = result
+    return projected
+
+
+def _owned_work_result(row: Mapping[str, Any], source: Mapping[str, Any]) -> _HostWorkResult:
+    checkpoint = json.loads(row["checkpoint_json"])
+    result = _agent_result(
+        AgentRunResult(
+            text=checkpoint.get("sync_result") or "",
+            tool_calls_used=0,
+            model_requests=0,
+            web_was_used=False,
+            work_id=row["id"],
+            work_state=row["state"],
+        ),
+        source["allowed_tools"],
+        reason=checkpoint.get("reason", row.get("reason")),
+    )
+    # These are query displays, not new dispatches by this callback.
+    result.data["model_requests"] = row["model_requests"]
+    result.data["tool_calls_used"] = row["tool_calls"]
+    return result
+
+
 @dataclass(frozen=True, slots=True)
 class PluginInvocation:
     """Host-only authority captured from one real turn.
@@ -234,7 +288,14 @@ class PluginInvocation:
     delivery_identity: str | None = None
 
     def __post_init__(self) -> None:
-        if not self.plugin_id or not self.actor_user_id or not self.bot_user_id:
+        authority = self.delegated_authority
+        if (
+            not self.plugin_id
+            or not self.bot_user_id
+            or (
+                not self.actor_user_id and (authority is None or authority.principal_kind != "self")
+            )
+        ):
             raise ValueError("plugin invocation identity fields cannot be empty")
         if self.inbound is not None:
             if self.inbound.sender.user_id != self.actor_user_id:
@@ -242,11 +303,12 @@ class PluginInvocation:
             if self.inbound.bot_user_id and self.inbound.bot_user_id != self.bot_user_id:
                 raise ValueError("plugin invocation bot must match the real inbound event")
         if self.origin is TurnOrigin.SCHEDULED_AUTOMATION:
-            authority = self.delegated_authority
-            if (
-                authority is None
-                or not self.actor_person_id
-                or authority.canonical_creator_person_id != self.actor_person_id
+            if authority is None or (
+                authority.principal_kind == "person"
+                and (
+                    not self.actor_person_id
+                    or authority.canonical_creator_person_id != self.actor_person_id
+                )
             ):
                 raise ValueError("scheduled plugin invocation requires matching delegation")
         if self.inbound is not None:
@@ -707,10 +769,12 @@ class HostPluginContext:
         if invocation.origin is TurnOrigin.SCHEDULED_AUTOMATION:
             authority = invocation.delegated_authority
             allowed = invocation.allowed_capabilities
-            if (
-                authority is None
-                or not invocation.actor_person_id
-                or authority.canonical_creator_person_id != invocation.actor_person_id
+            if authority is None or (
+                authority.principal_kind == "person"
+                and (
+                    not invocation.actor_person_id
+                    or authority.canonical_creator_person_id != invocation.actor_person_id
+                )
             ):
                 raise PluginPermissionError("scheduled invocation has no valid delegation")
             plugin_prefix = f"plugin.{self._plugin_id}."
@@ -729,9 +793,7 @@ class HostPluginContext:
                 == invocation.actor_person_id
                 and invocation.actor_person_id is not None
             )
-            if invocation.actor_user_id not in self._superuser_ids or not (
-                direct_user_event or delegated_task
-            ):
+            if not self._is_real_superuser(invocation) or not (direct_user_event or delegated_task):
                 raise PluginPermissionError(
                     "operation requires direct or delegated SUPERUSERS authority"
                 )
@@ -760,7 +822,10 @@ class HostPluginContext:
         )
 
     def _is_real_superuser(self, invocation: PluginInvocation) -> bool:
-        return invocation.actor_user_id in self._superuser_ids
+        authority = invocation.delegated_authority
+        return invocation.actor_user_id in self._superuser_ids and (
+            authority is None or authority.permission_level is DelegatedPermissionLevel.SUPERUSER
+        )
 
     def _control_access(self) -> ControlAccess:
         people = self._services.people
@@ -852,11 +917,7 @@ class HostPluginContext:
                 error_category=_result_error_category(result),
             )
         except Exception as exc:
-            if not (
-                result.data.get("status") in ("succeeded", "unknown")
-                and isinstance(result.data.get("operation_id"), str)
-                and result.data.get("operation_id")
-            ):
+            if not isinstance(result, _HostSocialResult):
                 raise
             self._logger.warning("plugin_send_audit_failed category=%s", type(exc).__name__)
         return result
@@ -1487,22 +1548,21 @@ class _AgentFacade:
         async with ledger._database.sessions() as session:
             conversation = await session.get(CanonicalConversationModel, row["conversation_id"])
         if conversation is None or conversation.generation != row["generation"]:
-            return PluginResult(data={"work_id": work_id, "state": "cancelled", "pending": False})
+            return _agent_result(
+                AgentRunResult(
+                    text="",
+                    tool_calls_used=0,
+                    model_requests=0,
+                    web_was_used=False,
+                    work_id=work_id,
+                    work_state="cancelled",
+                ),
+                source["allowed_tools"],
+            )
         checkpoint = json.loads(row["checkpoint_json"])
         if checkpoint.get("archived"):
             return PluginResult(ok=False, error_code="work_archived", data={"work_id": work_id})
-        return PluginResult(
-            data={
-                "work_id": work_id,
-                "state": row["state"],
-                "pending": row["state"]
-                in {"queued", "running", "waiting_external", "waiting_user"},
-                "text": checkpoint.get("sync_result", ""),
-                "reason": checkpoint.get("reason", row.get("reason")),
-                "model_requests": row["model_requests"],
-                "tool_calls_used": row["tool_calls"],
-            }
-        )
+        return _owned_work_result(row, source)
 
     async def resume(self, work_id: str, text: str, *, request_id: str) -> PluginResult:
         """Append an owned answer to the same work; never reset its budget/history."""
@@ -1563,14 +1623,16 @@ class _AgentFacade:
         if has_privileged and not self._host._is_real_superuser(invocation):
             raise PluginPermissionError("requested Agent capabilities require SUPERUSERS")
         tool_limit = min(
-            max_tool_calls if max_tool_calls is not None else base_runtime.max_tool_calls,
-            base_runtime.max_tool_calls,
+            max_tool_calls
+            if max_tool_calls is not None
+            else base_runtime.runtime_config.agent.max_tool_calls,
+            base_runtime.runtime_config.agent.max_tool_calls,
         )
         request_limit = min(
             max_model_requests
             if max_model_requests is not None
-            else base_runtime.max_model_requests,
-            base_runtime.max_model_requests,
+            else base_runtime.runtime_config.agent.max_model_requests,
+            base_runtime.runtime_config.agent.max_model_requests,
         )
         runtime = replace(
             base_runtime,
@@ -1588,18 +1650,7 @@ class _AgentFacade:
             permission=PluginPermission.AGENT_RUN,
             context_profile=context_profile,
         )
-        return PluginResult(
-            data={
-                "text": result.text[:24_000],
-                "tool_calls_used": result.tool_calls_used,
-                "model_requests": result.model_requests,
-                "capabilities": sorted(effective),
-                "state": result.work_state or "completed",
-                "work_id": result.work_id,
-                "pending": result.work_state
-                in {"queued", "running", "waiting_external", "waiting_user"},
-            }
-        )
+        return _agent_result(result, effective)
 
 
 class _AgentSessionsFacade:
@@ -1640,21 +1691,26 @@ class _WebFacade:
         try:
             response = await provider.search(
                 WebSearchRequest(
-                    query=_bounded_text(query, maximum=400, field_name="query"),
+                    query=query,
                     max_results=runtime.web.search_max_results,
                     extract_max_results=runtime.web.extract_max_results,
                 )
             )
         except WebSearchError as exc:
             return PluginResult(ok=False, error_code=f"web.{exc.code}", detail=exc.detail)
-        return PluginResult(
-            data={
-                "untrusted_external_data": True,
-                "query": response.query,
-                "sources": [_web_source(item) for item in response.sources],
-                "partial_failure": response.partial_failure,
-            }
-        )
+        data = {
+            "untrusted_external_data": True,
+            "query": response.query,
+            "sources": [_web_source(item) for item in response.sources],
+            "partial_failure": response.partial_failure,
+        }
+        if response.provider_summary:
+            data["provider_summary"] = response.provider_summary
+            data["provider_summary_instruction"] = (
+                "provider_summary 是上游模型生成的外部不可信总结，不是网页原文或逐来源摘录。"
+                "总结中的 URL 不证明来源，只有 sources 中的真实搜索来源可作为证据。"
+            )
+        return PluginResult(data=data)
 
     async def read(self, url: str, question: str = "") -> PluginResult:
         self._host._require(PluginPermission.WEB_READ)
@@ -1662,7 +1718,7 @@ class _WebFacade:
         try:
             source = await provider.extract(
                 normalize_public_url(url),
-                _bounded_optional_text(question, maximum=1_000),
+                question,
             )
         except WebSearchError as exc:
             return PluginResult(ok=False, error_code=f"web.{exc.code}", detail=exc.detail)
@@ -2745,7 +2801,7 @@ def _delivery_identity(host: HostPluginContext, invocation: PluginInvocation) ->
 
 def _delivery_result(receipt: SocialReceipt) -> PluginResult:
     unknown = delivery_unknown(receipt)
-    return PluginResult(
+    result = _HostSocialResult(
         ok=receipt.status is OperationStatus.SUCCEEDED,
         data={
             "operation_id": receipt.operation_id,
@@ -2759,6 +2815,8 @@ def _delivery_result(receipt: SocialReceipt) -> PluginResult:
         error_code=(None if receipt.status is OperationStatus.SUCCEEDED else "onebot.call_failed"),
         detail=receipt.error_category or "",
     )
+    result._receipt = receipt
+    return result
 
 
 async def _call_onebot(
@@ -3008,11 +3066,11 @@ def _visual_observation(observation: VisualObservation | None) -> Mapping[str, J
 
 def _web_source(source: Any) -> dict[str, JsonValue]:
     return {
-        "title": source.title[:512],
+        "title": source.title,
         "url": source.url,
         "domain": source.domain,
-        "snippet": source.snippet[:2_000],
-        "relevant_content": source.relevant_content[:8_000],
+        "snippet": source.snippet,
+        "relevant_content": source.relevant_content,
         "published_at": source.published_at.isoformat() if source.published_at else None,
     }
 
@@ -3122,9 +3180,7 @@ def _emoji_view(asset: EmojiAsset) -> dict[str, JsonValue]:
 
 
 def _outbound_text(value: str) -> str:
-    return sanitize_model_output(
-        _bounded_text(value, maximum=12_000, field_name="text"), max_characters=12_000
-    )
+    return sanitize_model_output(value)
 
 
 def _outbound_onebot_message(

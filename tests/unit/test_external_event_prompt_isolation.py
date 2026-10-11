@@ -1002,8 +1002,9 @@ async def test_plugin_wakeup_read_tools_use_canonical_target_without_a_fake_acto
         await tools.execute("search_chat_history", '{"keyword":"release"}', group_runtime)
     ).model_payload()
     assert bounded_search["ok"]
-    assert bounded_search["data"]["truncated"]
-    assert 0 < bounded_search["data"]["returned_count"] < 20
+    assert not bounded_search["data"]["truncated"]
+    assert bounded_search["data"]["returned_count"] == 20
+    assert all(row["content"] == "x" * 2000 for row in bounded_search["data"]["events"])
     assert bounded_search["data"]["returned_count"] == len(bounded_search["data"]["events"])
     gateway.call_api.assert_not_awaited()
     assert tools._ledger.search.await_args.kwargs["group_id"] == "group-100"

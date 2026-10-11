@@ -264,8 +264,6 @@ class ToolingRuntimeConfig:
 class WebRuntimeConfig:
     search_max_results: int
     extract_max_results: int
-    max_calls_per_turn: int
-    tool_result_max_characters: int
     source_retention_days: int
     source_max_runs_per_conversation: int
     mode: str = "disabled"

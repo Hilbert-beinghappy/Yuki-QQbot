@@ -48,6 +48,8 @@ def access_from_runtime(runtime: Any, *, generation: int | None = None) -> Artif
     snapshot = runtime.turn_snapshot
     if snapshot is not None:
         generation = snapshot.generation
+    if generation is None and runtime.sandbox_source is not None:
+        generation = runtime.sandbox_source.get("generation")
     if generation is None:
         raise ValueError("artifact_source_incomplete")
     # This is a description of the authenticated reading contract, never a grant.

@@ -31,6 +31,7 @@ from qq_ai_bot.capabilities.validation import (
     JsonSchemaCapabilityValidator,
 )
 from qq_ai_bot.runtime.contracts import MemoryCapabilityView
+from qq_ai_bot.services.agent_runner import AgentRuntime
 
 
 def _descriptor(
@@ -127,8 +128,6 @@ def test_actual_schema_compilation_errors_are_quarantined(schema) -> None:
 async def test_compilable_schemas_execute_once_through_real_catalog_and_original_receipt(
     database, tmp_path, case
 ):
-    from types import SimpleNamespace
-
     from jsonschema.validators import validator_for
     from tests.conftest import build_harness, make_settings
     from tests.support.work_session import invoke_tool
@@ -180,14 +179,30 @@ async def test_compilable_schemas_execute_once_through_real_catalog_and_original
     assert runtime.validate_call("schema_probe", json.dumps(payload)) == (True, None)
     _, work, tool_runtime = await active_work(database, tmp_path)
     chat = build_harness(database, make_settings(database.url)).processor._chat
-    backend = MainAgentBackend(
-        chat, replace(tool_runtime, runtime_config=await chat._runtime_config.snapshot())
+    config = await chat._runtime_config.snapshot()
+    backend = MainAgentBackend(chat, replace(tool_runtime, runtime_config=config))
+    actor = tool_runtime.actor_context
+    agent = AgentRuntime(
+        origin=actor.origin,
+        actor_user_id=actor.user_id,
+        actor_is_superuser=tool_runtime.actor_is_superuser,
+        delegated_authority=None,
+        conversation_key=tool_runtime.conversation_key,
+        current_group_id=actor.group_id,
+        bot_user_id=actor.bot_user_id,
+        gateway=tool_runtime.gateway,
+        runtime_config=config,
+        current_time=chat._time.current_default(),
+        allowed_capabilities=frozenset(),
+        max_tool_calls=config.agent.max_tool_calls,
+        max_model_requests=config.agent.max_model_requests,
+        work_control=work.control,
     )
     backend._capability_runtime = runtime
     backend._catalog = runtime.authorized_catalog
     backend._callable_tool_names = set(runtime.callable_capability_ids())
     call = ToolCall("original-schema-call", ToolFunction("schema_probe", json.dumps(payload)))
-    invocation = direct_invocations((call,), SimpleNamespace(work_control=work.control))[0]
+    invocation = direct_invocations((call,), agent)[0]
 
     async def invoke():
         return await backend.execute_call(invocation)
@@ -225,7 +240,6 @@ async def test_admin_failure_can_continue_correct_and_reuse_original_effect(
         ToolFunction,
     )
     from qq_ai_bot.llm.fake import FakeLLMProvider
-    from qq_ai_bot.services.agent_runner import AgentRuntime
     from qq_ai_bot.services.agent_tools import ToolRuntime
     from qq_ai_bot.services.main_agent_backend import MainAgentBackend
 
@@ -423,7 +437,22 @@ async def test_admin_failure_can_continue_correct_and_reuse_original_effect(
     )
     backend = MainAgentBackend(chat, tools)
     await backend.prepare()
-    context = SimpleNamespace(work_control=work.control)
+    context = AgentRuntime(
+        origin=TurnOrigin.USER_MESSAGE,
+        actor_user_id=actor.user_id,
+        actor_is_superuser=True,
+        delegated_authority=None,
+        conversation_key=tools.conversation_key,
+        current_group_id=actor.group_id,
+        bot_user_id=actor.bot_user_id,
+        gateway=None,
+        runtime_config=tools.runtime_config,
+        current_time=chat._time.current_default(),
+        allowed_capabilities=frozenset(),
+        max_tool_calls=8,
+        max_model_requests=1,
+        work_control=work.control,
+    )
     declared = backend.definitions(context, web_was_used=False)
     calls = []
 
@@ -472,24 +501,8 @@ async def test_admin_failure_can_continue_correct_and_reuse_original_effect(
     assert json.loads(restored)["data"]["change_id"] != change_id
     assert (await work.control.repository.get(work.control.current["id"]))["tool_calls"] == 6
     assert (await chat._runtime_config.get_effective(values["key"])).value == 17
-    runtime = AgentRuntime(
-        origin=TurnOrigin.USER_MESSAGE,
-        actor_user_id=actor.user_id,
-        actor_is_superuser=True,
-        delegated_authority=None,
-        conversation_key=tools.conversation_key,
-        current_group_id=actor.group_id,
-        bot_user_id=actor.bot_user_id,
-        gateway=None,
-        runtime_config=tools.runtime_config,
-        current_time=chat._time.current_default(),
-        allowed_capabilities=frozenset(),
-        max_tool_calls=8,
-        max_model_requests=1,
-        work_control=work.control,
-    )
     result = await chat.runtime.runner.run(
-        (ChatMessage("user", actor.instruction),), runtime, backend
+        (ChatMessage("user", actor.instruction),), context, backend
     )
     assert result.text == "配置已更新。" and work.control.accepted_ending() == "completed"
     assert len(provider.requests) == 1

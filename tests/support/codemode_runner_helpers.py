@@ -51,9 +51,6 @@ class Backend(StubAgentBackend):
     def finalize(self, text, runtime):
         return text
 
-    def exhausted(self, runtime):
-        return "exhausted"
-
     def post_commit_recovery_text(self):
         return None
 

@@ -60,7 +60,7 @@ from qq_ai_bot.runtime.work_control import WorkControl
 from qq_ai_bot.runtime.work_journal import JournalUnavailable, encode_transcript
 from qq_ai_bot.runtime.work_repository import WorkCapacityError, WorkRepository
 from qq_ai_bot.runtime.work_schema_v1 import journal
-from qq_ai_bot.services.agent_runner import AgentRuntime
+from qq_ai_bot.services.agent_runner import AgentRunResult, AgentRuntime
 from qq_ai_bot.services.main_agent_turns import MainAgentTurnService
 from qq_ai_bot.services.native_tool_binder import NativeToolBinder
 from qq_ai_bot.services.turn_transcript import TurnTranscript
@@ -1136,7 +1136,7 @@ async def test_responses_journal_replays_identical_http_bytes(database, tmp_path
 @pytest.mark.asyncio
 async def test_main_entry_captures_current_task_before_work_status(database, tmp_path):
     control = await _control(database, tmp_path)
-    runner = SimpleNamespace(run=AsyncMock(return_value=None))
+    runner = SimpleNamespace(run=AsyncMock(return_value=AgentRunResult("", 0, 0, False)))
     turns = MainAgentTurnService(
         SimpleNamespace(_settings=SimpleNamespace(runtime_work_enabled=False)), runner
     )

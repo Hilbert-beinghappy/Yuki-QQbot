@@ -38,7 +38,6 @@ class StubAgentBackend(AgentToolBackend):
         parallel_safe=None,
         is_side_effecting=None,
         finalize=None,
-        exhausted=None,
     ):
         # Fixed, test-only injection points replace SimpleNamespace fixtures.
         if definitions is not None:
@@ -51,8 +50,6 @@ class StubAgentBackend(AgentToolBackend):
             self.is_side_effecting = is_side_effecting
         if finalize is not None:
             self.finalize = finalize
-        if exhausted is not None:
-            self.exhausted = exhausted
 
     # P10 retires legacy execute(name, arguments, runtime). Test fixtures now
     # implement execute_call and explicitly grant their fake lifecycle controls.

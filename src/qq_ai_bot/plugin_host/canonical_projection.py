@@ -54,6 +54,7 @@ def projection_from_automation(
     conversation_id: str | None,
     person_id: str | None,
     space_id: str | None,
+    presence_id: str | None,
 ) -> HostCanonicalProjection:
     """Scheduled capability context is Host-trusted. Missing Conversation stays None."""
 
@@ -62,7 +63,7 @@ def projection_from_automation(
             person_id=person_id,
             space_id=space_id,
             conversation_id=conversation_id,
-            presence_id=None,
+            presence_id=presence_id,
             conversation_key=conversation_key,
         )
     return HostCanonicalProjection(conversation_key=conversation_key)

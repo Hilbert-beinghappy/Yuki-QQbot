@@ -32,7 +32,7 @@ class AutomationCommandHandler:
     ) -> str:
         """Manage owner-scoped tasks through the same service used by Agent tools."""
 
-        if self._automation is None or not self._settings.automation_enabled:
+        if self._automation is None:
             return "自动化功能当前未启用。"
         parts = argument.split()
         operation = parts.pop(0).casefold() if parts else "list"
@@ -43,7 +43,7 @@ class AutomationCommandHandler:
             if not rows:
                 return "当前没有运行中或已暂停的自动化任务。\n已结束任务：/ai automation completed"
             timezone = await self._automation.timezone(message.sender.user_id)
-            lines = [f"当前任务（{timezone}）："]
+            lines = [f"最近当前任务（{timezone}）："]
             lines.extend(
                 f"[ID {row.id}] [{row.status.value}] {row.name}；下次："
                 f"{local_text(row.next_run_at, timezone)}"
@@ -58,7 +58,7 @@ class AutomationCommandHandler:
             if not rows:
                 return "完成历史为空。"
             timezone = await self._automation.timezone(message.sender.user_id)
-            lines = [f"完成历史（{timezone}）："]
+            lines = [f"最近完成历史（{timezone}）："]
             lines.extend(
                 f"[ID {row.id}] [{row.status.value}] {row.name}；最后运行："
                 f"{local_text(row.last_run_at, timezone)}"

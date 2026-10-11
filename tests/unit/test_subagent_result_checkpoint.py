@@ -887,6 +887,28 @@ async def test_paused_descendant_retains_terminal_ancestors_and_resumes_without_
         await writer.execute(
             update(work).where(work.c.id == plain["id"]).values(updated=time.time() - 9 * 86400)
         )
+    caller = await repo.accept(
+        parent_lease,
+        source_key="original-sync-caller",
+        source={"delivery_contract": "return_to_caller"},
+        goal="retain the original result",
+    )
+    await repo.accept_control(
+        parent_lease,
+        caller["id"],
+        {
+            "action": "complete",
+            "call_key": "caller-complete",
+            "result": "original synchronous result",
+        },
+    )
+    current = await repo.get(caller["id"])
+    await repo.transition(parent_lease, caller["id"], current["revision"], "completed")
+    async with database.immediate_session() as writer:
+        await writer.execute(
+            update(work).where(work.c.id == caller["id"]).values(updated=time.time() - 10 * 86400)
+        )
+    original_caller = await repo.get(caller["id"])
     for index in range(130):
         newer = await repo.accept(
             parent_lease, source_key=f"newer-terminal:{index}", source={}, goal="finished receipt"
@@ -898,6 +920,11 @@ async def test_paused_descendant_retains_terminal_ancestors_and_resumes_without_
     await repo.reclaim_terminal()
     await repo.reclaim_terminal()
     assert await repo.get(plain["id"]) is None
+    assert await repo.get(caller["id"]) == original_caller
+    assert (
+        json.loads(original_caller["checkpoint_json"])["sync_result"]
+        == "original synchronous result"
+    )
     async with database.sessions() as reader:
         assert (
             list((await reader.execute(select(PluginBackgroundTurnJobModel.__table__))).mappings())

@@ -2,8 +2,7 @@
 
 from __future__ import annotations
 
-from copy import deepcopy
-from typing import Any, cast
+from typing import Any
 
 from jsonschema import Draft202012Validator
 from sqlalchemy import select
@@ -80,21 +79,10 @@ async def inspect_dispatch_receipt(
 
 
 def _validator(tool: ChatTool) -> CapabilityArgumentValidator:
-    def validate(value: object, allow_templates: bool) -> dict[str, Any]:
+    def validate(value: object) -> dict[str, Any]:
         if not isinstance(value, dict):
             raise ValueError("invalid_arguments")
-        schema = deepcopy(tool.parameters)
-        if allow_templates:
-            properties = cast(dict[str, Any], schema.get("properties", {}))
-            for key, item in value.items():
-                if (
-                    key in properties
-                    and isinstance(item, str)
-                    and item.startswith("${")
-                    and item.endswith("}")
-                ):
-                    properties[key] = {"type": "string"}
-        if next(Draft202012Validator(schema).iter_errors(value), None) is not None:
+        if next(Draft202012Validator(tool.parameters).iter_errors(value), None) is not None:
             raise ValueError("invalid_arguments")
         return dict(value)
 
@@ -130,7 +118,6 @@ def register_social_automation(
                     if tool.schema_version.isdecimal()
                     else tool.schema_version
                 ),
-                result_cacheable=tool.result_cacheable,
                 argument_validator=_validator(tool),
                 output_schema={"type": "object"},
                 required_permission=PermissionLevel.USER,

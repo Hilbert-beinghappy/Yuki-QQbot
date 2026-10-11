@@ -9,7 +9,6 @@ from typing import Any, cast
 
 from pydantic import BaseModel
 
-from qq_ai_bot.automation.authority import PermissionLevel
 from qq_ai_bot.automation.models import RetryPolicy, RiskClass, TurnOrigin
 from qq_ai_bot.automation.registry import (
     AutomationCapability,
@@ -19,10 +18,16 @@ from qq_ai_bot.automation.registry import (
     CapabilityResult,
 )
 from qq_ai_bot.plugin_host.canonical_projection import projection_from_automation
+from qq_ai_bot.plugin_host.direct_delivery import delivery_unknown
 from qq_ai_bot.plugin_host.extension_registry import ExtensionKind, ExtensionRegistry
-from qq_ai_bot.plugin_host.facades import PluginInvocation
+from qq_ai_bot.plugin_host.facades import (
+    PluginInvocation,
+    _HostSocialResult,
+    _HostWorkResult,
+    _owned_work_result,
+)
 from qq_ai_bot.plugin_host.manifest import PluginManifest
-from yuki_plugin_sdk.models import PermissionLevel as SdkPermissionLevel
+from qq_ai_bot.social.models import OperationStatus
 from yuki_plugin_sdk.registrar import AutomationActionRegistration, ToolRegistration
 from yuki_plugin_sdk.results import PluginResult
 
@@ -74,11 +79,7 @@ class PluginAutomationAdapter:
                     description=registration.metadata.description,
                     argument_model=registration.input_model,
                     output_schema=registration.output_model.model_json_schema(),
-                    required_permission=(
-                        PermissionLevel.SUPERUSER
-                        if registration.metadata.permission is SdkPermissionLevel.SUPERUSER
-                        else PermissionLevel.USER
-                    ),
+                    required_permission=registration.metadata.permission,
                     risk_class=RiskClass(registration.metadata.risk.value),
                     retry_policy=RetryPolicy(registration.metadata.retry_policy.value),
                     allowed_origins=frozenset(
@@ -105,10 +106,9 @@ class PluginAutomationAdapter:
         registration: AutomationActionRegistration | ToolRegistration,
     ) -> CapabilityHandler:
         async def execute(
-            arguments: dict[str, Any],
+            arguments: BaseModel,
             context: CapabilityExecutionContext,
         ) -> CapabilityResult:
-            model = registration.input_model.model_validate(arguments)
             scope_factory = self._invocation_scope
             if scope_factory is None:
                 raise RuntimeError("plugin automation invocation scope is unavailable")
@@ -118,37 +118,50 @@ class PluginAutomationAdapter:
             try:
                 async with asyncio.timeout(registration.metadata.timeout_seconds):
                     async with scope_factory(plugin_id, invocation):
-                        value = await registration.handler(model)
+                        value = await registration.handler(arguments)
             except (TimeoutError, OSError) as exc:
                 mutating = registration.metadata.risk.value != RiskClass.READ.value
                 raise AutomationExecutionError(
                     "plugin_effect_unknown" if mutating else "plugin_read_failed",
                     uncertain=mutating,
                     transient=not mutating,
+                    tool_calls=1,
                 ) from exc
+            if isinstance(value, _HostSocialResult):
+                receipt = value._receipt
+                if receipt.status is not OperationStatus.SUCCEEDED:
+                    raise AutomationExecutionError(
+                        value.error_code or "plugin_automation_failed",
+                        uncertain=delivery_unknown(receipt),
+                        tool_calls=1,
+                    )
+                return CapabilityResult(data=value.data, messages_sent=1)
+            if isinstance(value, _HostWorkResult):
+                work_result = value._work
+                if work_result.work_state in {"failed", "cancelled"}:
+                    raise AutomationExecutionError(
+                        f"agent_work_{work_result.work_state}",
+                        llm_calls=work_result.model_requests,
+                        tool_calls=1 + work_result.tool_calls_used,
+                    )
+                return CapabilityResult(
+                    data=value.data,
+                    pending_work_id=work_result.work_id
+                    if work_result.work_state
+                    in {"queued", "running", "waiting_external", "waiting_user", "suspended"}
+                    else None,
+                    llm_calls=work_result.model_requests,
+                    tool_calls=1 + work_result.tool_calls_used,
+                )
             if isinstance(value, PluginResult):
                 if not value.ok:
                     raise AutomationExecutionError(
                         value.error_code or "plugin_automation_failed",
-                        uncertain=value.data.get("uncertain") is True,
-                        transient=(
-                            registration.metadata.risk.value == RiskClass.READ.value
-                            and value.data.get("retryable") is True
-                        ),
+                        tool_calls=1,
                     )
-                data = dict(value.data)
-                if data.get("pending") is True:
-                    work_id = data.get("work_id")
-                    if not isinstance(work_id, str) or not work_id:
-                        raise AutomationExecutionError("plugin_pending_work_id_required")
-                    return CapabilityResult(
-                        data=data,
-                        pending_work_id=work_id,
-                        llm_calls=_count(data, "model_requests"),
-                        tool_calls=_count(data, "tool_calls_used"),
-                    )
-                if data.get("state") in {"failed", "cancelled", "suspended"}:
-                    raise AutomationExecutionError("agent_work_blocked")
+                data = value.data
+            elif isinstance(value, registration.output_model):
+                data = value.model_dump(mode="json")
             elif isinstance(value, BaseModel):
                 validated = registration.output_model.model_validate(
                     value.model_dump(mode="python")
@@ -157,18 +170,7 @@ class PluginAutomationAdapter:
             else:
                 validated = registration.output_model.model_validate(value)
                 data = validated.model_dump(mode="json")
-            messages_sent = int(
-                registration.metadata.risk.value == RiskClass.SEND.value
-                and str(data.get("status") or "").casefold() == "sent"
-            )
-            return CapabilityResult(
-                data=data,
-                llm_calls=_count(data, "model_requests"),
-                tool_calls=_count(data, "tool_calls_used") if "tool_calls_used" in data else 1,
-                messages_sent=_count(data, "messages_sent")
-                if "messages_sent" in data
-                else messages_sent,
-            )
+            return CapabilityResult(data=data)
 
         return execute
 
@@ -182,16 +184,16 @@ def _automation_invocation(
     authority = context.authority
     if authority.origin is not TurnOrigin.SCHEDULED_AUTOMATION:
         raise RuntimeError("plugin automation requires scheduled authority")
-    if (
-        not context.canonical_creator_person_id
-        or authority.actor_person_id != context.canonical_creator_person_id
-    ):
-        raise RuntimeError("plugin automation creator does not match trusted authority")
     if authority.bot_user_id != context.bot_user_id:
         raise RuntimeError("plugin automation bot does not match trusted authority")
     delegated = authority.delegated_authority
     if delegated is None:
         raise RuntimeError("plugin automation requires delegated authority")
+    if delegated.principal_kind == "person" and (
+        not context.canonical_creator_person_id
+        or authority.actor_person_id != context.canonical_creator_person_id
+    ):
+        raise RuntimeError("plugin automation creator does not match trusted authority")
     if delegated.bot_user_id != authority.bot_user_id:
         raise RuntimeError("plugin automation delegation belongs to another bot")
     if delegated.current_group_id != context.current_group_id:
@@ -201,6 +203,7 @@ def _automation_invocation(
         conversation_id=context.canonical_conversation_id,
         person_id=context.canonical_target_person_id,
         space_id=context.canonical_target_space_id,
+        presence_id=context.canonical_presence_id,
     )
     return PluginInvocation(
         plugin_id=plugin_id,
@@ -224,21 +227,13 @@ def _automation_invocation(
 __all__ = ["InvocationScopeFactory", "PluginAutomationAdapter"]
 
 
-def _count(data: dict[str, Any], key: str) -> int:
-    value = data.get(key, 0)
-    if type(value) is not int or value < 0:
-        raise ValueError("plugin usage counter must be a nonnegative integer")
-    return value
-
-
 async def resume_plugin_result(
     database: Any,
     work_id: str,
     definition: AutomationCapability,
     context: CapabilityExecutionContext,
-    accounted: dict[str, int],
 ) -> CapabilityResult:
-    """A returned handle transfers result ownership; never replay its handler."""
+    """Read the original SDK-owned result; its tree and usage remain with that owner."""
     import json
 
     from qq_ai_bot.automation.executor import AutomationExecutionError
@@ -257,15 +252,9 @@ async def resume_plugin_result(
         or row["generation"] != context.conversation_generation
     ):
         raise AutomationExecutionError("plugin_work_owner_mismatch")
-    if row["state"] in {"queued", "running", "waiting_external", "waiting_user"}:
-        return CapabilityResult(data={}, pending_work_id=work_id, tool_calls=0)
+    result = _owned_work_result(row, source)
+    if row["state"] in {"queued", "running", "waiting_external", "waiting_user", "suspended"}:
+        return CapabilityResult(data=result.data, pending_work_id=work_id, tool_calls=0)
     if row["state"] != "completed":
         raise AutomationExecutionError(f"agent_work_{row['state']}")
-    return CapabilityResult(
-        data={
-            "text": json.loads(row["checkpoint_json"]).get("sync_result", ""),
-            "work_id": work_id,
-        },
-        llm_calls=max(0, row["model_requests"] - accounted.get("models", 0)),
-        tool_calls=max(0, row["tool_calls"] - accounted.get("tools", 0)),
-    )
+    return CapabilityResult(data=result.data, tool_calls=0)

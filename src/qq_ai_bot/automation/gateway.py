@@ -1,7 +1,6 @@
-"""OneBot read/control gateway for scheduled Agent context.
+"""Bound OneBot transport for scheduled Agent and plugin invocations.
 
-Scheduled message effects use SocialService and its durable receipts. This
-adapter only supplies the normal Agent with its bound OneBot connection.
+Effect authorization and durable receipts remain at the calling service.
 """
 
 from __future__ import annotations
@@ -42,8 +41,6 @@ class OneBotAutomationGateway:
         self._router = router
 
     async def call_api(self, action: str, params: dict[str, object]) -> object:
-        if action.startswith(("send_", "upload_")) or action == "send_msg":
-            raise ProactiveGatewayError("use_social_send_message")
         try:
             resolved = await self._router.resolve_send_for_account(self._bot_user_id)
         except RouteSendError as exc:

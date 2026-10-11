@@ -1,4 +1,4 @@
-"""Restart-safe polling worker with database leases and misfire handling."""
+"""Restart-safe polling worker consuming original accepted runs and due slots."""
 
 from __future__ import annotations
 
@@ -9,11 +9,10 @@ from datetime import timedelta
 from typing import Any
 
 from qq_ai_bot.automation.executor import AutomationExecutor
-from qq_ai_bot.automation.models import RunStatus
+from qq_ai_bot.automation.models import ExecutionResult, RunStatus
 from qq_ai_bot.automation.repository import AutomationRepository
 from qq_ai_bot.config import Settings
 from qq_ai_bot.runtime.lease_heartbeat import supervise_lease
-from qq_ai_bot.time.schedules import schedule_after_completion
 from qq_ai_bot.time.service import TimeContextService
 
 logger = logging.getLogger(__name__)
@@ -68,17 +67,12 @@ class AutomationWorker:
     async def _loop(self) -> None:
         while not self._stop.is_set():
             try:
-                if not self._settings.automation_enabled:
-                    await asyncio.sleep(self._settings.automation_poll_seconds)
-                    continue
-                if len(self._running) >= max(1, self._settings.global_llm_concurrency - 1):
-                    await asyncio.sleep(self._settings.automation_poll_seconds)
-                    continue
                 rows = await self._repository.claim_due(
                     worker_id=uuid.uuid4().hex,
                     now=self._time.clock.now(),
                     lease_seconds=self._settings.automation_lease_seconds,
-                    limit=max(1, self._settings.global_llm_concurrency - 1 - len(self._running)),
+                    enabled=self._settings.automation_enabled,
+                    clock=self._time.clock.now,
                 )
                 for row in rows:
                     task = asyncio.create_task(
@@ -120,7 +114,6 @@ class AutomationWorker:
             await self._repository.release_claim(
                 automation.id,
                 worker_id=automation.claimed_by or self._worker_id,
-                next_run_at=automation.next_run_at,
             )
             raise
         except Exception as exc:
@@ -134,7 +127,6 @@ class AutomationWorker:
                 await self._repository.release_claim(
                     automation.id,
                     worker_id=automation.claimed_by or self._worker_id,
-                    next_run_at=automation.next_run_at,
                 )
             except Exception as release_exc:
                 logger.error(
@@ -144,105 +136,69 @@ class AutomationWorker:
                 )
 
     async def _process(self, automation: Any) -> None:
-        scheduled_for = automation.next_run_at
-        if scheduled_for is None:
-            await self._repository.release_claim(
-                automation.id, worker_id=automation.claimed_by or self._worker_id
-            )
-            return
+        worker_id = automation.claimed_by or self._worker_id
+        runs = list(await self._repository.running_runs(automation.id))
         now = self._time.clock.now()
-        lateness = (now - scheduled_for).total_seconds()
-        next_run = schedule_after_completion(
-            automation.script.schedule,
-            scheduled_for,
-            now,
-            automation.timezone,
-        )
-        existing = await self._repository.resumable_run(automation.id, scheduled_for)
-        if existing is None and lateness > automation.misfire_grace_seconds:
+        scheduled_for = automation.next_run_at
+        if (
+            self._settings.automation_enabled
+            and automation.status.value == "active"
+            and scheduled_for is not None
+            and scheduled_for <= now
+            and not any(run.scheduled_for == scheduled_for for run in runs)
+        ):
             run = await self._repository.create_run(
                 automation.id,
                 scheduled_for=scheduled_for,
                 actual_started_at=now,
+                worker_id=worker_id,
+                version_id=automation.version_id,
             )
             if run is not None:
-                await self._repository.finish_run(
-                    run.id,
-                    worker_id=automation.claimed_by or self._worker_id,
-                    status=RunStatus.MISSED,
-                    steps_completed=0,
-                    llm_calls=0,
-                    tool_calls=0,
-                    messages_sent=0,
-                    error_category="misfire_grace_exceeded",
-                    summary={},
-                    finished_at=now,
+                runs.append(run)
+        pending = False
+        for run in runs:
+            accepted = await self._repository.get_for_run(run.id)
+            result = (
+                await self._executor.execute(accepted, run)
+                if accepted is not None
+                else ExecutionResult(
+                    status=RunStatus.UNCERTAIN,
+                    steps_completed=run.steps_completed,
+                    llm_calls=run.llm_calls,
+                    tool_calls=run.tool_calls,
+                    messages_sent=run.messages_sent,
+                    error_category="missing_original_run_version",
+                    summary=run.result_summary,
                 )
-            await self._repository.finish_automation_run(
-                automation.id,
-                worker_id=automation.claimed_by or self._worker_id,
-                status=RunStatus.MISSED,
-                next_run_at=next_run,
-                now=now,
-                max_consecutive_failures=self._settings.automation_max_consecutive_failures,
             )
-            return
-        run = existing or await self._repository.create_run(
-            automation.id,
-            scheduled_for=scheduled_for,
-            actual_started_at=now,
-        )
-        if run is None:
-            await self._repository.release_claim(
-                automation.id,
-                worker_id=automation.claimed_by or self._worker_id,
-                next_run_at=next_run,
+            if result.status is RunStatus.RUNNING:
+                pending = True
+                continue
+            recorded = await self._repository.finish_run(
+                run.id,
+                worker_id=worker_id,
+                status=result.status,
+                steps_completed=result.steps_completed,
+                llm_calls=result.llm_calls,
+                tool_calls=result.tool_calls,
+                messages_sent=result.messages_sent,
+                error_category=result.error_category,
+                summary=result.summary,
+                finished_at=self._time.clock.now(),
             )
-            return
-        result = await self._executor.execute(automation, run)
-        if result.status is RunStatus.RUNNING:
-            await self._repository.release_claim(
-                automation.id,
-                worker_id=automation.claimed_by or self._worker_id,
-                next_run_at=scheduled_for,
-                not_before=self._time.clock.now() + timedelta(seconds=5),
-            )
-            return
-        finished = self._time.clock.now()
-        recorded = await self._repository.finish_run(
-            run.id,
-            worker_id=automation.claimed_by or self._worker_id,
-            status=result.status,
-            steps_completed=result.steps_completed,
-            llm_calls=result.llm_calls,
-            tool_calls=result.tool_calls,
-            messages_sent=result.messages_sent,
-            error_category=result.error_category,
-            summary=result.summary,
-            finished_at=finished,
-        )
-        if not recorded:
-            return
-        await self._repository.finish_automation_run(
+            if recorded:
+                logger.info(
+                    "automation_run_finished automation_id=%d run_id=%d status=%s "
+                    "error_category=%s messages_sent=%d",
+                    automation.id,
+                    run.id,
+                    result.status.value,
+                    result.error_category,
+                    result.messages_sent,
+                )
+        await self._repository.release_claim(
             automation.id,
-            worker_id=automation.claimed_by or self._worker_id,
-            status=result.status,
-            next_run_at=next_run,
-            now=finished,
-            max_consecutive_failures=self._settings.automation_max_consecutive_failures,
-        )
-        logger.info(
-            "automation_run_finished automation_id=%d run_id=%d creator_user_id=%s "
-            "bot_user_id=%s schedule_type=%s status=%s error_category=%s "
-            "messages_sent=%d llm_calls=%d tool_calls=%d",
-            automation.id,
-            run.id,
-            automation.creator_user_id,
-            automation.bot_user_id,
-            automation.script.schedule.type,
-            result.status.value,
-            result.error_category,
-            result.messages_sent,
-            result.llm_calls,
-            result.tool_calls,
+            worker_id=worker_id,
+            not_before=self._time.clock.now() + timedelta(seconds=5) if pending else None,
         )

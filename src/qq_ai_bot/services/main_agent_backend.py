@@ -33,6 +33,7 @@ from qq_ai_bot.llm.base import LLMError
 from qq_ai_bot.memory.runtime.contract import MemoryReadPolicy
 from qq_ai_bot.runtime.observability import identifier_hash
 from qq_ai_bot.runtime.origin import TurnOrigin as RuntimeTurnOrigin
+from qq_ai_bot.runtime.work_budget import WorkBudgetExceeded
 from qq_ai_bot.services.agent_runner import AgentRuntime, AgentToolBackend
 from qq_ai_bot.services.agent_tools import ToolRuntime
 from qq_ai_bot.services.turn_coordinator import TurnSupersededError
@@ -108,7 +109,6 @@ class MainAgentBackend(AgentToolBackend):
         self.failed_model_requests = 0
         self.failed_tool_calls = 0
         self._web_was_used = False
-        self._web_calls_used = 0
         self._catalog: UnifiedToolCatalog | None = None
         self._provider_registry: ToolProviderRegistry | None = None
         self._capability_runtime: TurnCapabilityRuntime | None = None
@@ -169,34 +169,21 @@ class MainAgentBackend(AgentToolBackend):
         return not (self._runtime.tools_closed or self._runtime.read_only)
 
     def work_query_allowed(self, action: str) -> bool:
-        """Use the automation directory's read authority, without executing it.
-
-        A child Work reads only its own lifecycle: WorkQueries fences the
-        query by the child lease's work ownership, so it neither needs nor
-        inherits the root's global Automation read authority.
-        """
+        """Read Work facts using the original actor and tree scope."""
         if self._child_work():
             return (
                 action in {"get", "list"}
                 and self._allowed_tools is not None
                 and "task_control" in self._allowed_tools
             )
-        name = "automation_get" if action == "get" else "automation_list"
-        if self._allowed_tools is not None and name not in self._allowed_tools:
-            return False
         if self._runtime.tools_closed:
             return False
-        request_runtime = self._request_runtime()
-        if not request_runtime.allow_automation:
-            return False
         try:
-            _ = request_runtime.require_actor().source_key
+            _ = self._runtime.require_actor().source_key
+            self._runtime.validate_source()
         except (PermissionError, ValueError):
             return False
-        capability_runtime = self._ensure_capability_runtime()
-        arguments = '{"automation_id":1}' if action == "get" else "{}"
-        permitted, _ = capability_runtime.validate_call(name, arguments)
-        return permitted
+        return True
 
     @staticmethod
     def _child_work(runtime: AgentRuntime | None = None) -> bool:
@@ -428,50 +415,83 @@ class MainAgentBackend(AgentToolBackend):
         config = self._runtime.runtime_config
         assert config is not None
         mutating = self._is_mutating_call(call)
-        if is_web_tool and self._web_calls_used >= config.web.max_calls_per_turn:
-            result = _refused_result(
-                name,
-                "web_tool_limit_exceeded",
-                detail=f"本轮最多执行 {config.web.max_calls_per_turn} 次联网工具，"
-                "请根据已有结果回答。",
+        execution_runtime = self._request_runtime()
+        if mutating and execution_runtime.turn_token is not None:
+            await self._service._turn_coordinator.mark_mutation_started(
+                execution_runtime.turn_token
             )
+        try:
+            parsed = json.loads(arguments_json)
+        except json.JSONDecodeError:
+            parsed = None
+        if not isinstance(parsed, dict):
+            result = _refused_result(name, "invalid_json")
         else:
-            execution_runtime = self._request_runtime()
-            if mutating and execution_runtime.turn_token is not None:
-                await self._service._turn_coordinator.mark_mutation_started(
-                    execution_runtime.turn_token
-                )
+            started = time.perf_counter()
+            binding_started = False
             try:
-                parsed = json.loads(arguments_json)
-            except json.JSONDecodeError:
-                parsed = None
-            if not isinstance(parsed, dict):
-                result = _refused_result(name, "invalid_json")
-            else:
-                started = time.perf_counter()
-                binding_started = False
-                try:
 
-                    async def invoke_binding() -> ToolExecutionResult:
-                        nonlocal binding_started
-                        from qq_ai_bot.runtime.work_activation import current_work_control
+                async def invoke_binding() -> ToolExecutionResult:
+                    nonlocal binding_started
+                    from qq_ai_bot.runtime.work_activation import current_work_control
 
-                        work = current_work_control.get()
-                        if work is not None:
-                            if name != "send_message":
-                                await work.validate()
-                            if not await work.repository.valid(work.lease):
-                                raise TurnSupersededError("work activation changed")
-                            if name != "send_message" and await work.has_pending_business_inputs():
-                                return ToolExecutionResult(
-                                    ok=False,
-                                    data={"executed": False},
-                                    error_code="new_input_before_execution",
-                                    public_message="新要求已到达，此调用未执行，请按新要求继续。",
-                                    retryable=True,
-                                    mutation_committed=False,
-                                )
-                        binding_started = True
+                    work = current_work_control.get()
+                    if work is not None:
+                        if name != "send_message":
+                            await work.validate()
+                        if not await work.repository.valid(work.lease):
+                            raise TurnSupersededError("work activation changed")
+                        if name != "send_message" and await work.has_pending_business_inputs():
+                            return ToolExecutionResult(
+                                ok=False,
+                                data={"executed": False},
+                                error_code="new_input_before_execution",
+                                public_message="新要求已到达，此调用未执行，请按新要求继续。",
+                                retryable=True,
+                                mutation_committed=False,
+                            )
+                    source = execution_runtime.sandbox_source
+                    if (
+                        work is None
+                        and source is not None
+                        and execution_runtime.origin is RuntimeTurnOrigin.SCHEDULED_AUTOMATION
+                        and self.counts_toward_limit(name, runtime)
+                    ):
+                        from qq_ai_bot.runtime.work_budget import charge_automation_run
+
+                        async with self._service._ledger._database.immediate_session() as writer:
+                            await charge_automation_run(
+                                writer, int(source["automation_run_id"]), models=0, tools=1
+                            )
+                    binding_started = True
+                    if self.counts_toward_limit(name, runtime):
+                        self.failed_tool_calls += 1
+                    from qq_ai_bot.model_runtime.dispatch_guard import model_dispatch_guard
+
+                    async def admit_auxiliary_request() -> None:
+                        if runtime.before_model_request is not None:
+                            await runtime.before_model_request()
+                        assert runtime.auxiliary_requests is not None
+                        if (
+                            runtime.max_model_requests is not None
+                            and invocation.identity.request_sequence + runtime.auxiliary_requests[0]
+                            >= runtime.max_model_requests
+                        ):
+                            raise WorkBudgetExceeded("agent_segment_budget_exhausted")
+                        assert runtime.admit_model_request is not None
+                        runtime.auxiliary_requests[0] += 1
+                        try:
+                            await runtime.admit_model_request()
+                        except BaseException:
+                            runtime.auxiliary_requests[0] -= 1
+                            raise
+                        self.failed_model_requests += 1
+
+                    with (
+                        model_dispatch_guard(admit_auxiliary_request)
+                        if work is None and runtime.admit_model_request is not None
+                        else nullcontext()
+                    ):
                         return await binding.invoke(
                             {str(key): value for key, value in parsed.items()},
                             ToolInvocationContext(
@@ -479,139 +499,136 @@ class MainAgentBackend(AgentToolBackend):
                             ),
                         )
 
-                    outcome = await self._service.run_effect(
-                        None if name == "send_message" else execution_runtime.turn_snapshot,
-                        invoke_binding,
-                    )
-                except asyncio.CancelledError:
-                    raise
-                except Exception as exc:
-                    uncertain = binding_started and effective_descriptor.effect not in {
-                        CapabilityEffect.READ_STATE,
-                        CapabilityEffect.EXTERNAL_READ,
-                    }
-                    outcome = ToolExecutionResult(
-                        ok=False,
-                        error_code=type(exc).__name__,
-                        public_message="工具执行失败",
-                        retryable=False,
-                        uncertain=uncertain,
-                        mutation_committed=None if uncertain else False,
-                        provider_id=descriptor.provider_id,
-                        tool_name=descriptor.provider_tool_name or descriptor.model_name,
-                    )
-                mutation_committed = mutating and resolve_mutation_commit(
-                    outcome,
-                    effective_descriptor,
+                outcome = await self._service.run_effect(
+                    None if name == "send_message" else execution_runtime.turn_snapshot,
+                    invoke_binding,
                 )
-                outcome = replace(outcome, mutation_committed=mutation_committed)
-                if call.function.name == "send_message" and isinstance(outcome.data, dict):
-                    receipt = outcome.data
-                    file = receipt.get("file")
-                    caption = receipt.get("caption")
-                    parts = receipt.get("parts")
-                    accepted = (
-                        sum(part.get("status") == "succeeded" for part in parts)
-                        if isinstance(parts, list)
-                        else (
-                            int(file.get("status") == "succeeded")
-                            + int(
-                                isinstance(caption, dict) and caption.get("status") == "succeeded"
-                            )
-                            if isinstance(file, dict)
-                            else int(receipt.get("status") == "succeeded")
-                        )
-                    )
-                    self.messages_sent += accepted
-                    inbound = self._runtime.inbound
-                    expected = (
-                        {"kind": "space", "id": inbound.space_id}
-                        if inbound is not None and inbound.space_id
-                        else {"kind": "person", "id": inbound.person_id}
-                        if inbound is not None
-                        else {
-                            "kind": "space" if self._runtime.space_id else "person",
-                            "id": self._runtime.space_id or self._runtime.person_id,
-                        }
-                    )
-                    sent_target = receipt.get("target")
-                    deliveries = (
-                        parts
-                        if isinstance(parts, list)
-                        else [caption]
+            except (asyncio.CancelledError, WorkBudgetExceeded):
+                raise
+            except Exception as exc:
+                uncertain = binding_started and effective_descriptor.effect not in {
+                    CapabilityEffect.READ_STATE,
+                    CapabilityEffect.EXTERNAL_READ,
+                }
+                outcome = ToolExecutionResult(
+                    ok=False,
+                    error_code=type(exc).__name__,
+                    public_message="工具执行失败",
+                    retryable=False,
+                    uncertain=uncertain,
+                    mutation_committed=None if uncertain else False,
+                    provider_id=descriptor.provider_id,
+                    tool_name=descriptor.provider_tool_name or descriptor.model_name,
+                )
+            mutation_committed = mutating and resolve_mutation_commit(
+                outcome,
+                effective_descriptor,
+            )
+            outcome = replace(outcome, mutation_committed=mutation_committed)
+            if call.function.name == "send_message" and isinstance(outcome.data, dict):
+                receipt = outcome.data
+                file = receipt.get("file")
+                caption = receipt.get("caption")
+                parts = receipt.get("parts")
+                accepted = (
+                    sum(part.get("status") == "succeeded" for part in parts)
+                    if isinstance(parts, list)
+                    else (
+                        int(file.get("status") == "succeeded")
+                        + int(isinstance(caption, dict) and caption.get("status") == "succeeded")
                         if isinstance(file, dict)
-                        else [receipt]
+                        else int(receipt.get("status") == "succeeded")
                     )
-                    if isinstance(sent_target, dict) and sent_target == expected:
-                        # Only the confirmed ledger projection knows what survived
-                        # sanitization/splitting/media preparation and reached QQ.
-                        # Raw tool arguments cannot reconstruct delivery evidence.
-                        self.sent_current_texts.extend(
-                            part["delivered_text"]
-                            for part in deliveries
-                            if isinstance(part, dict)
-                            and part.get("status") == "succeeded"
-                            and isinstance(part.get("delivered_text"), str)
-                            and part["delivered_text"].strip()
-                        )
-                tooling = config.tooling
-                result_tokens = tooling.result_token_budget if tooling is not None else None
-                result_budget = (
-                    result_tokens * 4
-                    if result_tokens is not None
-                    else config.agent.tool_result_max_characters
                 )
-                item_limit = tooling.result_item_limit if tooling is not None else None
-                artifact_store = (
-                    self._service._tool_artifacts
-                    if outcome.images or (tooling is not None and tooling.result_artifact_enabled)
-                    else None
+                self.messages_sent += accepted
+                inbound = self._runtime.inbound
+                expected = (
+                    {"kind": "space", "id": inbound.space_id}
+                    if inbound is not None and inbound.space_id
+                    else {"kind": "person", "id": inbound.person_id}
+                    if inbound is not None
+                    else {
+                        "kind": "space" if self._runtime.space_id else "person",
+                        "id": self._runtime.space_id or self._runtime.person_id,
+                    }
                 )
-                retention_seconds = (
-                    tooling.result_artifact_retention_seconds if tooling is not None else None
+                sent_target = receipt.get("target")
+                deliveries = (
+                    parts
+                    if isinstance(parts, list)
+                    else [caption]
+                    if isinstance(file, dict)
+                    else [receipt]
                 )
-                from qq_ai_bot.runtime.work_activation import current_work_control
-                from qq_ai_bot.tool_results.access import access_from_runtime
+                if isinstance(sent_target, dict) and sent_target == expected:
+                    # Only the confirmed ledger projection knows what survived
+                    # sanitization/splitting/media preparation and reached QQ.
+                    # Raw tool arguments cannot reconstruct delivery evidence.
+                    self.sent_current_texts.extend(
+                        part["delivered_text"]
+                        for part in deliveries
+                        if isinstance(part, dict)
+                        and part.get("status") == "succeeded"
+                        and isinstance(part.get("delivered_text"), str)
+                        and part["delivered_text"].strip()
+                    )
+            tooling = config.tooling
+            result_tokens = tooling.result_token_budget if tooling is not None else None
+            result_budget = (
+                result_tokens * 4
+                if result_tokens is not None
+                else config.agent.tool_result_max_characters
+            )
+            item_limit = tooling.result_item_limit if tooling is not None else None
+            artifact_store = (
+                self._service._tool_artifacts
+                if outcome.images or (tooling is not None and tooling.result_artifact_enabled)
+                else None
+            )
+            retention_seconds = (
+                tooling.result_artifact_retention_seconds if tooling is not None else None
+            )
+            from qq_ai_bot.runtime.work_activation import current_work_control
+            from qq_ai_bot.tool_results.access import access_from_runtime
 
-                active = current_work_control.get()
+            active = current_work_control.get()
 
-                budgeted = await ToolResultBudgeter(
-                    max_characters=result_budget,
-                    item_limit=item_limit,
-                    artifacts=artifact_store,
-                    artifact_retention_seconds=retention_seconds,
-                    artifact_access_resolver=(
-                        lambda: access_from_runtime(
-                            execution_runtime,
-                            generation=active.lease.generation if active is not None else None,
-                        )
+            budgeted = await ToolResultBudgeter(
+                max_characters=result_budget,
+                item_limit=item_limit,
+                artifacts=artifact_store,
+                artifact_retention_seconds=retention_seconds,
+                artifact_access_resolver=(
+                    lambda: access_from_runtime(
+                        execution_runtime,
+                        generation=active.lease.generation if active is not None else None,
                     )
-                    if artifact_store is not None
-                    else None,
-                ).render(outcome)
-                result = budgeted.text
-                self._service._tool_metrics.record_invocation(
-                    descriptor.provider_id,
-                    descriptor.provider_tool_name or descriptor.model_name,
-                    outcome.ok,
                 )
-                if self._service._tool_invocations is not None:
-                    await self._service._record_tool_invocation(
-                        runtime=execution_runtime,
-                        provider_id=descriptor.provider_id,
-                        tool_name=descriptor.provider_tool_name or descriptor.model_name,
-                        success=outcome.ok,
-                        latency_seconds=time.perf_counter() - started,
-                        result_size=len(result.encode("utf-8")),
-                        artifact_created=budgeted.artifact_id is not None,
-                        error_category=outcome.error_code,
-                        result_excerpt=result,
-                        # The same Host operation the effect row and audit fence use.
-                        tool_call_id=receipt_call_id,
-                    )
-            if is_web_tool:
-                self._web_calls_used += 1
-                self._web_was_used = True
+                if artifact_store is not None
+                else None,
+            ).render(outcome)
+            result = budgeted.text
+            self._service._tool_metrics.record_invocation(
+                descriptor.provider_id,
+                descriptor.provider_tool_name or descriptor.model_name,
+                outcome.ok,
+            )
+            if self._service._tool_invocations is not None:
+                await self._service._record_tool_invocation(
+                    runtime=execution_runtime,
+                    provider_id=descriptor.provider_id,
+                    tool_name=descriptor.provider_tool_name or descriptor.model_name,
+                    success=outcome.ok,
+                    latency_seconds=time.perf_counter() - started,
+                    result_size=len(result.encode("utf-8")),
+                    artifact_created=budgeted.artifact_id is not None,
+                    error_category=outcome.error_code,
+                    result_excerpt=result,
+                    # The same Host operation the effect row and audit fence use.
+                    tool_call_id=receipt_call_id,
+                )
+        if is_web_tool:
+            self._web_was_used = True
         return result
 
     async def observe_response(self, response: Any, runtime: AgentRuntime) -> None:
@@ -675,15 +692,6 @@ class MainAgentBackend(AgentToolBackend):
             )
         ) and (runtime.work_control is None or runtime.work_control.lease.work_id is None)
 
-    def allow_silent_final(self, runtime: AgentRuntime) -> bool:
-        if self._self_main_run(runtime):
-            return True
-        return (
-            runtime.origin is RuntimeTurnOrigin.USER_MESSAGE
-            and self._runtime.inbound is not None
-            and (runtime.work_control is None or runtime.work_control.current is None)
-        )
-
     def finalize(self, content: str, runtime: AgentRuntime) -> str:
         from yuki_participation.self_report import extract_tail
 
@@ -697,14 +705,6 @@ class MainAgentBackend(AgentToolBackend):
         ) and body.strip() == "NO_REPLY":
             return ""
         return body
-
-    def has_visible_effects(self) -> bool:
-        """An accepted send permits a text-free internal final response."""
-
-        return self.messages_sent > 0
-
-    def exhausted(self, runtime: AgentRuntime) -> str:
-        return "这次操作的工具调用次数过多，已停止继续执行。请把请求拆小后再试。"
 
     def _is_mutating_call(self, call: ToolCall) -> bool:
         entry = (

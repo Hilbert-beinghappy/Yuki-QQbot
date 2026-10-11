@@ -1,4 +1,4 @@
-"""Work directory reads share real Automation authority and the Runner gate."""
+"""Work reads use their actor and tree scope independently of Automation."""
 
 import json
 from dataclasses import replace
@@ -47,25 +47,22 @@ async def query_environment(database):
 
 
 @pytest.mark.asyncio
-async def test_queries_follow_automation_read_policy_not_mutation_admission(query_environment):
+async def test_queries_do_not_require_automation_or_mutation_admission(query_environment):
     chat, runtime = query_environment
     for read_only in (False, True):
-        backend = MainAgentBackend(chat, replace(runtime, read_only=read_only))
+        backend = MainAgentBackend(
+            chat,
+            replace(runtime, read_only=read_only, allow_automation=False),
+            allowed_tools=frozenset(),
+        )
         for action in ("get", "list"):
-            name = f"automation_{action}"
-            arguments = '{"automation_id":1}' if action == "get" else "{}"
-            automation_allowed, _ = backend._ensure_capability_runtime().validate_call(
-                name, arguments
-            )
-            assert automation_allowed
             assert backend.work_query_allowed(action)
 
 
 @pytest.mark.asyncio
-async def test_queries_require_trusted_internal_actor_and_automation_access(query_environment):
+async def test_queries_require_trusted_internal_actor(query_environment):
     chat, runtime = query_environment
     invalid = (
-        replace(runtime, allow_automation=False),
         replace(
             runtime, inbound=replace(runtime.inbound, source_event_id=None), actor_context=None
         ),
@@ -82,7 +79,7 @@ async def test_delegated_query_scope_and_closed_profiles_are_enforced(query_envi
     chat, runtime = query_environment
     delegated = MainAgentBackend(chat, runtime, allowed_tools=frozenset({"automation_get"}))
     assert delegated.work_query_allowed("get")
-    assert not delegated.work_query_allowed("list")
+    assert delegated.work_query_allowed("list")
     closed = MainAgentBackend(chat, replace(runtime, tools_closed=True))
     assert not closed.work_query_allowed("get")
     assert not closed.work_query_allowed("list")
@@ -113,13 +110,10 @@ async def test_self_directory_reads_do_not_require_or_borrow_a_person(query_envi
     )
     with pytest.raises(ValueError, match="invalid_self_tool_actor"):
         replace(actor, user_id="1001")
-    backend = MainAgentBackend(chat, runtime)
+    backend = MainAgentBackend(chat, replace(runtime, allow_automation=False))
     assert backend.work_query_allowed("get")
     assert backend.work_query_allowed("list")
-    for invalid in (
-        replace(runtime, allow_automation=False),
-        replace(runtime, initiative_run_id="another-initiative"),
-    ):
+    for invalid in (replace(runtime, initiative_run_id="another-initiative"),):
         refused = MainAgentBackend(chat, invalid)
         assert not refused.work_query_allowed("get")
         assert not refused.work_query_allowed("list")
@@ -161,7 +155,9 @@ async def test_runner_query_gate_refuses_before_domain_read_and_keeps_lifecycle(
         if action == "get":
             arguments["work_id"] = "original-work"
         call = ToolCall(action, ToolFunction("task_control", json.dumps(arguments)))
-        backend = MainAgentBackend(chat, replace(tool_runtime, allow_automation=allowed))
+        backend = MainAgentBackend(
+            chat, replace(tool_runtime, allow_automation=False, tools_closed=not allowed)
+        )
         return await chat.runtime.runner._execute_tool_batch(
             (call,),
             backend,
