@@ -14,7 +14,11 @@ from qq_ai_bot.memory.maintenance import MemoryMaintenanceWorker
 from qq_ai_bot.memory.models import MemoryFactCreate
 from qq_ai_bot.memory.repository import MemoryFactRepository
 from qq_ai_bot.memory.service import MemoryFactService
-from qq_ai_bot.persistence.models import MemoryFactModel, MemoryFactStateEventModel
+from qq_ai_bot.persistence.models import (
+    MemoryFactModel,
+    MemoryFactRelationModel,
+    MemoryFactStateEventModel,
+)
 
 
 async def _case(database, count=1):
@@ -42,6 +46,71 @@ async def _case(database, count=1):
         rows,
         MemoryMaintenanceWorker(settings=make_settings(database.url), facts=facts),
     )
+
+
+async def test_expiry_extension_and_two_hop_conflicts_follow_current_batch_rows(
+    database, monkeypatch
+):
+    repository, facts, rows, worker = await _case(database, 3)
+    first, middle, last = rows
+    async with database.immediate_session() as session:
+        await session.execute(
+            update(MemoryFactModel)
+            .where(MemoryFactModel.id == middle.id)
+            .values(conflict_state="contested")
+        )
+        session.add_all(
+            [
+                MemoryFactRelationModel(
+                    source_fact_id=source.id,
+                    target_fact_id=target.id,
+                    relation_type="contradicts",
+                    confidence=1,
+                    created_at=datetime.now(UTC),
+                )
+                for source, target in ((first, middle), (middle, last))
+            ]
+        )
+    original = repository.list_expired_candidates
+
+    async def extend_after_discovery(**kwargs):
+        discovered = await original(**kwargs)
+        async with database.immediate_session() as session:
+            await session.execute(
+                update(MemoryFactModel)
+                .where(MemoryFactModel.id.in_((middle.id, last.id)))
+                .values(valid_until=datetime.now(UTC) + timedelta(days=1))
+            )
+        return discovered
+
+    monkeypatch.setattr(repository, "list_expired_candidates", extend_after_discovery)
+    assert await worker.process_once() == 1
+    assert (await facts.get_fact(first.id)).status.value == "invalidated"
+    assert (await facts.get_fact(middle.id)).conflict_state.value == "contested"
+    assert (await facts.get_fact(last.id)).status.value == "active"
+    monkeypatch.setattr(repository, "list_expired_candidates", original)
+    async with database.immediate_session() as session:
+        await session.execute(
+            update(MemoryFactModel)
+            .where(MemoryFactModel.id == last.id)
+            .values(valid_until=datetime.now(UTC) - timedelta(days=1))
+        )
+    assert await worker.process_once() == 1
+    kept = await facts.get_fact(middle.id)
+    assert kept.status.value == "active" and kept.conflict_state.value == "clear"
+    async with database.sessions() as session:
+        events = tuple(
+            await session.scalars(
+                select(MemoryFactStateEventModel).where(
+                    MemoryFactStateEventModel.action.in_(("expired", "conflict_cleared"))
+                )
+            )
+        )
+    assert [(item.fact_id, item.action) for item in events] == [
+        (first.id, "expired"),
+        (last.id, "expired"),
+        (middle.id, "conflict_cleared"),
+    ]
 
 
 def _race(database, worker, monkeypatch, *, code, fail_attempts=4):

@@ -233,10 +233,13 @@ class MemoryRetriever:
             )
         ranked = self._ranker.rank_global(tuple(pooled), query)
         selected = ranked[:limit]
+        selected_by_target: dict[MemoryEntityTarget, list[MemoryRetrievalHit]] = {}
+        for hit in selected:
+            selected_by_target.setdefault(hit.target, []).append(hit)
         blocks = tuple(
             MemoryRetrievalBlock(
                 target=target,
-                hits=tuple(hit for hit in selected if hit.target == target),
+                hits=tuple(selected_by_target.get(target, ())),
             )
             for target in targets.values()
         )
@@ -366,6 +369,10 @@ class MemoryRetriever:
                 logger.warning("memory_semantic_degraded error_category=%s", exc.code)
         elif query.mode is MemoryRetrievalMode.OVERVIEW:
             semantic_status = "overview"
+        if query.targets and query.mode is not MemoryRetrievalMode.OVERVIEW and lexical_enabled:
+            safe = build_safe_lexical_query(
+                query.normalized_text, term_limit=query.query_term_limit
+            )
         for target in query.targets:
             hits: tuple[MemoryRetrievalHit, ...]
             if query.mode is MemoryRetrievalMode.OVERVIEW or not lexical_enabled:
@@ -385,10 +392,6 @@ class MemoryRetriever:
                     reason=("overview" if lexical_enabled else "retrieval_disabled_fallback"),
                 )
             else:
-                safe = build_safe_lexical_query(
-                    query.normalized_text,
-                    term_limit=query.query_term_limit,
-                )
                 search_started = time.perf_counter()
                 candidates = await self._index.search(
                     target,
@@ -479,6 +482,7 @@ class MemoryRetriever:
                 )
             )
         all_hits = []
+        selected_by_target: dict[MemoryEntityTarget, list[MemoryRetrievalHit]] = {}
         per_target: dict[str, int] = {}
         output_truncated = False
         for hit in ranked:
@@ -488,10 +492,9 @@ class MemoryRetriever:
                 continue
             per_target[key] = per_target.get(key, 0) + 1
             all_hits.append(hit.model_copy(update={"rank": len(all_hits) + 1}))
+            selected_by_target.setdefault(hit.target, []).append(all_hits[-1])
         blocks = [
-            MemoryRetrievalBlock(
-                target=target, hits=tuple(hit for hit in all_hits if hit.target == target)
-            )
+            MemoryRetrievalBlock(target=target, hits=tuple(selected_by_target.get(target, ())))
             for target in query.targets
         ]
 

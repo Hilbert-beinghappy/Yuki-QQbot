@@ -44,4 +44,5 @@ waits = sa.Table(
     ),
     sa.Index("ix_runtime_work_wait_scope", "conversation_id", "generation", "status"),
     sa.Index("ix_runtime_work_wait_deadline", "status", "deadline"),
+    sa.Index("ix_runtime_work_wait_scan", "status", "created", "id"),
 )

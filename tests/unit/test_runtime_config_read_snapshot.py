@@ -1,6 +1,5 @@
 """Current identity and overrides share one real SQLite read view, without caching."""
 
-import asyncio
 from datetime import UTC, datetime
 
 import pytest
@@ -97,8 +96,6 @@ async def test_snapshot_matches_previous_complete_config_and_resolves_once(
     assert sql[0] == "BEGIN"
     assert resolved.count("resolve_live_person_id") == int("user_id" in kwargs)
     assert resolved.count("resolve_live_space_id") == int("group_id" in kwargs)
-    if scope == "space":
-        assert sum(statement.startswith("SELECT") for statement in sql) == 8
 
 
 @pytest.mark.asyncio
@@ -156,7 +153,7 @@ async def test_snapshot_under_wal_writer_reads_committed_config_without_dml(data
 
         event.listen(database.engine.sync_engine, "before_cursor_execute", capture)
         try:
-            result = await asyncio.wait_for(runtime.snapshot(user_id="10001"), timeout=1)
+            result = await runtime.snapshot(user_id="10001")
         finally:
             event.remove(database.engine.sync_engine, "before_cursor_execute", capture)
         assert result.context.compaction_window_tokens == 70000

@@ -170,7 +170,7 @@ class EmojiCollector:
             source_emoji_id=attachment.emoji_id or "",
             source_package_id=attachment.emoji_package_id or "",
         )
-        near_duplicates: tuple[EmojiAsset, ...] = ()
+        near_duplicates: tuple[str, ...] = ()
         if runtime.near_duplicate_enabled and media.perceptual_hash is not None:
             near_duplicates = await self._repository.near_duplicates(
                 media.perceptual_hash,
@@ -186,7 +186,7 @@ class EmojiCollector:
                 "restored": was_missing,
                 "animated": asset.animated,
                 "scope_type": message.scope_type.value,
-                "near_duplicate_ids": [row.id for row in near_duplicates[:20]],
+                "near_duplicate_ids": list(near_duplicates[:20]),
             },
         )
         if was_missing:

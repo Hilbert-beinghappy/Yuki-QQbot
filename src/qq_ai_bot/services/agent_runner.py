@@ -335,18 +335,17 @@ class AgentRunner:
             runtime.runtime_config.context.work_window_tokens,
             output_tokens=request.max_output_tokens,
         )
+        capacity_template = self._capacity_request(request)
 
         def source_fits(source: str) -> bool:
             return (
                 estimate_request_tokens(
-                    self._capacity_request(
-                        replace(
-                            request,
-                            messages=(
-                                request.messages[0],
-                                ChatMessage(role="user", content=source),
-                            ),
-                        )
+                    replace(
+                        capacity_template,
+                        messages=(
+                            capacity_template.messages[0],
+                            ChatMessage(role="user", content=source),
+                        ),
                     )
                 )
                 <= summary_budget

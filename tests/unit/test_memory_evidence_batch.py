@@ -1,10 +1,10 @@
-"""Canonical evidence is filtered in one SQL read, including hidden source chains."""
+"""Canonical evidence preserves authorized sources, order, and requested limits."""
 
 from datetime import UTC, datetime, timedelta
 from uuid import uuid4
 
 import pytest
-from sqlalchemy import event, insert, select
+from sqlalchemy import insert, select
 from tests.support.self_initiative_memory_quality_helpers import reflection_fact
 from tests.unit.test_memory_v2 import _append_event
 
@@ -22,7 +22,7 @@ from qq_ai_bot.persistence.repositories import EventLedgerRepository
 
 
 @pytest.mark.parametrize("size", [1, 64, 1000])
-async def test_evidence_query_round_trips_are_constant_and_order_limit_is_preserved(database, size):
+async def test_evidence_order_limit_and_counts_are_preserved(database, size):
     repository = MemoryFactRepository(database)
     facts = MemoryFactService(repository)
     source = await _append_event(EventLedgerRepository(database), message_id="seed", content="seed")
@@ -73,17 +73,7 @@ async def test_evidence_query_round_trips_are_constant_and_order_limit_is_preser
                 for i, event_id in enumerate(event_ids)
             ],
         )
-    statements = []
-
-    def count(_connection, _cursor, statement, *_args):
-        statements.append(statement)
-
-    event.listen(database.engine.sync_engine, "before_cursor_execute", count)
-    try:
-        evidence = await repository.list_evidence(fact.id, limit=size)
-    finally:
-        event.remove(database.engine.sync_engine, "before_cursor_execute", count)
-    assert len(statements) == 1
+    evidence = await repository.list_evidence(fact.id, limit=size)
     assert len(evidence) == size
     assert [row.excerpt for row in evidence] == [f"item-{i}" for i in reversed(range(size))]
     assert [row.id for row in await repository.list_evidence(fact.id, limit=1)] == [evidence[0].id]

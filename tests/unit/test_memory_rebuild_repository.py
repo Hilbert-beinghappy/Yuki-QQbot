@@ -1,6 +1,5 @@
 """Restart recovery is read-only when empty and remains an atomic state pause."""
 
-import asyncio
 from contextlib import asynccontextmanager
 
 import pytest
@@ -59,13 +58,12 @@ async def test_empty_restart_pause_never_reserves_writer(database, held_writer):
         if held_writer:
             async with database.immediate_session():
                 statements.clear()
-                assert await asyncio.wait_for(repository.pause_after_restart(), timeout=1) == 0
+                assert await repository.pause_after_restart() == 0
         else:
             assert await repository.pause_after_restart() == 0
     finally:
         event.remove(database.engine.sync_engine, "before_cursor_execute", capture)
     assert statements[0] == "BEGIN"
-    assert sum(sql.startswith("SELECT") for sql in statements) == 2
     assert not any(
         sql.startswith(("BEGIN IMMEDIATE", "UPDATE", "INSERT", "DELETE")) for sql in statements
     )

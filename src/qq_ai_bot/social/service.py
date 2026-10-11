@@ -14,7 +14,7 @@ from datetime import UTC, datetime
 from typing import Any, cast
 from uuid import UUID
 
-from sqlalchemy import select
+from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from qq_ai_bot.adapters.onebot.sender import parse_onebot_send_receipt
@@ -323,51 +323,61 @@ class SocialService:
                     )
                     .exists()
                 )
+                candidates = (
+                    select(
+                        CanonicalPersonModel.id.label("person_id"),
+                        func.max(IdentityBindingModel.id).label("binding_id"),
+                    )
+                    .join(
+                        IdentityBindingModel,
+                        IdentityBindingModel.person_id == CanonicalPersonModel.id,
+                    )
+                    .where(
+                        CanonicalPersonModel.enabled.is_(True),
+                        known,
+                        IdentityBindingModel.status == "active",
+                        IdentityBindingModel.platform == "qq",
+                        IdentityBindingModel.display_name == query
+                        if exact
+                        else IdentityBindingModel.display_name.contains(query, autoescape=True),
+                    )
+                    .group_by(CanonicalPersonModel.id)
+                    .order_by(CanonicalPersonModel.id)
+                )
+                if not exact:
+                    candidates = candidates.limit(20)
+                matching = candidates.subquery()
                 rows = (
                     await session.execute(
-                        select(CanonicalPersonModel.id, IdentityBindingModel.display_name)
+                        select(matching.c.person_id, IdentityBindingModel.display_name)
                         .join(
-                            IdentityBindingModel,
-                            IdentityBindingModel.person_id == CanonicalPersonModel.id,
+                            IdentityBindingModel, IdentityBindingModel.id == matching.c.binding_id
                         )
-                        .where(
-                            CanonicalPersonModel.enabled.is_(True),
-                            known,
-                            IdentityBindingModel.status == "active",
-                            IdentityBindingModel.platform == "qq",
-                            IdentityBindingModel.display_name == query
-                            if exact
-                            else IdentityBindingModel.display_name.contains(query, autoescape=True),
-                        )
-                        .order_by(CanonicalPersonModel.id, IdentityBindingModel.id)
-                        .limit(20)
+                        .order_by(matching.c.person_id)
                     )
                 ).all()
             elif kind == "space":
-                rows = (
-                    await session.execute(
-                        select(CanonicalSpaceModel.id, CanonicalSpaceModel.name)
-                        .where(
-                            CanonicalSpaceModel.enabled.is_(True),
-                            CanonicalSpaceModel.name == query
-                            if exact
-                            else CanonicalSpaceModel.name.contains(query, autoescape=True),
-                        )
-                        .order_by(CanonicalSpaceModel.id)
-                        .limit(20)
+                statement = (
+                    select(CanonicalSpaceModel.id, CanonicalSpaceModel.name)
+                    .where(
+                        CanonicalSpaceModel.enabled.is_(True),
+                        CanonicalSpaceModel.name == query
+                        if exact
+                        else CanonicalSpaceModel.name.contains(query, autoescape=True),
                     )
-                ).all()
+                    .order_by(CanonicalSpaceModel.id)
+                )
+                if not exact:
+                    statement = statement.limit(20)
+                rows = (await session.execute(statement)).all()
             else:
                 raise SocialError("invalid_target_kind")
         if kind == "space" and query and not rows and _refresh:
             await self.refresh_space_names()
             return await self.contacts(kind, query, exact=exact, _refresh=False)
-        return list(
-            {
-                str(row[0]): {"target_id": str(row[0]), "display_name": str(row[1]), "kind": kind}
-                for row in rows
-            }.values()
-        )
+        return [
+            {"target_id": str(row[0]), "display_name": str(row[1]), "kind": kind} for row in rows
+        ]
 
     async def target(self, kind: str, args: dict[str, Any], context: SocialContext) -> SocialTarget:
         selectors = [key for key in ("target_id", "display_name", "subject_ref") if args.get(key)]
@@ -877,37 +887,42 @@ class SocialService:
                     for item in await self.contacts(kind, str(args.get("display_name", "")))
                 ]
             async with self.database.sessions() as session:
+                selected_ids = [item["target_id"] for item in items]
+                bindings_by_target: dict[str, list[dict[str, str]]] = {
+                    target_id: [] for target_id in selected_ids
+                }
+                if selected_ids:
+                    model = IdentityBindingModel if kind == "person" else SpaceBindingModel
+                    owner_column = (
+                        IdentityBindingModel.person_id
+                        if kind == "person"
+                        else SpaceBindingModel.space_id
+                    )
+                    account_column = (
+                        IdentityBindingModel.external_account_id
+                        if kind == "person"
+                        else SpaceBindingModel.external_space_id
+                    )
+                    bindings = (
+                        await session.execute(
+                            select(owner_column, model.id, account_column)
+                            .where(
+                                owner_column.in_(selected_ids),
+                                model.platform == "qq",
+                                model.status == "active",
+                            )
+                            .order_by(model.id)
+                        )
+                    ).all()
+                    for owner_id, binding_id, account_id in bindings:
+                        bindings_by_target[owner_id].append(
+                            {
+                                "binding_id": binding_id,
+                                "user_id" if kind == "person" else "group_id": account_id,
+                            }
+                        )
                 for item in items:
-                    if kind == "person":
-                        bindings = (
-                            await session.scalars(
-                                select(IdentityBindingModel)
-                                .where(
-                                    IdentityBindingModel.person_id == item["target_id"],
-                                    IdentityBindingModel.platform == "qq",
-                                    IdentityBindingModel.status == "active",
-                                )
-                                .order_by(IdentityBindingModel.id)
-                            )
-                        ).all()
-                        item["bindings"] = [
-                            {"binding_id": b.id, "user_id": b.external_account_id} for b in bindings
-                        ]
-                    else:
-                        spaces = (
-                            await session.scalars(
-                                select(SpaceBindingModel)
-                                .where(
-                                    SpaceBindingModel.space_id == item["target_id"],
-                                    SpaceBindingModel.platform == "qq",
-                                    SpaceBindingModel.status == "active",
-                                )
-                                .order_by(SpaceBindingModel.id)
-                            )
-                        ).all()
-                        item["bindings"] = [
-                            {"binding_id": b.id, "group_id": b.external_space_id} for b in spaces
-                        ]
+                    item["bindings"] = bindings_by_target[item["target_id"]]
             return (
                 items[0] if args.get("target_id") or args.get("subject_ref") else {"items": items}
             )

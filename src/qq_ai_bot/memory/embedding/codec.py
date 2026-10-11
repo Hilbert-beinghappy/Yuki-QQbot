@@ -41,5 +41,12 @@ class Float32VectorCodec:
             raise ValueError("embedding vector dimensions differ")
         left_norm = Float32VectorCodec.normalize(left)
         right_norm = Float32VectorCodec.normalize(right)
-        score = math.fsum(a * b for a, b in zip(left_norm.values, right_norm.values, strict=True))
+        return Float32VectorCodec.dot_normalized(left_norm, right_norm)
+
+    @staticmethod
+    def dot_normalized(left: EmbeddingVector, right: EmbeddingVector) -> float:
+        """Score vectors already normalized by this codec in the current scan."""
+        if left.dimensions != right.dimensions:
+            raise ValueError("embedding vector dimensions differ")
+        score = math.fsum(a * b for a, b in zip(left.values, right.values, strict=True))
         return max(-1.0, min(1.0, score))

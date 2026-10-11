@@ -855,3 +855,222 @@ async def test_wait_shorthand_keeps_long_owned_run_id_and_completed_uncertainty(
     assert (await tasks.by_run(run_id)).completion_json == json.dumps(
         {"status": terminal, "pending": False}
     )
+
+
+async def test_batched_waits_keep_owner_tuple_and_sandbox_self_scope(database, tmp_path):
+    from datetime import UTC, datetime
+
+    from qq_ai_bot.sandbox.db_models import SandboxTaskRunModel
+
+    repository, lease, control = await _running_work(database, tmp_path)
+    owner = control.current["id"]
+    other = await repository.accept(
+        lease, source_key="other-root", source=control.source, goal="another real root"
+    )
+    now = datetime.now(UTC)
+    async with database.immediate_session() as writer:
+        writer.add(
+            SandboxTaskRunModel(
+                request_id="same-work-original-run",
+                source_conversation_id=lease.conversation_id,
+                source_json=json.dumps({"work_id": owner}),
+                payload_hash="0" * 64,
+                run_id=owner,
+                status="completed",
+                completion_json=json.dumps({"status": "uncertain"}),
+                created_at=now,
+                updated_at=now,
+            )
+        )
+    waits = WorkWaitRepository(repository)
+    for identity in (owner, other["id"]):
+        await waits.register(
+            lease,
+            work_id=identity,
+            source=control.source,
+            call_key=f"tuple-wait:{identity}",
+            mode="any",
+            conditions=[{"kind": "owned_run", "run_id": owner}],
+            deadline_at=None,
+        )
+    assert await waits.deliver_due() == 1
+    matched = await waits.describe(owner)
+    assert matched["conditions"][0]["matched"]["status"] == "uncertain"
+    assert (await waits.describe(other["id"]))["status"] == "active"
+    assert (await waits.describe(other["id"]))["conditions"][0]["matched"] is None
+
+
+async def test_abandoned_batch_repairs_original_inputs_and_advances_work_once(
+    database, tmp_path, monkeypatch
+):
+    import time
+    from datetime import UTC, datetime
+    from uuid import uuid4
+
+    from sqlalchemy import update
+    from tests.support.projection_sql_counts import capture_sql
+
+    from qq_ai_bot.persistence.models import ChatEventModel
+    from qq_ai_bot.runtime import work_repository
+
+    repository, lease, control = await _running_work(database, tmp_path)
+    identity = control.current["id"]
+    now = datetime.now(UTC)
+    async with database.immediate_session() as writer:
+        event = ChatEventModel(
+            bot_user_id="80001",
+            platform_message_id="original-repair-input",
+            scope_type="group",
+            group_id="20001",
+            sender_user_id="10001",
+            direction="inbound",
+            content="original text",
+            occurred_at=now,
+            observed_at=now,
+            canonical_event_id=str(uuid4()),
+            canonical_conversation_id=lease.conversation_id,
+            author_kind="person",
+            author_person_id=control.source["actor_person_id"],
+            suppression_status="keeper",
+        )
+        writer.add(event)
+        await writer.flush()
+        event_id = event.id
+    repaired = []
+    for key, event_id_value in (("first", event_id), ("second", event_id), ("missing", None)):
+        repaired.append(
+            await repository.enqueue(
+                lease.conversation_id,
+                lease.generation,
+                f"repair:{key}",
+                kind="message",
+                event_id=event_id_value,
+                work_id=identity,
+                ready=False,
+            )
+        )
+    unowned = await repository.enqueue(
+        lease.conversation_id,
+        lease.generation,
+        "repair:null-owner",
+        kind="message",
+        event_id=event_id,
+        work_id=identity,
+        ready=False,
+    )
+    async with database.immediate_session() as writer:
+        await writer.execute(
+            update(inputs)
+            .where(inputs.c.id.in_(repaired))
+            .values(prepare_owner="abandoned-process")
+        )
+        await writer.execute(
+            update(inputs)
+            .where(inputs.c.id == unowned)
+            .values(prepare_owner=None, created=time.time())
+        )
+        await writer.execute(
+            update(work).where(work.c.id == identity).values(state="waiting_external")
+        )
+    before = await repository.get(identity)
+    with capture_sql(database) as statements:
+        original_encode = work_repository.encode_json
+
+        def encode_prepared(payload):
+            assert not any(sql.upper() == "BEGIN IMMEDIATE" for sql, _ in statements)
+            return original_encode(payload)
+
+        monkeypatch.setattr(work_repository, "encode_json", encode_prepared)
+        await repository.repair_abandoned_inputs("current-process")
+    writer_start = next(
+        index for index, (sql, _) in enumerate(statements) if sql.upper() == "BEGIN IMMEDIATE"
+    )
+    assert any("chat_events.content" in sql for sql, _ in statements[:writer_start])
+    assert not any("chat_events.content" in sql for sql, _ in statements[writer_start:])
+    first_write = next(
+        index for index, (sql, _) in enumerate(statements) if sql.startswith("UPDATE")
+    )
+    assert not any(sql.lstrip().upper().startswith("SELECT") for sql, _ in statements[first_write:])
+    async with database.sessions() as reader:
+        rows = {row["id"]: row for row in (await reader.execute(select(inputs))).mappings()}
+    for input_id in repaired[:2]:
+        assert rows[input_id]["ready"]
+        assert json.loads(rows[input_id]["payload_json"])["text"].endswith("original text")
+    assert rows[repaired[2]]["state"] == "cancelled"
+    assert not rows[unowned]["ready"] and rows[unowned]["state"] == "pending"
+    after = await repository.get(identity)
+    assert after["revision"] == before["revision"] + 1 and after["state"] == "queued"
+    await repository.repair_abandoned_inputs("current-process")
+    assert await repository.get(identity) == after
+
+
+async def test_due_wait_after_unchanged_first_page_delivers_to_original_work(
+    database, tmp_path, monkeypatch
+):
+    from uuid import UUID
+
+    from sqlalchemy import update
+
+    from qq_ai_bot.runtime import work_wait
+    from qq_ai_bot.runtime.work_wait_schema import waits
+
+    repository, lease, control = await _running_work(database, tmp_path)
+    wait_ids = iter(UUID(int=index + 1, version=4) for index in range(129))
+    monkeypatch.setattr(work_wait, "uuid4", lambda: next(wait_ids))
+    waiting_work = []
+    for index in range(129):
+        row = await repository.accept(
+            lease,
+            source_key=f"paged-wait:{index}",
+            source=control.source,
+            goal=f"continue original work {index}",
+            initial_state="queued",
+        )
+        binding = await WorkWaitRepository(repository).register(
+            lease,
+            work_id=row["id"],
+            source=control.source,
+            call_key=f"paged-wait-call:{index}",
+            mode="any",
+            conditions=[{"kind": "time_due", "after_seconds": 0 if index == 128 else 86400}],
+            deadline_at=None,
+        )
+        waiting_work.append(row["id"])
+    tail_work = waiting_work[-1]
+    async with database.immediate_session() as writer:
+        # Equal creation times exercise the ID component of the page cursor.
+        await writer.execute(update(waits).values(created=0))
+        await writer.execute(
+            update(work)
+            .where(work.c.id.in_(waiting_work))
+            .values(state="waiting_external")
+        )
+    due = binding["conditions"][0]["due"]
+    reader = WorkWaitRepository(repository)
+    assert await reader.deliver_due(now=due) == 1
+    async with database.sessions() as session:
+        bindings = (
+            await session.execute(select(waits).order_by(waits.c.created, waits.c.id))
+        ).mappings().all()
+        states = dict(
+            (
+                await session.execute(
+                    select(work.c.id, work.c.state).where(work.c.id.in_(waiting_work))
+                )
+            )
+            .tuples()
+            .all()
+        )
+    assert [row["work_id"] for row in bindings] == waiting_work
+    assert all(row["status"] == "active" for row in bindings[:-1])
+    assert all(json.loads(row["conditions_json"])[0]["matched"] is None for row in bindings[:-1])
+    assert bindings[-1]["status"] == "delivered"
+    assert states[tail_work] == "queued"
+    assert all(states[identity] == "waiting_external" for identity in waiting_work[:-1])
+    pending = await repository.pending(lease, work_id=tail_work)
+    assert len(pending) == 1 and pending[0]["ready"]
+    signal = json.loads(json.loads(pending[0]["payload_json"])["text"])
+    assert signal["wait_id"] == binding["id"] and signal["reason"] == "signal"
+    assert signal["conditions"][0]["matched"]["due"] == due
+    assert await reader.deliver_due(now=due) == 0
+    assert await repository.pending(lease, work_id=tail_work) == pending

@@ -183,10 +183,23 @@ class AutomationCreatorIdentity(StrictModel):
     kind: Literal["person", "self"] = "person"
 
 
+class AutomationDirectoryRecord(StrictModel):
+    """The fields consumed by ordinary automation list/get."""
+
+    id: int
+    creator_kind: Literal["person", "self"] = "person"
+    creator_user_id: str
+    canonical_creator_person_id: str | None
+    name: str
+    status: AutomationStatus
+    timezone: str
+    next_run_at: datetime | None
+
+
 class AutomationDirectoryEntry(StrictModel):
     """One task and its creator as returned by the global directory."""
 
-    record: AutomationRecord
+    record: AutomationRecord | AutomationDirectoryRecord
     creator: AutomationCreatorIdentity
 
 

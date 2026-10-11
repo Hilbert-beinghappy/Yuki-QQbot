@@ -2,19 +2,19 @@
 
 from __future__ import annotations
 
+import json
+from collections.abc import Mapping
 from dataclasses import dataclass
 
-from sqlalchemy import select
+from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from qq_ai_bot.domain.identity import AuthorKind
 from qq_ai_bot.identity.canonical_repository import (
     IDENTITY_PLATFORM,
     external_id,
-    find_identity_binding,
-    find_presence,
 )
-from qq_ai_bot.identity.db_models import CanonicalPersonModel, PresenceModel
+from qq_ai_bot.identity.db_models import CanonicalPersonModel, IdentityBindingModel, PresenceModel
 from qq_ai_bot.identity.errors import CanonicalIdentityError
 from qq_ai_bot.identity.write_settings import identity_write_settings
 
@@ -49,23 +49,78 @@ async def project_event_author(
     if event_kind == "external_event" or direction == "external":
         return EventAuthorProjection(AuthorKind.SYSTEM.value, None, None)
     sender_id = external_id(sender_user_id)
-    presence = await find_presence(session, sender_id)
-    binding = await find_identity_binding(session, sender_id)
-    if presence is not None and binding is not None:
-        raise CanonicalIdentityError("canonical_kind_mismatch")
-    if presence is not None:
-        return EventAuthorProjection(AuthorKind.YUKI.value, None, presence.id)
+    return (
+        await project_event_authors(
+            session, sender_user_ids=(sender_id,), sender_is_bot=sender_is_bot
+        )
+    )[sender_id]
+
+
+async def project_event_authors(
+    session: AsyncSession,
+    *,
+    sender_user_ids: tuple[str, ...],
+    sender_is_bot: bool = False,
+) -> dict[str, EventAuthorProjection]:
+    """Project the requested accounts together using the same canonical rules."""
+
+    accounts = tuple(dict.fromkeys(external_id(item) for item in sender_user_ids))
+    if not accounts:
+        return {}
+    values = func.json_each(json.dumps(accounts)).table_valued("value")
+    selected = select(values.c.value)
+    presences = {
+        account: presence_id
+        for account, presence_id in (
+            await session.execute(
+                select(PresenceModel.external_account_id, PresenceModel.id).where(
+                    PresenceModel.platform == IDENTITY_PLATFORM,
+                    PresenceModel.external_account_id.in_(selected),
+                )
+            )
+        ).all()
+    }
+    bindings = {
+        row.external_account_id: row
+        for row in (
+            await session.execute(
+                select(
+                    IdentityBindingModel.external_account_id,
+                    IdentityBindingModel.person_id,
+                    IdentityBindingModel.status,
+                    CanonicalPersonModel.enabled,
+                )
+                .outerjoin(
+                    CanonicalPersonModel, CanonicalPersonModel.id == IdentityBindingModel.person_id
+                )
+                .where(
+                    IdentityBindingModel.platform == IDENTITY_PLATFORM,
+                    IdentityBindingModel.external_account_id.in_(selected),
+                )
+            )
+        ).all()
+    }
     settings = identity_write_settings()
-    if sender_is_bot or sender_id in settings.ignored_bot_users:
-        return EventAuthorProjection(AuthorKind.EXTERNAL_BOT.value, None, None)
-    if binding is not None and binding.status == "active":
-        person = await session.get(CanonicalPersonModel, binding.person_id)
-        if person is None:
-            raise CanonicalIdentityError("unclassified")
-        if not person.enabled:
-            raise CanonicalIdentityError("canonical_owner_disabled")
-        return EventAuthorProjection(AuthorKind.PERSON.value, person.id, None)
-    return EventAuthorProjection(AuthorKind.PERSON.value, None, None)
+    authors: dict[str, EventAuthorProjection] = {}
+    for sender_id in accounts:
+        presence_id = presences.get(sender_id)
+        binding = bindings.get(sender_id)
+        if presence_id is not None and binding is not None:
+            raise CanonicalIdentityError("canonical_kind_mismatch")
+        if presence_id is not None:
+            author = EventAuthorProjection(AuthorKind.YUKI.value, None, presence_id)
+        elif sender_is_bot or sender_id in settings.ignored_bot_users:
+            author = EventAuthorProjection(AuthorKind.EXTERNAL_BOT.value, None, None)
+        elif binding is not None and binding.status == "active":
+            if binding.enabled is None:
+                raise CanonicalIdentityError("unclassified")
+            if not binding.enabled:
+                raise CanonicalIdentityError("canonical_owner_disabled")
+            author = EventAuthorProjection(AuthorKind.PERSON.value, binding.person_id, None)
+        else:
+            author = EventAuthorProjection(AuthorKind.PERSON.value, None, None)
+        authors[sender_id] = author
+    return authors
 
 
 async def same_platform_presence_external_ids(session: AsyncSession) -> frozenset[str]:
@@ -84,24 +139,29 @@ async def canonical_person_reference_ids(
     user_ids: tuple[str, ...],
     *,
     speaker_user_id: str,
+    authors: Mapping[str, EventAuthorProjection] | None = None,
 ) -> tuple[str, ...]:
     """Keep one Binding representative per Person. Drop Yuki/external/unbound."""
 
+    candidates = tuple(
+        dict.fromkeys(
+            str(raw).strip()
+            for raw in user_ids
+            if str(raw).strip() and str(raw).strip() != speaker_user_id
+        )
+    )
+    if authors is None:
+        authors = await project_event_authors(session, sender_user_ids=candidates)
     seen_persons: set[str] = set()
     kept: list[str] = []
-    for raw in user_ids:
-        user_id = str(raw).strip()
-        if not user_id or user_id == speaker_user_id:
-            continue
-        author = await project_event_author(session, sender_user_id=user_id)
+    for user_id in candidates:
+        author = authors[user_id]
         if author.author_kind != AuthorKind.PERSON.value or author.author_person_id is None:
             continue
         if author.author_person_id in seen_persons:
             continue
         seen_persons.add(author.author_person_id)
         kept.append(user_id)
-        if len(kept) >= 5:
-            break
     return tuple(kept)
 
 
@@ -115,5 +175,6 @@ __all__ = [
     "canonical_account_is_person",
     "canonical_person_reference_ids",
     "project_event_author",
+    "project_event_authors",
     "same_platform_presence_external_ids",
 ]

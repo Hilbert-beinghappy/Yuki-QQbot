@@ -1378,7 +1378,6 @@ class RuntimeConfigService:
             ),
             memory=MemoryRetrievalRuntimeConfig(
                 retrieval_enabled=bool(value("memory.retrieval_enabled")),
-                max_referenced_targets=int(cast(int, value("memory.max_referenced_targets"))),
                 self_enabled=self._settings.self_memory_enabled,
                 lexical_candidate_limit=int(cast(int, value("memory.lexical_candidate_limit"))),
                 context_limit_per_entity=int(cast(int, value("memory.context_limit_per_entity"))),

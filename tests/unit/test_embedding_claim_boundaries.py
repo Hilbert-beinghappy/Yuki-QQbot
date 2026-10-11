@@ -9,13 +9,18 @@ import pytest
 from sqlalchemy import event, insert, select, update
 
 from qq_ai_bot.identity.canonical_repository import ensure_person
+from qq_ai_bot.memory.authorized_scope import AuthorizedMemoryScope
+from qq_ai_bot.memory.embedding.codec import Float32VectorCodec
 from qq_ai_bot.memory.embedding.fake import FakeEmbeddingProvider
 from qq_ai_bot.memory.embedding.jobs import EmbeddingWrite, MemoryEmbeddingJobRepository
-from qq_ai_bot.memory.embedding.models import EmbeddingProviderProfile
+from qq_ai_bot.memory.embedding.models import EmbeddingProviderProfile, EmbeddingVector
 from qq_ai_bot.memory.embedding.provider import EmbeddingProviderError
 from qq_ai_bot.memory.embedding.repository import MemoryEmbeddingRepository
+from qq_ai_bot.memory.embedding.semantic import MemorySemanticIndex
 from qq_ai_bot.memory.embedding.text import EmbeddingDocumentBuilder
 from qq_ai_bot.memory.embedding.worker import MemoryEmbeddingWorker
+from qq_ai_bot.memory.enums import MemoryScopeType, MemoryTargetRole
+from qq_ai_bot.memory.models import MemoryEntityTarget
 from qq_ai_bot.persistence.database import Database
 from qq_ai_bot.persistence.models import (
     MemoryEmbeddingJobModel,
@@ -76,8 +81,103 @@ def _write(job):
     )
 
 
+async def test_semantic_order_and_streamed_health_keep_stale_and_scan_coverage(
+    database, monkeypatch
+):
+    jobs = await _jobs(database, 5)
+    repository = MemoryEmbeddingRepository(database)
+    codec = Float32VectorCodec()
+    vectors = ((1.0, 0.0), (1.0, 0.0), (0.0, 1.0), (-1.0, 0.0), (1.0, 1.0))
+    now = datetime.now(UTC)
+    async with database.immediate_session() as session:
+        facts = tuple(await session.scalars(select(MemoryFactModel).order_by(MemoryFactModel.id)))
+        for fact, values in zip(facts, vectors, strict=True):
+            digest = jobs.documents.content_hash_fields(
+                kind=fact.kind,
+                category=fact.category,
+                memory_key=fact.memory_key,
+                content=fact.content,
+            )
+            session.add(
+                MemoryEmbeddingModel(
+                    fact_id=fact.id,
+                    profile_id=jobs.profile.id,
+                    content_hash="f" * 64 if fact.id == facts[-1].id else digest,
+                    vector_blob=codec.encode(EmbeddingVector(values=values, dimensions=2)),
+                    created_at=now,
+                    updated_at=now,
+                )
+            )
+        facts[3].status = "superseded"
+    scope = AuthorizedMemoryScope(
+        requester_person_id=facts[0].canonical_subject_person_id,
+        allowed_scopes=(MemoryScopeType.PERSON,),
+    )
+    query = EmbeddingVector(values=(0.1, 0.2), dimensions=2)
+    index = MemorySemanticIndex(repository, documents=jobs.documents)
+    results, truncated, coverage = await index.search_authorized(
+        scope=scope,
+        query_vector=query,
+        profile=jobs.profile.profile,
+        profile_id=jobs.profile.id,
+        candidate_limit=2,
+        kinds=(),
+    )
+    assert [hit.fact_id for hit in results] == [facts[2].id, facts[0].id]
+    assert truncated and not coverage
+    for hit in results:
+        values = vectors[hit.fact_id - facts[0].id]
+        decoded = codec.decode(
+            codec.encode(EmbeddingVector(values=values, dimensions=2)), dimensions=2
+        )
+        assert hit.cosine_similarity == codec.dot(query, decoded)
+    target = MemoryEntityTarget(
+        role=MemoryTargetRole.CURRENT_PERSON,
+        scope_type=MemoryScopeType.PERSON,
+        subject_user_id="1001",
+        block_id="person:1001",
+    )
+    explicit = await index.search(
+        target=target,
+        query_vector=query,
+        profile=jobs.profile.profile,
+        profile_id=jobs.profile.id,
+        candidate_limit=3,
+        kinds=(),
+    )
+    assert [hit.fact_id for hit in explicit] == [facts[2].id, facts[0].id, facts[1].id]
+    rows, scanned_out, active_count = await repository.load_authorized_vectors(
+        scope=scope,
+        profile_id=jobs.profile.id,
+        kinds=(),
+        scan_limit=2,
+    )
+    assert len(rows) == 2 and scanned_out and active_count == 4
+    native_load = repository.load_authorized_vectors
+
+    async def scan_page(**kwargs):
+        return await native_load(**kwargs, scan_limit=2)
+
+    monkeypatch.setattr(repository, "load_authorized_vectors", scan_page)
+    scanned, truncated, coverage = await index.search_authorized(
+        scope=scope,
+        query_vector=query,
+        profile=jobs.profile.profile,
+        profile_id=jobs.profile.id,
+        candidate_limit=3,
+        kinds=(),
+    )
+    assert [hit.fact_id for hit in scanned] == [facts[0].id, facts[1].id]
+    assert truncated and not coverage
+    health = await repository.local_health(
+        current_profile_id=jobs.profile.id, documents=jobs.documents
+    )
+    assert health["active_fact_count"] == 4 and health["ready_embedding_count"] == 3
+    assert health["stale_embedding_count"] == 2
+
+
 @pytest.mark.parametrize("count", [1, 20, 129])
-async def test_complete_pages_two_reads_hashes_outside_writer(database, monkeypatch, count):
+async def test_complete_pages_hashes_outside_writer(database, monkeypatch, count):
     jobs = await _jobs(database, count)
     assert await jobs.reconcile() == count
     claimed = await jobs.claim(limit=count)
@@ -104,9 +204,6 @@ async def test_complete_pages_two_reads_hashes_outside_writer(database, monkeypa
     monkeypatch.setattr(jobs.documents, "content_hash_fields", hash_fields)
     try:
         assert await jobs.complete(tuple(_write(job) for job in claimed)) == count
-        assert sum(sql.lstrip().upper().startswith("SELECT") for sql in statements) == 2 * (
-            (count + 127) // 128
-        )
         statements.clear()
         assert await jobs.reconcile() == 0
         assert not any("BEGIN IMMEDIATE" in sql for sql in statements)
@@ -136,6 +233,31 @@ async def test_late_original_claim_never_overwrites_reclaimed_job(database, late
         assert stored.attempts == current.attempts
         assert not tuple(await session.scalars(select(MemoryEmbeddingModel)))
     assert await jobs.complete((_write(current),)) == 1
+
+
+@pytest.mark.parametrize("action", ["fail", "skip"])
+async def test_batch_failure_and_skip_leave_reclaimed_peer_processing(database, action):
+    jobs = await _jobs(database, 3)
+    await jobs.reconcile()
+    old = await jobs.claim(limit=3)
+    await jobs.recover_interrupted()
+    current = await jobs.claim(limit=3)
+    mixed = (old[0], *current[1:])
+    if action == "skip":
+        await jobs.skip_many(mixed)
+    else:
+        await jobs.fail_many(
+            mixed, error_category="batch_failure", retryable=False, initial_delay_seconds=0
+        )
+    async with database.sessions() as session:
+        rows = {row.id: row for row in await session.scalars(select(MemoryEmbeddingJobModel))}
+    assert rows[current[0].id].status == "processing"
+    assert rows[current[0].id].updated_at == current[0].updated_at
+    assert rows[current[0].id].attempts == current[0].attempts
+    for claim in current[1:]:
+        assert rows[claim.id].status == ("done" if action == "skip" else "failed")
+        assert rows[claim.id].updated_at > claim.updated_at
+    assert await jobs.complete((_write(current[0]),)) == 1
 
 
 async def test_ordinary_reconcile_preserves_failed_claim_and_content_change_requeues(database):

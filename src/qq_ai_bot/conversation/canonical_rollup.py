@@ -76,21 +76,16 @@ async def drain_rollup_signals(
         pending = (await session.execute(select(signals).limit(8))).mappings().all()
     for signal in pending:
         policy = config
-        if policy_for_scope is not None:
-            async with database.sessions() as session:
-                exists = await session.get(CanonicalConversationModel, signal["conversation_id"])
-                alias = (
-                    await require_primary_alias_for_conversation(session, signal["conversation_id"])
-                    if exists is not None
-                    else None
-                )
-            if alias is not None:
-                policy = await policy_for_scope(ConversationScope.parse(alias))
         async with database.sessions() as session:
             conversation = await session.get(CanonicalConversationModel, signal["conversation_id"])
             if conversation is None or conversation.generation != signal["generation"]:
                 needed = False
             else:
+                if policy_for_scope is not None:
+                    alias = await require_primary_alias_for_conversation(
+                        session, signal["conversation_id"]
+                    )
+                    policy = await policy_for_scope(ConversationScope.parse(alias))
                 needed = await _needs_rollup(session, conversation, policy)
         async with database.immediate_session() as session:
             removed = await session.execute(

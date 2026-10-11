@@ -867,8 +867,10 @@ class WorkSession:
 
         input_refs()
 
-        def encoded(candidate: dict[str, Any], cursor: list[int], extra: str | None = None) -> str:
-            candidate["source_refs"] = sorted(refs | ({extra} if extra else set()))
+        def encoded(
+            candidate: dict[str, Any], cursor: list[int], extra: set[str] | None = None
+        ) -> str:
+            candidate["source_refs"] = sorted(refs | (extra or set()))
             candidate["paging"] = {**paging, "next_cursor": cursor}
             return json.dumps(without_empty_records(candidate), ensure_ascii=False)
 
@@ -896,27 +898,66 @@ class WorkSession:
             else:
                 raise WorkCapacityError("work_compaction_source_capacity")
             input_refs()
-        while index < len(units):
+        if not offset and index < len(units):
+            start = index
+            base_page = page
+
+            def full_candidate(end: int) -> tuple[dict[str, Any], set[str]]:
+                candidate = dict(base_page)
+                for section in (
+                    "records",
+                    "record_source_indices",
+                    "model_observations",
+                    "effects",
+                ):
+                    candidate[section] = list(base_page[section])
+                added_refs = set()
+                for unit in units[start:end]:
+                    candidate[unit["kind"]].append(unit["value"])
+                    if unit["kind"] == "records":
+                        candidate["record_source_indices"].append(unit["index"])
+                    added_refs.add(unit["ref"])
+                return candidate, added_refs
+
+            # Complete units only add fields/refs and advance a decimal cursor;
+            # the actual fixed-template request accounting is monotone here.
+            width = 1
+            upper = min(start + width, len(units))
+            while True:
+                await asyncio.sleep(0)
+                candidate, added_refs = full_candidate(upper)
+                if not fits(encoded(candidate, [upper, 0], added_refs)):
+                    break
+                page = candidate
+                index = upper
+                if upper == len(units):
+                    break
+                width *= 2
+                upper = min(start + width, len(units))
+            low, high = index, upper - 1
+            while low < high:
+                await asyncio.sleep(0)
+                end = (low + high + 1) // 2
+                candidate, added_refs = full_candidate(end)
+                if fits(encoded(candidate, [end, 0], added_refs)):
+                    low = end
+                    page = candidate
+                else:
+                    high = end - 1
+            index = low
+            refs.update(unit["ref"] for unit in units[start:index])
+
+        if index < len(units):
             await asyncio.sleep(0)
             unit = units[index]
-            candidate = deepcopy(page)
-            if not offset:
-                candidate[unit["kind"]].append(unit["value"])
-                if unit["kind"] == "records":
-                    candidate["record_source_indices"].append(unit["index"])
-                if fits(encoded(candidate, [index + 1, 0], unit["ref"])):
-                    page = candidate
-                    refs.add(unit["ref"])
-                    index += 1
-                    continue
             # A large public record remains intact in the private source snapshot;
             # its JSON text is presented in ordered fragments under the original ref.
             text = json.dumps(unit["value"], ensure_ascii=False)
-            low, high = 0, len(text) - offset
-            while low < high:
-                count = (low + high + 1) // 2
-                candidate = deepcopy(page)
-                candidate.setdefault("source_fragments", []).append(
+
+            def fragment_candidate(count: int) -> tuple[dict[str, Any], list[int]]:
+                candidate = dict(page)
+                candidate["source_fragments"] = [
+                    *page.get("source_fragments", []),
                     {
                         "ref": unit["ref"],
                         "kind": unit["kind"],
@@ -924,13 +965,26 @@ class WorkSession:
                         "offset": offset,
                         "total_characters": len(text),
                         "text": text[offset : offset + count],
-                    }
-                )
+                    },
+                ]
                 cursor = [index + 1, 0] if offset + count == len(text) else [index, offset + count]
-                if fits(encoded(candidate, cursor, unit["ref"])):
-                    low = count
-                else:
-                    high = count - 1
+                return candidate, cursor
+
+            remaining = len(text) - offset
+            candidate, cursor = fragment_candidate(remaining)
+            if fits(encoded(candidate, cursor, {unit["ref"]})):
+                low = remaining
+            else:
+                # Finishing resets offset to zero, which can shorten metadata.
+                # Probe that endpoint separately; partial cursors only grow.
+                low, high = 0, remaining - 1
+                while low < high:
+                    count = (low + high + 1) // 2
+                    candidate, cursor = fragment_candidate(count)
+                    if fits(encoded(candidate, cursor, {unit["ref"]})):
+                        low = count
+                    else:
+                        high = count - 1
             if not low:
                 if (
                     page["records"]
@@ -938,7 +992,8 @@ class WorkSession:
                     or page["effects"]
                     or page.get("source_fragments")
                 ):
-                    break
+                    encoded(page, [index, offset])
+                    return without_empty_records(page)
                 raise WorkCapacityError("work_compaction_source_capacity")
             page.setdefault("source_fragments", []).append(
                 {
@@ -955,7 +1010,6 @@ class WorkSession:
             if offset == len(text):
                 index += 1
                 offset = 0
-            break
         encoded(page, [index, offset])
         return without_empty_records(page)
 

@@ -185,12 +185,15 @@ class SubagentRepository:
         now = time.time()
         cutoff = now - 7 * 86400
 
-        def expired_query() -> Select[tuple[str]]:
-            tree = rooted_tree()
+        def expired_query(root_ids: list[str] | None = None) -> Select[Any]:
+            conditions = [work.c.state.in_(TERMINAL), work.c.updated < cutoff]
+            if root_ids is not None:
+                conditions.append(work.c.id.in_(root_ids))
+            tree = rooted_tree(*conditions)
             root = work.alias("archive_root")
             retained = tree.alias("retained_tree")
             return (
-                select(children.c.work_id)
+                select(children.c.work_id, tree.c.root_id)
                 .join(work, work.c.id == children.c.work_id)
                 .join(tree, tree.c.work_id == work.c.id)
                 .join(root, root.c.id == tree.c.root_id)
@@ -212,12 +215,17 @@ class SubagentRepository:
         # Most passes have nothing to archive. Scan before reserving SQLite's
         # single writer, then check eligibility again after acquiring it.
         async with self.database.sessions() as session:
-            candidates = list(await session.scalars(expired_query()))
+            candidates = (await session.execute(expired_query())).all()
         if not candidates:
             return
+        root_ids = list({root_id for _, root_id in candidates})
         async with self.database.immediate_session() as session:
             expired = list(
-                await session.scalars(expired_query().where(children.c.work_id.in_(candidates)))
+                await session.scalars(
+                    expired_query(root_ids).where(
+                        children.c.work_id.in_([identity for identity, _ in candidates])
+                    )
+                )
             )
             if not expired:
                 return
@@ -237,7 +245,7 @@ class SubagentRepository:
                 .where(work.c.id.in_(expired))
                 .values(checkpoint_json="{}", source_json="{}")
             )
-            tree = rooted_tree()
+            tree = rooted_tree(work.c.id.in_(root_ids))
             expired_roots = list(
                 await session.scalars(
                     select(work.c.id).where(

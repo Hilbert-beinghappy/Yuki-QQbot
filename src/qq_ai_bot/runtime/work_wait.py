@@ -14,7 +14,7 @@ from datetime import datetime
 from typing import Any
 from uuid import uuid4
 
-from sqlalchemy import func, select, update
+from sqlalchemy import and_, func, literal, select, tuple_, update
 from sqlalchemy.dialects.sqlite import insert
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -26,7 +26,6 @@ from qq_ai_bot.plugin_host.db_models import (
 )
 from qq_ai_bot.runtime.work_repository import WorkConflict, WorkLease, WorkRepository, encode_json
 from qq_ai_bot.runtime.work_schema_v1 import inputs, work
-from qq_ai_bot.runtime.work_tree import descendants
 from qq_ai_bot.runtime.work_wait_schema import waits
 
 
@@ -307,16 +306,28 @@ class WorkWaitRepository:
         reason: str,
         now: float,
     ) -> int | None:
-        original = (
-            (await session.execute(select(work).where(work.c.id == binding["work_id"])))
-            .mappings()
-            .first()
-        )
-        conversation = await session.get(CanonicalConversationModel, binding["conversation_id"])
+        original: Any
+        if "work_source_json" in binding:
+            original = {
+                "generation": binding["work_generation"],
+                "state": binding["work_state"],
+                "source_json": binding["work_source_json"],
+            }
+            current_generation = binding["current_generation"]
+        else:
+            original = (
+                (await session.execute(select(work).where(work.c.id == binding["work_id"])))
+                .mappings()
+                .first()
+            )
+            current_generation = await session.scalar(
+                select(CanonicalConversationModel.generation).where(
+                    CanonicalConversationModel.id == binding["conversation_id"]
+                )
+            )
         if (
             original is None
-            or conversation is None
-            or conversation.generation != binding["generation"]
+            or current_generation != binding["generation"]
             or original["generation"] != binding["generation"]
             or original["state"] in {"completed", "failed", "cancelled"}
         ):
@@ -607,10 +618,20 @@ class WorkWaitRepository:
     def _due_query() -> Any:
         return (
             select(
-                waits,
+                waits.c.id,
+                waits.c.work_id,
+                waits.c.conversation_id,
+                waits.c.generation,
+                waits.c.principal_kind,
+                waits.c.principal_id,
+                waits.c.mode,
+                waits.c.conditions_json,
+                waits.c.deadline,
+                waits.c.created,
                 CanonicalConversationModel.generation.label("current_generation"),
                 work.c.generation.label("work_generation"),
                 work.c.state.label("work_state"),
+                work.c.source_json.label("work_source_json"),
             )
             .select_from(
                 waits.outerjoin(
@@ -622,19 +643,18 @@ class WorkWaitRepository:
         )
 
     @staticmethod
-    async def _observe_due(
-        session: AsyncSession, binding: Any, now: float
+    def _observe_due(
+        binding: Any,
+        conditions: list[dict[str, Any]],
+        states: dict[tuple[str, str], str],
+        now: float,
     ) -> tuple[list[dict[str, Any]], str] | None:
-        """Read current facts; this same observation is repeated under the writer."""
-        from qq_ai_bot.sandbox.db_models import SandboxTaskRunModel
-
         if (
             binding["current_generation"] != binding["generation"]
             or binding["work_generation"] != binding["generation"]
             or binding["work_state"] in {None, "completed", "failed", "cancelled"}
         ):
             return [], "invalidated"
-        conditions = json.loads(binding["conditions_json"])
         for condition in conditions:
             if isinstance(condition.get("matched"), dict):
                 condition["matched"].pop("text", None)
@@ -650,25 +670,7 @@ class WorkWaitRepository:
                 }
                 changed = True
             elif condition["kind"] == "owned_run":
-                state = await session.scalar(
-                    select(work.c.state).where(
-                        work.c.id.in_(descendants(binding["work_id"])),
-                        work.c.id == condition["run_id"],
-                    )
-                )
-                if state is None:
-                    task = await session.scalar(
-                        select(SandboxTaskRunModel).where(
-                            SandboxTaskRunModel.run_id == condition["run_id"],
-                            func.json_extract(SandboxTaskRunModel.source_json, "$.work_id").in_(
-                                descendants(binding["work_id"], include_self=True)
-                            ),
-                        )
-                    )
-                    if task:
-                        state = task.status
-                        if state == "completed" and task.completion_json:
-                            state = json.loads(task.completion_json).get("status", state)
+                state = states.get((binding["work_id"], condition["run_id"]))
                 if state in {
                     "completed",
                     "succeeded",
@@ -693,6 +695,88 @@ class WorkWaitRepository:
             return conditions, "deadline" if expired and not done else "signal"
         return (conditions, "partial") if changed else None
 
+    @classmethod
+    async def _observe_page(
+        cls, session: AsyncSession, bindings: Any, now: float
+    ) -> list[tuple[Any, tuple[list[dict[str, Any]], str] | None]]:
+        """Expand each owning subtree once for this page's requested runs."""
+        from qq_ai_bot.sandbox.db_models import SandboxTaskRunModel
+
+        conditions = {row["id"]: json.loads(row["conditions_json"]) for row in bindings}
+        requested_pairs = {
+            (row["work_id"], condition["run_id"])
+            for row in bindings
+            if row["current_generation"] == row["generation"]
+            and row["work_generation"] == row["generation"]
+            and row["work_state"] not in {None, "completed", "failed", "cancelled"}
+            for condition in conditions[row["id"]]
+            if condition["kind"] == "owned_run" and condition["matched"] is None
+        }
+        states: dict[tuple[str, str], str] = {}
+        if requested_pairs:
+            records = func.json_each(
+                encode_json([{"owner": owner, "run": run} for owner, run in requested_pairs])
+            ).table_valued("value")
+            requested = select(
+                func.json_extract(records.c.value, "$.owner").label("owner_id"),
+                func.json_extract(records.c.value, "$.run").label("run_id"),
+            ).cte("requested_runs")
+            tree = (
+                select(work.c.id.label("work_id"), work.c.id.label("owner_id"))
+                .where(work.c.id.in_(select(requested.c.owner_id)))
+                .cte("owned_tree", recursive=True)
+            )
+            child = work.alias("owned_child")
+            tree = tree.union_all(
+                select(child.c.id, tree.c.owner_id).join(
+                    tree, child.c.parent_work_id == tree.c.work_id
+                )
+            )
+            owned_work = (
+                select(
+                    requested.c.owner_id,
+                    requested.c.run_id,
+                    work.c.state,
+                    literal(None).label("completion_json"),
+                    literal(False).label("sandbox"),
+                )
+                .select_from(requested.join(tree, tree.c.owner_id == requested.c.owner_id))
+                .join(work, work.c.id == tree.c.work_id)
+                .where(work.c.id == requested.c.run_id, tree.c.work_id != tree.c.owner_id)
+            )
+            owned_sandbox = select(
+                requested.c.owner_id,
+                requested.c.run_id,
+                SandboxTaskRunModel.status,
+                SandboxTaskRunModel.completion_json,
+                literal(True),
+            ).select_from(
+                requested.join(
+                    SandboxTaskRunModel, SandboxTaskRunModel.run_id == requested.c.run_id
+                ).join(
+                    tree,
+                    and_(
+                        tree.c.owner_id == requested.c.owner_id,
+                        tree.c.work_id
+                        == func.json_extract(SandboxTaskRunModel.source_json, "$.work_id"),
+                    ),
+                )
+            )
+            rows = (await session.execute(owned_work.union_all(owned_sandbox))).all()
+            work_states = {
+                (owner, run): state for owner, run, state, _, sandbox in rows if not sandbox
+            }
+            states.update(work_states)
+            for owner, run, state, completion, sandbox in rows:
+                if not sandbox or (owner, run) in work_states:
+                    continue
+                if state == "completed" and completion:
+                    state = json.loads(completion).get("status", state)
+                states[owner, run] = state
+        return [
+            (row, cls._observe_due(row, conditions[row["id"]], states, now)) for row in bindings
+        ]
+
     async def deliver_due(self, now: float | None = None) -> int:
         """Discover changed waits read-only; recheck a bounded batch before writing."""
         observed_at = time.time() if now is None else now
@@ -703,14 +787,13 @@ class WorkWaitRepository:
                 query = self._due_query().order_by(waits.c.created, waits.c.id).limit(128)
                 if cursor is not None:
                     query = query.where(
-                        (waits.c.created > cursor[0])
-                        | ((waits.c.created == cursor[0]) & (waits.c.id > cursor[1]))
+                        tuple_(waits.c.created, waits.c.id) > cursor
                     )
                 rows = (await discovery.execute(query)).mappings().all()
                 if not rows:
                     break
-                for binding in rows:
-                    if await self._observe_due(discovery, binding, observed_at) is not None:
+                for binding, observation in await self._observe_page(discovery, rows, observed_at):
+                    if observation is not None:
                         candidates.append(binding["id"])
                         if len(candidates) == 128:
                             break
@@ -735,8 +818,7 @@ class WorkWaitRepository:
                 .mappings()
                 .all()
             )
-            for binding in rows:
-                observation = await self._observe_due(session, binding, current)
+            for binding, observation in await self._observe_page(session, rows, current):
                 if observation is None:
                     continue
                 conditions, reason = observation

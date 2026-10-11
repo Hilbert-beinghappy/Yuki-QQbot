@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+from heapq import nsmallest
 
 from qq_ai_bot.memory.authorized_scope import AuthorizedMemoryScope
 from qq_ai_bot.memory.embedding.codec import Float32VectorCodec
@@ -61,6 +62,7 @@ class MemorySemanticIndex:
         )
         scored: list[tuple[int, float]] = []
         stale_count = 0
+        normalized_query = None
         for row in rows:
             current_hash = self._documents.content_hash_fields(
                 kind=row.kind,
@@ -72,15 +74,17 @@ class MemorySemanticIndex:
                 stale_count += 1
                 continue
             vector = self._codec.decode(row.vector_blob, dimensions=profile.dimensions)
-            similarity = self._codec.dot(query_vector, vector)
+            if normalized_query is None:
+                normalized_query = self._codec.normalize(query_vector)
+            similarity = self._codec.dot_normalized(normalized_query, self._codec.normalize(vector))
             scored.append((row.fact_id, similarity))
-        scored.sort(key=lambda item: (-item[1], item[0]))
+        selected = nsmallest(candidate_limit, scored, key=lambda item: (-item[1], item[0]))
         truncated = scan_truncated or len(scored) > candidate_limit
         coverage_complete = not scan_truncated and not stale_count and len(rows) == active_count
         return (
             tuple(
                 AuthorizedSemanticCandidate(fact_id, similarity, rank)
-                for rank, (fact_id, similarity) in enumerate(scored[:candidate_limit], start=1)
+                for rank, (fact_id, similarity) in enumerate(selected, start=1)
             ),
             truncated,
             coverage_complete,
@@ -104,6 +108,7 @@ class MemorySemanticIndex:
             temporal=temporal,
         )
         scored: list[tuple[int, float]] = []
+        normalized_query = None
         for row in rows:
             current_hash = self._documents.content_hash_fields(
                 kind=row.kind,
@@ -114,9 +119,11 @@ class MemorySemanticIndex:
             if row.content_hash != current_hash:
                 continue
             vector = self._codec.decode(row.vector_blob, dimensions=profile.dimensions)
-            similarity = self._codec.dot(query_vector, vector)
+            if normalized_query is None:
+                normalized_query = self._codec.normalize(query_vector)
+            similarity = self._codec.dot_normalized(normalized_query, self._codec.normalize(vector))
             scored.append((row.fact_id, similarity))
-        scored.sort(key=lambda item: (-item[1], item[0]))
+        selected = nsmallest(candidate_limit, scored, key=lambda item: (-item[1], item[0]))
         return tuple(
             MemorySemanticCandidate(
                 fact_id=fact_id,
@@ -124,5 +131,5 @@ class MemorySemanticIndex:
                 cosine_similarity=similarity,
                 semantic_rank=rank,
             )
-            for rank, (fact_id, similarity) in enumerate(scored[:candidate_limit], start=1)
+            for rank, (fact_id, similarity) in enumerate(selected, start=1)
         )

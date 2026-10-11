@@ -3,16 +3,17 @@
 from __future__ import annotations
 
 import asyncio
-from datetime import datetime, timedelta, tzinfo
+from datetime import UTC, datetime, timedelta, tzinfo
 from typing import Any
 
 import pytest
-from sqlalchemy import func, select
+from sqlalchemy import func, select, text
 from tests.conftest import make_settings
 from tests.support.model_executor import InjectedModelExecutor
 from tests.unit.test_memory_mutation import _service
 from tests.unit.test_memory_v2 import _append_event, _claim
 
+from qq_ai_bot.conversation.canonical_db_models import CanonicalConversationModel
 from qq_ai_bot.domain.messages import ChatRequest, ChatResponse
 from qq_ai_bot.llm.base import LLMProvider
 from qq_ai_bot.memory.claim_processor import MemoryProcessingContext
@@ -25,6 +26,7 @@ from qq_ai_bot.memory.service import MemoryFactService
 from qq_ai_bot.memory.worker import MemoryWorker
 from qq_ai_bot.persistence.database import Database
 from qq_ai_bot.persistence.models import (
+    ChatEventModel,
     MemoryClaimCandidateModel,
     MemoryFactModel,
     MemoryJobModel,
@@ -38,6 +40,78 @@ class _ReclaimTime(datetime):
     @classmethod
     def now(cls, tz: tzinfo | None = None) -> datetime:
         return datetime.now(tz) + timedelta(minutes=6)
+
+
+async def test_queue_health_preserves_owner_waiting_stale_and_failure_categories(
+    database,
+    monkeypatch,
+):
+    clock = datetime.now(UTC)
+
+    class FixedClock(datetime):
+        @classmethod
+        def now(cls, tz=None):
+            return clock
+
+    monkeypatch.setattr("qq_ai_bot.memory.repository.datetime", FixedClock)
+    ledger = EventLedgerRepository(database)
+    events = [
+        await _append_event(
+            ledger,
+            message_id=f"health:{index}",
+            user_id="2002" if index == 2 else "1001",
+            content="abc",
+            group_id="3001" if index in (3, 4) else None,
+        )
+        for index in range(10)
+    ]
+    jobs = MemoryJobRepository(database)
+    category = "x" * 64
+    async with database.immediate_session() as session:
+        await session.execute(text("PRAGMA ignore_check_constraints=ON"))
+        try:
+            for index, event in enumerate(events):
+                owner = await session.get(ChatEventModel, event.id)
+                conversation = await session.get(
+                    CanonicalConversationModel, owner.canonical_conversation_id
+                )
+                session.add(
+                    MemoryJobModel(
+                        event_id=event.id,
+                        conversation_key=event.scope.key,
+                        canonical_person_id=conversation.person_id if index != 8 else None,
+                        canonical_space_id=conversation.space_id if index != 8 else None,
+                        status="processing"
+                        if index in (3, 4)
+                        else "failed"
+                        if index in (6, 7)
+                        else "done"
+                        if index == 9
+                        else "pending",
+                        attempts=int(index == 2),
+                        next_attempt_at=clock + timedelta(hours=1) if index == 5 else clock,
+                        created_at=clock - timedelta(hours=4)
+                        if index == 8
+                        else clock - timedelta(minutes=2),
+                        updated_at=clock - timedelta(minutes=6) if index == 3 else clock,
+                        error_category=category + str(index) if index in (6, 7) else None,
+                    )
+                )
+            await session.flush()
+        finally:
+            await session.execute(text("PRAGMA ignore_check_constraints=OFF"))
+    assert await jobs.batch_health(trigger_count=3, max_characters=1000, max_wait_seconds=3600) == {
+        "pending_events": 5,
+        "processing_events": 2,
+        "failed_events": 2,
+        "stale_processing_events": 1,
+        "oldest_open_age_seconds": 14400,
+        "ready_owner_count": 2,
+        "waiting_owner_count": 1,
+        "normal_waiting_is_blocked": False,
+        "invalid_owner_count": 1,
+        "failure_categories": {category: 2},
+    }
 
 
 async def _reclaim(jobs: MemoryJobRepository, monkeypatch: pytest.MonkeyPatch) -> MemoryJob:

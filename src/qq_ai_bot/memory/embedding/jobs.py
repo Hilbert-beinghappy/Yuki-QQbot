@@ -204,13 +204,17 @@ class MemoryEmbeddingJobRepository:
         return bool(await self._enqueue_prepared(rows, force=force))
 
     async def enqueue_facts(
-        self, fact_ids: tuple[int, ...], *, only_if_latest_profile: bool = False
+        self,
+        fact_ids: tuple[int, ...],
+        *,
+        force: bool = False,
+        only_if_latest_profile: bool = False,
     ) -> int:
         created = 0
         for offset in range(0, len(fact_ids), 128):
             rows = await self._prepare_page(ids=fact_ids[offset : offset + 128])
             created += await self._enqueue_prepared(
-                rows, only_if_latest_profile=only_if_latest_profile
+                rows, force=force, only_if_latest_profile=only_if_latest_profile
             )
         return created
 
@@ -465,14 +469,21 @@ class MemoryEmbeddingJobRepository:
         return len(vectors)
 
     async def skip(self, job: MemoryEmbeddingJob) -> None:
-        async with self._database.immediate_session() as writer:
-            await writer.execute(
-                update(MemoryEmbeddingJobModel)
-                .where(*self._claim_guard(job))
-                .values(
-                    status="done", updated_at=next_updated_at(job.updated_at), error_category=None
-                )
-            )
+        await self.skip_many((job,))
+
+    async def skip_many(self, jobs: tuple[MemoryEmbeddingJob, ...]) -> None:
+        for offset in range(0, len(jobs), 128):
+            async with self._database.immediate_session() as writer:
+                for job in jobs[offset : offset + 128]:
+                    await writer.execute(
+                        update(MemoryEmbeddingJobModel)
+                        .where(*self._claim_guard(job))
+                        .values(
+                            status="done",
+                            updated_at=next_updated_at(job.updated_at),
+                            error_category=None,
+                        )
+                    )
 
     async def fail(
         self,
@@ -482,20 +493,37 @@ class MemoryEmbeddingJobRepository:
         retryable: bool,
         initial_delay_seconds: float,
     ) -> None:
-        now = next_updated_at(job.updated_at)
-        async with self._database.immediate_session() as writer:
-            await writer.execute(
-                update(MemoryEmbeddingJobModel)
-                .where(*self._claim_guard(job))
-                .values(
-                    status="pending" if retryable else "failed",
-                    updated_at=now,
-                    next_attempt_at=now + timedelta(seconds=initial_delay_seconds)
-                    if retryable
-                    else now,
-                    error_category=error_category[:64],
-                )
-            )
+        await self.fail_many(
+            (job,),
+            error_category=error_category,
+            retryable=retryable,
+            initial_delay_seconds=initial_delay_seconds,
+        )
+
+    async def fail_many(
+        self,
+        jobs: tuple[MemoryEmbeddingJob, ...],
+        *,
+        error_category: str,
+        retryable: bool,
+        initial_delay_seconds: float,
+    ) -> None:
+        for offset in range(0, len(jobs), 128):
+            async with self._database.immediate_session() as writer:
+                for job in jobs[offset : offset + 128]:
+                    now = next_updated_at(job.updated_at)
+                    await writer.execute(
+                        update(MemoryEmbeddingJobModel)
+                        .where(*self._claim_guard(job))
+                        .values(
+                            status="pending" if retryable else "failed",
+                            updated_at=now,
+                            next_attempt_at=now + timedelta(seconds=initial_delay_seconds)
+                            if retryable
+                            else now,
+                            error_category=error_category[:64],
+                        )
+                    )
 
     async def retry_failed(self) -> int:
         job = MemoryEmbeddingJobModel

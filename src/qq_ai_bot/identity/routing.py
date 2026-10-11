@@ -190,8 +190,12 @@ class PresenceRouter:
             presence = await session.get(PresenceModel, presence_id)
         if presence is None or not presence.enabled or presence.platform != "qq":
             raise RouteSendError("original_presence_unavailable")
+        return self._presence_connection(presence)
+
+    def _presence_connection(self, presence: PresenceModel) -> ResolvedSend:
+        """Use the Presence already selected in this read preparation."""
         try:
-            resolution = self._registry.resolve_active(presence_id)
+            resolution = self._registry.resolve_active(presence.id)
         except RegistryClosed as exc:
             raise RouteSendError("original_presence_unavailable") from exc
         return ResolvedSend(
@@ -278,38 +282,46 @@ class PresenceRouter:
             raise RouteSendError("route_changed")
 
     async def accessible_group_connections(
-        self, space_id: str, *, binding_id: str | None = None
+        self,
+        space_id: str,
+        *,
+        binding_id: str | None = None,
+        presence_id: str | None = None,
     ) -> list[ResolvedSend]:
         """Read-only reachability; neither outbound nor ingest pins govern reads."""
         async with self._database.sessions() as session:
-            bindings = list(
-                await session.scalars(
-                    select(SpaceBindingModel).where(
-                        SpaceBindingModel.space_id == space_id,
-                        SpaceBindingModel.platform == "qq",
-                        SpaceBindingModel.status == "active",
-                    )
-                )
+            binding_query = select(SpaceBindingModel).where(
+                SpaceBindingModel.space_id == space_id,
+                SpaceBindingModel.platform == "qq",
+                SpaceBindingModel.status == "active",
             )
+            if binding_id is not None:
+                binding_query = binding_query.where(SpaceBindingModel.id == binding_id)
+            bindings = list(
+                await session.scalars(binding_query)
+            )
+            presence_query = select(PresenceModel).where(
+                PresenceModel.platform == "qq",
+                PresenceModel.enabled.is_(True),
+            )
+            if presence_id is not None:
+                presence_query = presence_query.where(PresenceModel.id == presence_id)
             presences = list(
                 await session.scalars(
-                    select(PresenceModel)
-                    .where(
-                        PresenceModel.platform == "qq",
-                        PresenceModel.enabled.is_(True),
-                    )
-                    .order_by(PresenceModel.id)
+                    presence_query.order_by(PresenceModel.id)
                 )
             )
-        if binding_id is not None:
-            bindings = [binding for binding in bindings if binding.id == binding_id]
         if len(bindings) != 1:
             raise RouteSendError("binding_ambiguous" if bindings else "binding_unavailable")
         binding = bindings[0]
         connections = []
-        for presence in presences:
+        for index, presence in enumerate(presences):
             try:
-                route = await self.resolve_presence(presence.id)
+                route = (
+                    self._presence_connection(presence)
+                    if index == 0
+                    else await self.resolve_presence(presence.id)
+                )
             except RouteSendError:
                 continue
             if await self._probe(

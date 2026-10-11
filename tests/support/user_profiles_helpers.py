@@ -2,8 +2,35 @@
 
 from __future__ import annotations
 
+from datetime import UTC, datetime
+
 from qq_ai_bot.domain.conversations import ScopeType
 from qq_ai_bot.domain.messages import InboundMessage, SenderIdentity
+from qq_ai_bot.identity.canonical_repository import ensure_person, ensure_space
+from qq_ai_bot.persistence.database import Database
+from qq_ai_bot.persistence.people_repository import PeopleRepository
+
+
+async def observe_members(
+    database: Database,
+    user_ids: tuple[str, ...],
+    *,
+    group_id: str = "2001",
+) -> PeopleRepository:
+    """Seed real canonical owners, then exercise their ordinary observation path."""
+    async with database.immediate_session() as session:
+        await ensure_space(session, group_id, now=datetime(2026, 8, 24, tzinfo=UTC))
+        for user_id in user_ids:
+            await ensure_person(session, user_id, now=datetime(2026, 8, 24, tzinfo=UTC))
+    people = PeopleRepository(database)
+    for user_id in user_ids:
+        await people.observe(
+            user_id=user_id,
+            nickname=f"name-{user_id}",
+            group_id=group_id,
+            group_card=f"card-{user_id}",
+        )
+    return people
 
 
 def inbound(

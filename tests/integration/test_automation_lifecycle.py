@@ -3,12 +3,13 @@
 import asyncio
 import json
 import os
+from contextlib import asynccontextmanager
 from dataclasses import replace
 from datetime import UTC, datetime, timedelta
 from uuid import uuid4
 
 import pytest
-from sqlalchemy import event, func, select, update
+from sqlalchemy import event, func, insert, select, update
 from tests.support.automation_runtime_helpers import FakeClock
 from tests.support.automation_unified_delivery_helpers import sent, setup_run
 from tests.support.runtime_execution import make_work_resumer
@@ -25,7 +26,12 @@ from qq_ai_bot.domain.tool_actor import ToolActor
 from qq_ai_bot.identity.canonical_repository import ensure_space
 from qq_ai_bot.identity.db_models import CanonicalPersonModel, IdentityBindingModel
 from qq_ai_bot.persistence.control_query import ControlQueryAdapter
-from qq_ai_bot.persistence.models import AutomationModel, AutomationRunModel, AutomationStepRunModel
+from qq_ai_bot.persistence.models import (
+    AutomationModel,
+    AutomationRunModel,
+    AutomationStepRunModel,
+    AutomationVersionModel,
+)
 from qq_ai_bot.runtime.origin import TurnOrigin
 from qq_ai_bot.runtime.subagent_repository import SubagentRepository
 from qq_ai_bot.runtime.work_budget_schema import automation_budgets
@@ -1509,3 +1515,149 @@ async def test_control_cancel_automation_tree_stops_original_supervisor_and_reta
         server.close()
         await server.wait_closed()
         await manager.close()
+
+
+async def test_ordinary_directory_does_not_parse_execution_payloads(database, tmp_path):
+    from pydantic import ValidationError
+    from sqlalchemy import update
+    from tests.support.automation_unified_delivery_helpers import setup_run
+
+    from qq_ai_bot.automation.models import AutomationStatus
+    from qq_ai_bot.persistence.models import AutomationModel
+
+    case = await setup_run(database, tmp_path, delivery="none", mode="silent")
+    async with database.immediate_session() as writer:
+        await writer.execute(
+            update(AutomationModel)
+            .where(AutomationModel.id == case.row.id)
+            .values(
+                script_json="unreadable execution IR",
+                required_capabilities_json="unreadable capabilities",
+                authority_snapshot_json="unreadable authority",
+            )
+        )
+    entry = await case.repository.get_directory_entry(case.row.id)
+    assert entry.record.name == case.row.name and entry.creator.person_id == case.env.person
+    directory = await case.repository.list_directory(statuses=(AutomationStatus.ACTIVE,))
+    assert [item.record.id for item in directory] == [case.row.id]
+    with pytest.raises(ValidationError):
+        await case.repository.list_directory(
+            statuses=(AutomationStatus.ACTIVE,), include_script=True
+        )
+
+
+async def test_batch_claimers_accept_disjoint_sets_and_keep_running_and_versionless_rows(
+    database, tmp_path, monkeypatch
+):
+    case = await setup_run(database, tmp_path, delivery="none", mode="silent")
+    clock = FakeClock(case.row.next_run_at)
+    async with database.sessions() as reader:
+        definition = await reader.get(AutomationModel, case.row.id)
+        version = await reader.get(AutomationVersionModel, case.row.version_id)
+        definition_values = {
+            column.name: getattr(definition, column.name)
+            for column in AutomationModel.__table__.columns
+            if column.name != "id"
+        }
+        version_values = {
+            column.name: getattr(version, column.name)
+            for column in AutomationVersionModel.__table__.columns
+            if column.name != "id"
+        }
+    async with database.immediate_session() as writer:
+        await writer.execute(
+            update(AutomationModel)
+            .where(AutomationModel.id == case.row.id)
+            .values(status="paused", next_run_at=None)
+        )
+        for identity in (2, 3, 4):
+            await writer.execute(
+                insert(AutomationModel).values(
+                    id=identity, **{**definition_values, "next_run_at": clock.now()}
+                )
+            )
+            if identity != 4:
+                await writer.execute(
+                    insert(AutomationVersionModel).values(
+                        **{**version_values, "automation_id": identity}
+                    )
+                )
+    original_writer = database.immediate_session
+    both_discovered = asyncio.Event()
+    arriving = 0
+
+    @asynccontextmanager
+    async def compete():
+        nonlocal arriving
+        arriving += 1
+        if arriving == 2:
+            both_discovered.set()
+        await asyncio.wait_for(both_discovered.wait(), timeout=5)
+        async with original_writer() as writer:
+            yield writer
+
+    monkeypatch.setattr(database, "immediate_session", compete)
+    first, second = await asyncio.gather(
+        *(
+            case.repository.claim_due(
+                worker_id=worker, now=clock.now(), lease_seconds=60, clock=clock.now
+            )
+            for worker in ("first-real-writer", "second-real-writer")
+        )
+    )
+    first_ids, second_ids = {row.id for row in first}, {row.id for row in second}
+    assert not first_ids & second_ids and first_ids | second_ids == {case.row.id, 2, 3, 4}
+    accepted = {row.id: row for row in (*first, *second)}
+    assert accepted[case.row.id].status is AutomationStatus.PAUSED
+    assert accepted[4].version_id is None
+    assert all(row.script == case.row.script for row in accepted.values())
+    original_run_source = await case.repository.get_for_run(case.run.id)
+    assert original_run_source.version_id == case.run.version_id
+    assert original_run_source.script == case.row.script
+    assert (await case.repository.run_history(case.row.id))[0].id == case.run.id
+    assert not case.provider.requests and not sent(case.env)
+
+
+@pytest.mark.parametrize("unknown_commit", [False, True])
+async def test_claim_parses_only_after_successful_commit(
+    database, tmp_path, monkeypatch, unknown_commit
+):
+    import qq_ai_bot.automation.repository as automation_repository
+
+    case = await setup_run(database, tmp_path, delivery="none", mode="silent")
+    original_writer = database.immediate_session
+    original_record = automation_repository._automation_record
+    committed = False
+    parsed = []
+
+    @asynccontextmanager
+    async def commit_outcome():
+        nonlocal committed
+        async with original_writer() as writer:
+            yield writer
+        if unknown_commit:
+            raise RuntimeError("unknown_claim_commit")
+        committed = True
+
+    def parse_accepted(row, version_id=None):
+        assert committed
+        parsed.append(row.id)
+        return original_record(row, version_id)
+
+    monkeypatch.setattr(database, "immediate_session", commit_outcome)
+    monkeypatch.setattr(automation_repository, "_automation_record", parse_accepted)
+    if unknown_commit:
+        with pytest.raises(RuntimeError, match="unknown_claim_commit"):
+            await case.repository.claim_due(
+                worker_id="original-claim", now=case.row.next_run_at, lease_seconds=60
+            )
+        assert parsed == []
+    else:
+        accepted = await case.repository.claim_due(
+            worker_id="original-claim", now=case.row.next_run_at, lease_seconds=60
+        )
+        assert parsed == [case.row.id] and accepted[0].script == case.row.script
+    async with database.sessions() as reader:
+        original = await reader.get(AutomationModel, case.row.id)
+        assert original.claimed_by == "original-claim"
+    assert not case.provider.requests and not sent(case.env)

@@ -946,32 +946,24 @@ class PluginNotificationRepository:
     async def counts(self, plugin_id: str) -> dict[str, int]:
         async with self._database.sessions() as session:
             outbox = (
-                (
-                    await session.execute(
-                        select(PluginNotificationOutboxModel.status).where(
-                            PluginNotificationOutboxModel.plugin_id == plugin_id
-                        )
-                    )
+                await session.execute(
+                    select(PluginNotificationOutboxModel.status, func.count())
+                    .where(PluginNotificationOutboxModel.plugin_id == plugin_id)
+                    .group_by(PluginNotificationOutboxModel.status)
                 )
-                .scalars()
-                .all()
-            )
+            ).all()
             turns = (
-                (
-                    await session.execute(
-                        select(PluginBackgroundTurnJobModel.status).where(
-                            PluginBackgroundTurnJobModel.plugin_id == plugin_id
-                        )
-                    )
+                await session.execute(
+                    select(PluginBackgroundTurnJobModel.status, func.count())
+                    .where(PluginBackgroundTurnJobModel.plugin_id == plugin_id)
+                    .group_by(PluginBackgroundTurnJobModel.status)
                 )
-                .scalars()
-                .all()
-            )
+            ).all()
         result: dict[str, int] = {}
         for prefix, values in (("outbox", outbox), ("turn", turns)):
-            for value in values:
+            for value, count in values:
                 key = f"{prefix}_{value}"
-                result[key] = result.get(key, 0) + 1
+                result[key] = count
         return result
 
     async def turn_delivery_counts(self, job: BackgroundTurnJobRecord) -> dict[str, int]:

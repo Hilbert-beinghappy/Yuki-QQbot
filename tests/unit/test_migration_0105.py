@@ -17,9 +17,10 @@ from qq_ai_bot.automation.models import AutomationScript
 from qq_ai_bot.automation.repository import AutomationRepository
 from qq_ai_bot.automation.validator import canonical_script_hash
 from qq_ai_bot.control_plane.paging import PageRequest
+from qq_ai_bot.identity.canonical_repository import ensure_person, ensure_space
 from qq_ai_bot.persistence.control_automation_query import ControlAutomationQueryAdapter
 from qq_ai_bot.persistence.database import Database
-from qq_ai_bot.persistence.models import AutomationVersionModel
+from qq_ai_bot.persistence.models import AutomationVersionModel, RuntimeConfigOverrideModel
 from qq_ai_bot.runtime.subagent_repository import SubagentRepository
 from qq_ai_bot.runtime.subagent_schema import children
 from qq_ai_bot.runtime.work_budget_schema import automation_budgets, budgets
@@ -27,6 +28,62 @@ from qq_ai_bot.runtime.work_recovery_schema import invocations
 from qq_ai_bot.runtime.work_repository import WorkRepository
 from qq_ai_bot.runtime.work_schema_v1 import effects, journal, work
 from qq_ai_bot.runtime.work_tree import budget_root_id
+
+
+def test_0106_query_migration_removes_retired_overrides_without_removing_other_config(
+    tmp_path, monkeypatch
+):
+    url = f"sqlite+aiosqlite:///{(tmp_path / 'queries.db').as_posix()}"
+    monkeypatch.setenv("DATABASE_URL", url)
+    config = Config("alembic.ini")
+    command.upgrade(config, "0106")
+
+    async def seed():
+        database = Database(url)
+        try:
+            async with database.immediate_session() as writer:
+                person = await ensure_person(writer, "10001")
+                space = await ensure_space(writer, "20001")
+                now = datetime.now(UTC)
+                for scope, person_id, space_id, key in (
+                    ("global", None, None, "memory.max_referenced_targets"),
+                    ("user", person, None, "memory.max_referenced_targets"),
+                    ("group", None, space, "memory.max_referenced_targets"),
+                    ("global", None, None, "context.compaction_window_tokens"),
+                ):
+                    writer.add(
+                        RuntimeConfigOverrideModel(
+                            config_key=key,
+                            scope_type=scope,
+                            canonical_person_id=person_id,
+                            canonical_space_id=space_id,
+                            value_json="60000" if key.startswith("context.") else "5",
+                            value_type="integer",
+                            apply_mode="hot",
+                            created_at=now,
+                            updated_at=now,
+                            updated_by="test",
+                        )
+                    )
+        finally:
+            await database.close()
+
+    asyncio.run(seed())
+    command.upgrade(config, "head")
+
+    async def verify():
+        database = Database(url)
+        try:
+            async with database.sessions() as reader:
+                rows = (await reader.scalars(select(RuntimeConfigOverrideModel))).all()
+                assert [(row.config_key, row.value_json) for row in rows] == [
+                    ("context.compaction_window_tokens", "60000")
+                ]
+                assert not list(await reader.execute(text("PRAGMA foreign_key_check")))
+        finally:
+            await database.close()
+
+    asyncio.run(verify())
 
 
 @pytest.mark.parametrize("from_0104", [False, True])
@@ -144,7 +201,7 @@ def test_fresh_and_0104_upgrade_preserve_work_identity_source_receipts_and_budge
         try:
             async with database.sessions() as session:
                 assert (
-                    await session.scalar(text("SELECT version_num FROM alembic_version")) == "0106"
+                    await session.scalar(text("SELECT version_num FROM alembic_version")) == "0107"
                 )
                 columns = {
                     row[1] for row in await session.execute(text("PRAGMA table_info(runtime_work)"))

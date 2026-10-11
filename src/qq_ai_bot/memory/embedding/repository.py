@@ -6,7 +6,7 @@ from dataclasses import dataclass
 from datetime import UTC, datetime
 from typing import Any
 
-from sqlalchemy import and_, delete, func, or_, select
+from sqlalchemy import and_, delete, func, or_, select, text
 from sqlalchemy.dialects.sqlite import insert
 
 from qq_ai_bot.memory.authorized_scope import AuthorizedMemoryScope, authorized_fact_condition
@@ -311,36 +311,37 @@ class MemoryEmbeddingRepository:
             or_(MemoryFactModel.valid_until.is_(None), MemoryFactModel.valid_until > now),
         ]
         async with self._database.sessions() as session:
+            await session.execute(text("BEGIN"))
             active_count = int(
                 await session.scalar(
                     select(func.count()).select_from(MemoryFactModel).where(*active)
                 )
                 or 0
             )
-            active_embedding_rows = (
-                await session.execute(
-                    select(
-                        MemoryEmbeddingModel.content_hash,
-                        MemoryFactModel.kind,
-                        MemoryFactModel.category,
-                        MemoryFactModel.memory_key,
-                        MemoryFactModel.content,
-                    )
-                    .join(MemoryFactModel, MemoryFactModel.id == MemoryEmbeddingModel.fact_id)
-                    .where(MemoryEmbeddingModel.profile_id == current_profile_id, *active)
+            active_embedding_rows = await session.stream(
+                select(
+                    MemoryEmbeddingModel.content_hash,
+                    MemoryFactModel.kind,
+                    MemoryFactModel.category,
+                    MemoryFactModel.memory_key,
+                    MemoryFactModel.content,
                 )
-            ).all()
-            matching_count = sum(
-                1
-                for row in active_embedding_rows
-                if row.content_hash
-                == documents.content_hash_fields(
-                    kind=row.kind,
-                    category=row.category,
-                    memory_key=row.memory_key,
-                    content=row.content,
-                )
+                .join(MemoryFactModel, MemoryFactModel.id == MemoryEmbeddingModel.fact_id)
+                .where(MemoryEmbeddingModel.profile_id == current_profile_id, *active)
+                .execution_options(yield_per=100)
             )
+            matching_count = indexed_count = 0
+            async for row in active_embedding_rows:
+                indexed_count += 1
+                matching_count += int(
+                    row.content_hash
+                    == documents.content_hash_fields(
+                        kind=row.kind,
+                        category=row.category,
+                        memory_key=row.memory_key,
+                        content=row.content,
+                    )
+                )
             inactive_count = int(
                 await session.scalar(
                     select(func.count())
@@ -400,7 +401,7 @@ class MemoryEmbeddingRepository:
             "pending_job_count": int(job_counts.get("pending", 0)),
             "processing_job_count": int(job_counts.get("processing", 0)),
             "failed_job_count": int(job_counts.get("failed", 0)),
-            "stale_embedding_count": inactive_count + (len(active_embedding_rows) - matching_count),
+            "stale_embedding_count": inactive_count + (indexed_count - matching_count),
             "orphan_embedding_count": orphan_count,
             "old_profile_count": old_profile_count,
             "last_success_at": last_success,

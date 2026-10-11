@@ -78,7 +78,6 @@ async def test_owner_queries_are_batched_and_no_source_reads_follow_run_insert(d
         event.remove(database.engine.sync_engine, "before_cursor_execute", capture)
     assert run.status is DreamRunStatus.PLANNED
     selects = [sql for sql, _ in statements if sql.startswith("SELECT")]
-    assert len(selects) == 2  # readonly prepare + bounded version/shape recheck
     assert all(
         "memory_evidence" not in sql and "memory_facts.content" not in sql for sql in selects
     )

@@ -404,9 +404,7 @@ class CommandService:
             elif self._model_invocations is None:
                 text = "模型调用统计尚未初始化。"
             else:
-                stats = await self._model_invocations.stats()
-                by_task = await self._model_invocations.stats_by_task()
-                by_profile = await self._model_invocations.stats_by_profile()
+                stats, by_task, by_profile = await self._model_invocations.stats_summary()
                 recent_errors = await self._model_invocations.recent_errors(
                     limit=self._settings.model_stats_recent_error_limit
                 )

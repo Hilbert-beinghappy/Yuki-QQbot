@@ -7,8 +7,9 @@ import uuid
 from datetime import UTC, datetime
 from typing import TYPE_CHECKING, Protocol, cast
 
-from sqlalchemy import or_, select
+from sqlalchemy import case, or_, select
 from sqlalchemy.ext.asyncio import AsyncSession
+from sqlalchemy.orm import aliased, load_only
 
 from qq_ai_bot.memory.enums import (
     MemoryAuthority,
@@ -42,7 +43,7 @@ from qq_ai_bot.memory.partition import (
 )
 from qq_ai_bot.memory.repository import MemoryFactRepository, PreparedEvidenceCopy
 from qq_ai_bot.memory.validation import ValidatedMemoryClaim, normalize_memory_text
-from qq_ai_bot.persistence.models import MemoryFactRelationModel
+from qq_ai_bot.persistence.models import MemoryFactModel, MemoryFactRelationModel
 
 logger = logging.getLogger(__name__)
 
@@ -171,23 +172,6 @@ class MemoryFactService:
             visibility_type,
             owners.visibility_person_id,
             owners.visibility_space_id,
-        )
-
-    async def list_evidence_lineage(
-        self,
-        fact_id: int,
-        *,
-        cursor: str | None = None,
-        limit: int = 50,
-    ) -> object:
-        """Page direct evidence and recoverable Reflection/Dream provenance."""
-
-        from qq_ai_bot.memory.lineage import MemoryLineageService
-
-        return await MemoryLineageService(self._repository.database).list_evidence_lineage(
-            fact_id,
-            cursor=cursor,
-            limit=limit,
         )
 
     async def remember(
@@ -877,6 +861,7 @@ class MemoryFactService:
         actor_user_id: str | None,
         evidence: MemoryEvidenceCreate | None = None,
         session: AsyncSession | None = None,
+        current: MemoryFactModel | None = None,
     ) -> bool:
         if session is None:
             return await self._repository.apply_evidence_write(
@@ -889,8 +874,12 @@ class MemoryFactService:
                 )
             )
         await self.prepare_evidence_write((fact_id,), session=session)
-        current = await self._repository.get_fact(fact_id, session=session)
-        if current is None or current.status is MemoryStatus.INVALIDATED:
+        current = (
+            current
+            if current is not None
+            else await session.scalar(select(MemoryFactModel).where(MemoryFactModel.id == fact_id))
+        )
+        if current is None or current.status == MemoryStatus.INVALIDATED.value:
             return False
         if evidence is not None:
             await self._repository.add_evidence(fact_id, evidence, session=session)
@@ -910,6 +899,7 @@ class MemoryFactService:
             source_event_id=evidence.event_id if evidence is not None else None,
             actor_user_id=actor_user_id,
             session=session,
+            current=current,
         )
         if changed:
             self.metrics.increment("facts_invalidated")
@@ -973,24 +963,44 @@ class MemoryFactService:
         reason_code: str,
         actor_user_id: str | None,
         session: AsyncSession,
+        current: MemoryFactModel | None = None,
     ) -> bool:
-        current = await self._repository.get_fact(fact_id, session=session)
+        current = (
+            current
+            if current is not None
+            else await session.get(
+                MemoryFactModel,
+                fact_id,
+                options=(
+                    load_only(
+                        MemoryFactModel.status,
+                        MemoryFactModel.conflict_state,
+                        MemoryFactModel.invalidated_reason,
+                    ),
+                ),
+            )
+        )
         if (
             current is None
-            or current.status is MemoryStatus.CONTESTED
-            or current.conflict_state is MemoryConflictState.CLEAR
+            or current.status == MemoryStatus.CONTESTED.value
+            or current.conflict_state == MemoryConflictState.CLEAR.value
         ):
             return False
         changed = await self._repository.transition(
             fact_id,
-            status=current.status,
+            status=MemoryStatus(current.status),
             conflict_state=MemoryConflictState.CLEAR,
-            invalidated_reason=current.invalidated_reason,
+            invalidated_reason=(
+                MemoryInvalidationReason(current.invalidated_reason)
+                if current.invalidated_reason
+                else None
+            ),
             action=MemoryStateAction.CONFLICT_CLEARED,
             reason_code=reason_code,
             source_event_id=None,
             actor_user_id=actor_user_id,
             session=session,
+            current=current,
         )
         if changed:
             self.metrics.increment("conflicts_cleared")
@@ -1002,45 +1012,64 @@ class MemoryFactService:
         *,
         session: AsyncSession,
     ) -> None:
-        relations = await self._repository.list_relations(fact_id, session=session)
-        related_ids = {
-            relation.target_fact_id
-            if relation.source_fact_id == fact_id
-            else relation.source_fact_id
-            for relation in relations
-            if relation.relation_type is MemoryFactRelationType.CONTRADICTS
-        }
-        for related_id in related_ids:
-            related = await self._repository.get_fact(related_id, session=session)
-            if (
-                related is None
-                or related.status is not MemoryStatus.ACTIVE
-                or related.conflict_state is MemoryConflictState.CLEAR
-            ):
-                continue
-            still_conflicted = False
-            for relation in await self._repository.list_relations(related_id, session=session):
-                if relation.relation_type is not MemoryFactRelationType.CONTRADICTS:
-                    continue
-                counterpart_id = (
-                    relation.target_fact_id
-                    if relation.source_fact_id == related_id
-                    else relation.source_fact_id
+        relation = MemoryFactRelationModel
+        related_ids = select(
+            case(
+                (relation.source_fact_id == fact_id, relation.target_fact_id),
+                else_=relation.source_fact_id,
+            )
+        ).where(
+            relation.relation_type == MemoryFactRelationType.CONTRADICTS.value,
+            or_(relation.source_fact_id == fact_id, relation.target_fact_id == fact_id),
+        )
+        counterpart = aliased(MemoryFactModel)
+        still_conflicted = (
+            select(relation.id)
+            .join(
+                counterpart,
+                counterpart.id
+                == case(
+                    (relation.source_fact_id == MemoryFactModel.id, relation.target_fact_id),
+                    else_=relation.source_fact_id,
+                ),
+            )
+            .where(
+                relation.relation_type == MemoryFactRelationType.CONTRADICTS.value,
+                or_(
+                    relation.source_fact_id == MemoryFactModel.id,
+                    relation.target_fact_id == MemoryFactModel.id,
+                ),
+                counterpart.status.in_((MemoryStatus.ACTIVE.value, MemoryStatus.CONTESTED.value)),
+            )
+            .correlate(MemoryFactModel)
+            .exists()
+        )
+        related = tuple(
+            await session.scalars(
+                select(MemoryFactModel)
+                .options(
+                    load_only(
+                        MemoryFactModel.status,
+                        MemoryFactModel.conflict_state,
+                        MemoryFactModel.invalidated_reason,
+                    )
                 )
-                counterpart = await self._repository.get_fact(counterpart_id, session=session)
-                if counterpart is not None and counterpart.status in {
-                    MemoryStatus.ACTIVE,
-                    MemoryStatus.CONTESTED,
-                }:
-                    still_conflicted = True
-                    break
-            if not still_conflicted:
-                await self._clear_conflict_in_session(
-                    related_id,
-                    reason_code="all_contradictions_resolved",
-                    actor_user_id=None,
-                    session=session,
+                .where(
+                    MemoryFactModel.id.in_(related_ids),
+                    MemoryFactModel.status == MemoryStatus.ACTIVE.value,
+                    MemoryFactModel.conflict_state != MemoryConflictState.CLEAR.value,
+                    ~still_conflicted,
                 )
+            )
+        )
+        for current in related:
+            await self._clear_conflict_in_session(
+                current.id,
+                reason_code="all_contradictions_resolved",
+                actor_user_id=None,
+                session=session,
+                current=current,
+            )
 
     async def restore_fact(
         self,

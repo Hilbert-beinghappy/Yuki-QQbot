@@ -12,7 +12,7 @@ from typing import Protocol, TypedDict, TypeVar
 from sqlalchemy import Select, event, func, select, tuple_
 from sqlalchemy.exc import DatabaseError
 from sqlalchemy.ext.asyncio import AsyncSession
-from sqlalchemy.orm import InstrumentedAttribute
+from sqlalchemy.orm import InstrumentedAttribute, load_only
 
 from qq_ai_bot import __version__
 from qq_ai_bot.admin.config_files import ConfigFileError, ConfigFileService
@@ -131,7 +131,7 @@ from qq_ai_bot.memory.fts import SQLiteMemoryFTSIndex
 from qq_ai_bot.memory.repository import MemoryFactRepository
 from qq_ai_bot.model_runtime.profiles import ModelProfileCatalog
 from qq_ai_bot.persistence.control_external import control_operation
-from qq_ai_bot.persistence.control_operations import read_operation
+from qq_ai_bot.persistence.control_operations import read_operation, run_operation
 from qq_ai_bot.persistence.control_paging import numbered_statement
 from qq_ai_bot.persistence.database import Database
 from qq_ai_bot.persistence.models import (
@@ -220,11 +220,11 @@ def _now() -> datetime:
 
 def _spec_is_configured(
     spec: object,
-    overrides: set[tuple[str, str, str]] | dict[tuple[str, str, str], object],
+    overrides: set[str],
     settings: object | None,
 ) -> bool:
     key = getattr(spec, "key", "")
-    if any(item[0] == key for item in overrides):
+    if key in overrides:
         return True
     apply_mode = getattr(getattr(spec, "apply_mode", None), "value", "")
     if apply_mode != "secret" and not bool(getattr(spec, "sensitive", False)):
@@ -1748,7 +1748,14 @@ class ControlQueryAdapter:
                         (
                             sql_window := await numbered_statement(
                                 session,
-                                select(model.id, model.public_id)
+                                select(
+                                    model.id,
+                                    model.public_id,
+                                    model.status,
+                                    model.created_at,
+                                    model.updated_at,
+                                    model.error_category,
+                                )
                                 .where(model.id > after)
                                 .order_by(model.id)
                                 .limit(request.limit + 1),
@@ -1761,8 +1768,15 @@ class ControlQueryAdapter:
                 more = len(keys) > request.limit
                 selected = keys[: request.limit]
                 items = [
-                    await read_operation(self._database, session, f"{kind.value}:{public_id}")
-                    for _, public_id in selected
+                    run_operation(
+                        kind,
+                        row.public_id,
+                        row.status,
+                        created_at=row.created_at,
+                        updated_at=row.updated_at,
+                        error_category=row.error_category,
+                    )
+                    for row in selected
                 ]
                 last_id = selected[-1][0] if selected else 0
             return self._page(
@@ -1780,23 +1794,26 @@ class ControlQueryAdapter:
         async with self._reader() as session:
             epoch, _revision = await self._runtime(session)
             _phase, key = self._cursor_state(request, QueryResourceKind.CONFIG_SPEC, epoch=epoch)
-            overrides = {
-                (
-                    row.config_key,
-                    row.scope_type,
-                    row.canonical_person_id or row.canonical_space_id or "",
+            specs = sorted(self._registry.list(), key=lambda item: item.key)
+            if key is not None:
+                specs = [item for item in specs if item.key > key]
+            total = len(specs)
+            start = (request.number - 1) * request.limit if request.number else 0
+            window = specs[start : start + request.limit + 1]
+            more = len(window) == request.limit + 1
+            if more:
+                window = window[:-1]
+            overrides = set(
+                await session.scalars(
+                    select(RuntimeConfigOverrideModel.config_key)
+                    .distinct()
+                    .where(
+                        RuntimeConfigOverrideModel.config_key.in_(
+                            tuple(item.key for item in window)
+                        )
+                    )
                 )
-                for row in (await session.scalars(select(RuntimeConfigOverrideModel))).all()
-            }
-        specs = sorted(self._registry.list(), key=lambda item: item.key)
-        if key is not None:
-            specs = [item for item in specs if item.key > key]
-        total = len(specs)
-        start = (request.number - 1) * request.limit if request.number else 0
-        window = specs[start : start + request.limit + 1]
-        more = len(window) == request.limit + 1
-        if more:
-            window = window[:-1]
+            )
         items = [
             ConfigSpecView(
                 key=item.key,
@@ -2114,7 +2131,18 @@ class ControlQueryAdapter:
             epoch, _revision = await self._runtime(session)
             _phase, key = self._cursor_state(request, QueryResourceKind.AUTOMATION, epoch=epoch)
             after = decode_integer_cursor_key(key, minimum=1) if key is not None else 0
-            stmt = select(AutomationModel)
+            stmt = select(AutomationModel).options(
+                load_only(
+                    AutomationModel.id,
+                    AutomationModel.updated_at,
+                    AutomationModel.name,
+                    AutomationModel.status,
+                    AutomationModel.run_count,
+                    AutomationModel.script_hash,
+                    AutomationModel.canonical_target_person_id,
+                    AutomationModel.canonical_target_space_id,
+                )
+            )
             if after:
                 stmt = stmt.where(AutomationModel.id > after)
             stmt = stmt.order_by(AutomationModel.id.asc()).limit(request.limit + 1)

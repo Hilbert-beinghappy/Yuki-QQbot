@@ -5,7 +5,7 @@ from __future__ import annotations
 import hashlib
 from datetime import UTC, datetime
 
-from sqlalchemy import func, or_, select, update
+from sqlalchemy import func, or_, select, text, update
 from sqlalchemy.dialects.sqlite import insert
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -67,6 +67,7 @@ async def claim_initiative(
     now = datetime.now(UTC)
     async with database.sessions() as session, session.begin():
         session.autoflush = False
+        await session.execute(text("BEGIN"))
         # The cursor is per run: a late receipt for an older run cannot be skipped
         # merely because a newer run was already reflected.
         runs = list(
@@ -96,6 +97,43 @@ async def claim_initiative(
                 .limit(100)
             )
         )
+        run_ids = tuple(initiative.id for initiative in runs)
+        cursors = (
+            {
+                cursor.initiative_run_id: cursor
+                for cursor in await session.scalars(
+                    select(Cursor).where(Cursor.initiative_run_id.in_(run_ids))
+                )
+            }
+            if run_ids
+            else {}
+        )
+        windows: dict[str, Window] = {}
+        if run_ids:
+            for stored_window in await session.scalars(
+                select(Window)
+                .outerjoin(Cursor, Cursor.initiative_run_id == Window.initiative_run_id)
+                .where(
+                    Window.initiative_run_id.in_(run_ids),
+                    Window.last_receipt_id > func.coalesce(Cursor.last_receipt_id, 0),
+                )
+                .order_by(Window.first_receipt_id)
+            ):
+                windows.setdefault(stored_window.initiative_run_id, stored_window)
+        retries = (
+            {
+                retry.id: retry
+                for retry in await session.scalars(
+                    select(MemorySelfReflectionRunModel).where(
+                        MemorySelfReflectionRunModel.id.in_(
+                            tuple(window.reflection_run_id for window in windows.values())
+                        )
+                    )
+                )
+            }
+            if windows
+            else {}
+        )
         for initiative in runs:
             try:
                 source = await resolve_self_origin(
@@ -106,22 +144,10 @@ async def claim_initiative(
             partition_hash = hashlib.sha256(source.partition.encode()).hexdigest()
             if partition_hash in excluded_conversation_keys:
                 continue
-            cursor = await session.get(Cursor, initiative.id)
+            cursor = cursors.get(initiative.id)
             last = cursor.last_receipt_id if cursor else 0
-            window = await session.scalar(
-                select(Window)
-                .where(
-                    Window.initiative_run_id == initiative.id,
-                    Window.last_receipt_id > last,
-                )
-                .order_by(Window.first_receipt_id)
-                .limit(1)
-            )
-            retry = (
-                await session.get(MemorySelfReflectionRunModel, window.reflection_run_id)
-                if window
-                else None
-            )
+            window = windows.get(initiative.id)
+            retry = retries.get(window.reflection_run_id) if window else None
             if retry is not None:
                 next_at = retry.next_attempt_at
                 if next_at and next_at.tzinfo is None:

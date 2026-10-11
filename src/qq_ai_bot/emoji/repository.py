@@ -90,26 +90,28 @@ class EmojiRepository:
         *,
         max_distance: int,
         exclude_id: str | None = None,
-    ) -> tuple[EmojiAsset, ...]:
+    ) -> tuple[str, ...]:
         if not 0 <= max_distance <= 64:
             raise ValueError("near duplicate distance must be between zero and 64")
         try:
             target = int(perceptual_hash, 16)
         except ValueError as exc:
             raise ValueError("invalid perceptual hash") from exc
-        statement = select(EmojiAssetModel).where(EmojiAssetModel.perceptual_hash.is_not(None))
+        statement = select(EmojiAssetModel.id, EmojiAssetModel.perceptual_hash).where(
+            EmojiAssetModel.perceptual_hash.is_not(None)
+        )
         if exclude_id is not None:
             statement = statement.where(EmojiAssetModel.id != exclude_id)
         async with self._database.sessions() as session:
-            rows = (await session.scalars(statement)).all()
-        matches: list[EmojiAsset] = []
-        for row in rows:
+            rows = (await session.execute(statement)).all()
+        matches: list[str] = []
+        for emoji_id, stored_hash in rows:
             try:
-                distance = (target ^ int(row.perceptual_hash or "", 16)).bit_count()
+                distance = (target ^ int(stored_hash, 16)).bit_count()
             except ValueError:
                 continue
             if distance <= max_distance:
-                matches.append(self._asset(row))
+                matches.append(emoji_id)
         return tuple(matches)
 
     async def resolve_id(self, value: str) -> EmojiAsset | None:
@@ -535,7 +537,7 @@ class EmojiRepository:
             recent_scope = None
             if scope_cooldown_after is not None:
                 recent_scope = (
-                    select(func.count())
+                    select(EmojiUsageEventModel.id)
                     .select_from(EmojiUsageEventModel)
                     .where(EmojiUsageEventModel.created_at > scope_cooldown_after)
                 )
@@ -579,7 +581,7 @@ class EmojiRepository:
                     .exists()
                 )
                 statement = statement.where(~disabled_override)
-            if recent_scope is not None and await session.scalar(recent_scope):
+            if recent_scope is not None and await session.scalar(select(recent_scope.exists())):
                 return ()
             rows = (await session.execute(statement)).all()
             return tuple((self._asset(row), float(weight or 0)) for row, weight in rows)

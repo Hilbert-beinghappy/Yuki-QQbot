@@ -2,12 +2,13 @@
 
 from __future__ import annotations
 
-from datetime import datetime
+from datetime import UTC, datetime
 
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from qq_ai_bot.control_plane.operations import (
+    OperationKind,
     OperationRef,
     OperationStatus,
     StateEpoch,
@@ -17,11 +18,11 @@ from qq_ai_bot.control_plane.problems import Problem, ProblemCode
 from qq_ai_bot.control_plane.query_types import ControlQueryError
 from qq_ai_bot.conversation.canonical_db_models import ControlCommandReceiptModel
 from qq_ai_bot.domain.identity import PrincipalId, RequestId
+from qq_ai_bot.memory.dream.db_models import MemoryDreamRunModel
 from qq_ai_bot.memory.dream.models import DreamRun
-from qq_ai_bot.memory.dream.repository import DreamRepository
 from qq_ai_bot.memory.rebuild.models import MemoryRebuildRun
-from qq_ai_bot.memory.rebuild.repository import MemoryRebuildRepository
 from qq_ai_bot.persistence.database import Database
+from qq_ai_bot.persistence.models import MemoryRebuildRunModel
 
 
 def _op_ref(
@@ -82,30 +83,54 @@ def _dream_status(value: str) -> OperationStatus:
 
 
 def rebuild_operation(run: MemoryRebuildRun) -> OperationRef:
-    status = _rebuild_status(run.status.value)
-    return _op_ref(
-        f"rebuild:{run.public_id}",
-        status,
+    return run_operation(
+        OperationKind.REBUILD,
+        run.public_id,
+        run.status.value,
         created_at=run.created_at,
         updated_at=run.updated_at,
-        error_category=run.error_category or "rebuild_failed",
+        error_category=run.error_category,
     )
 
 
 def dream_operation(run: DreamRun) -> OperationRef:
-    status = _dream_status(run.status.value)
-    return _op_ref(
-        f"dream:{run.public_id}",
-        status,
+    return run_operation(
+        OperationKind.DREAM,
+        run.public_id,
+        run.status.value,
         created_at=run.created_at,
         updated_at=run.updated_at,
-        error_category=run.error_category or "partial_failed",
+        error_category=run.error_category,
+    )
+
+
+def run_operation(
+    kind: OperationKind,
+    public_id: str,
+    status: str,
+    *,
+    created_at: datetime,
+    updated_at: datetime,
+    error_category: str | None,
+) -> OperationRef:
+    return _op_ref(
+        f"{kind.value}:{public_id}",
+        _rebuild_status(status) if kind is OperationKind.REBUILD else _dream_status(status),
+        created_at=created_at.replace(tzinfo=UTC)
+        if created_at.tzinfo is None
+        else created_at.astimezone(UTC),
+        updated_at=updated_at.replace(tzinfo=UTC)
+        if updated_at.tzinfo is None
+        else updated_at.astimezone(UTC),
+        error_category=error_category
+        or ("rebuild_failed" if kind is OperationKind.REBUILD else "partial_failed"),
     )
 
 
 async def read_operation(
     database: Database, session: AsyncSession, operation_id: str
 ) -> OperationRef:
+    del database
     parts = operation_id.split(":") if type(operation_id) is str else []
     try:
         if len(parts) == 3 and parts[0] == "control":
@@ -123,16 +148,28 @@ async def read_operation(
                 return control_operation(row)
         elif len(parts) == 2 and parts[0] in {"rebuild", "dream"}:
             public_id = RequestId.parse(parts[1]).text
-            if parts[0] == "rebuild":
-                rebuild = await MemoryRebuildRepository(database).get_run(
-                    public_id, session=session
+            kind = OperationKind(parts[0])
+            model = MemoryRebuildRunModel if kind is OperationKind.REBUILD else MemoryDreamRunModel
+            run = (
+                await session.execute(
+                    select(
+                        model.public_id,
+                        model.status,
+                        model.created_at,
+                        model.updated_at,
+                        model.error_category,
+                    ).where(model.public_id == public_id)
                 )
-                if rebuild is not None:
-                    return rebuild_operation(rebuild)
-            else:
-                dream = await DreamRepository(database).get_run(public_id, session=session)
-                if dream is not None:
-                    return dream_operation(dream)
+            ).one_or_none()
+            if run is not None:
+                return run_operation(
+                    kind,
+                    run.public_id,
+                    run.status,
+                    created_at=run.created_at,
+                    updated_at=run.updated_at,
+                    error_category=run.error_category,
+                )
         else:
             raise ValueError("invalid operation ID")
     except (TypeError, ValueError) as exc:

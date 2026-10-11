@@ -208,7 +208,6 @@ class MemorySettings(DomainSettings):
     memory_self_reflection_timeout_seconds: float = Field(default=180.0, gt=0)
     memory_self_reflection_tool_receipt_characters: int = Field(gt=0)
     memory_self_reflection_tool_receipt_retention_days: int = Field(gt=0)
-    memory_max_referenced_targets: int = Field(gt=0)
     memory_lexical_candidate_limit: int = Field(gt=0)
     memory_context_limit_per_entity: int = Field(gt=0)
     memory_overview_limit_per_entity: int = Field(gt=0)

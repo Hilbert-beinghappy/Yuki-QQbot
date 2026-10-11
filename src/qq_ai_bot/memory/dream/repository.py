@@ -5,11 +5,12 @@ from __future__ import annotations
 import hashlib
 import json
 import uuid
+from collections import defaultdict
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from typing import Any, cast
 
-from sqlalchemy import Table, false, func, or_, select, update
+from sqlalchemy import Table, false, func, or_, select, text, update
 from sqlalchemy.dialects.sqlite import insert
 from sqlalchemy.engine import CursorResult
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -140,92 +141,121 @@ class DreamRepository:
         ]
         if maximum_fact_id is not None:
             conditions.append(MemoryFactModel.id <= maximum_fact_id)
-        from qq_ai_bot.persistence.unit_of_work import optional_session
-
         async with optional_session(self.database, session, write=False) as active:
-            rows = (
-                await active.execute(
-                    select(
-                        MemoryFactModel.id,
-                        MemoryEmbeddingModel.content_hash,
-                        MemoryEmbeddingModel.vector_blob,
-                    )
-                    .outerjoin(
-                        MemoryEmbeddingModel,
-                        (MemoryEmbeddingModel.fact_id == MemoryFactModel.id)
-                        & (MemoryEmbeddingModel.profile_id == profile_id),
-                    )
-                    .where(*conditions)
-                    .order_by(MemoryFactModel.id)
-                )
-            ).all()
+            if session is None:
+                await active.execute(text("BEGIN"))
             candidates: list[DreamCandidate] = []
+            eligible = 0
             missing = 0
             ambiguous = 0
-            for row in rows:
-                fact = await self._facts.get_fact(int(row.id), session=active)
-                if fact is None:
-                    continue
-                signature = fact_signature(fact)
-                if row.vector_blob is None or row.content_hash is None:
-                    missing += 1
-                    continue
-                expected_hash = documents.content_hash_fields(
-                    kind=fact.kind.value,
-                    category=fact.category,
-                    memory_key=fact.memory_key,
-                    content=fact.content,
+            after_id = 0
+            while True:
+                rows = (
+                    await active.execute(
+                        select(
+                            MemoryFactModel.id,
+                            MemoryEmbeddingModel.content_hash,
+                            MemoryEmbeddingModel.vector_blob,
+                        )
+                        .outerjoin(
+                            MemoryEmbeddingModel,
+                            (MemoryEmbeddingModel.fact_id == MemoryFactModel.id)
+                            & (MemoryEmbeddingModel.profile_id == profile_id),
+                        )
+                        .where(*conditions, MemoryFactModel.id > after_id)
+                        .order_by(MemoryFactModel.id)
+                        .limit(256)
+                    )
+                ).all()
+                if not rows:
+                    break
+                eligible += len(rows)
+                fact_ids = tuple(int(row.id) for row in rows)
+                facts = {
+                    fact.id: fact for fact in await self._facts.get_facts(fact_ids, session=active)
+                }
+                legacy_ids: set[int] = set()
+                bots: dict[int, set[str]] = defaultdict(set)
+                # These are the original, unfiltered provenance chains. A hidden
+                # legacy event or a second bot still contributes to these checks.
+                event_sources = await active.execute(
+                    select(
+                        MemoryEvidenceModel.fact_id,
+                        ChatEventModel.canonical_event_id,
+                        ChatEventModel.bot_user_id,
+                    )
+                    .join(ChatEventModel, ChatEventModel.id == MemoryEvidenceModel.event_id)
+                    .where(MemoryEvidenceModel.fact_id.in_(fact_ids))
                 )
-                if str(row.content_hash) != expected_hash:
-                    missing += 1
-                    continue
-                from qq_ai_bot.identity.memory_guard import refuse_legacy_live_fact
+                for fact_id, canonical_event_id, bot_id in event_sources:
+                    if canonical_event_id is None:
+                        legacy_ids.add(fact_id)
+                    if bot_id:
+                        bots[fact_id].add(str(bot_id))
+                tool_sources = await active.execute(
+                    select(
+                        MemoryEvidenceModel.fact_id,
+                        ChatEventModel.id,
+                        ChatEventModel.canonical_event_id,
+                        MemoryToolReceiptModel.bot_user_id,
+                    )
+                    .join(
+                        MemoryToolReceiptModel,
+                        MemoryToolReceiptModel.id == MemoryEvidenceModel.tool_receipt_id,
+                    )
+                    .outerjoin(
+                        ChatEventModel,
+                        ChatEventModel.id == MemoryToolReceiptModel.trigger_event_id,
+                    )
+                    .where(MemoryEvidenceModel.fact_id.in_(fact_ids))
+                )
+                for fact_id, event_id, canonical_event_id, bot_id in tool_sources:
+                    if event_id is not None and canonical_event_id is None:
+                        legacy_ids.add(fact_id)
+                    if bot_id:
+                        bots[fact_id].add(str(bot_id))
                 from qq_ai_bot.memory.partition import dream_canonical_owner_complete
 
-                if await refuse_legacy_live_fact(active, fact.id):
-                    continue
-                if not dream_canonical_owner_complete(fact):
-                    continue
-                bot_ids = await self._fact_bot_ids(fact, session=active)
-                if len(bot_ids) > 1:
-                    ambiguous += 1
-                candidates.append(
-                    DreamCandidate(
-                        fact=fact,
-                        bot_user_id=next(iter(bot_ids), "self"),
-                        vector=self._codec.decode(bytes(row.vector_blob), dimensions=dimensions),
-                        signature=signature,
+                for row in rows:
+                    fact = facts.get(int(row.id))
+                    if fact is None:
+                        continue
+                    if row.vector_blob is None or row.content_hash is None:
+                        missing += 1
+                        continue
+                    expected_hash = documents.content_hash_fields(
+                        kind=fact.kind.value,
+                        category=fact.category,
+                        memory_key=fact.memory_key,
+                        content=fact.content,
                     )
-                )
+                    if str(row.content_hash) != expected_hash:
+                        missing += 1
+                        continue
+                    if fact.id in legacy_ids or not dream_canonical_owner_complete(fact):
+                        continue
+                    bot_ids = {"self"} if fact.scope_type.value == "self" else bots[fact.id]
+                    if len(bot_ids) > 1:
+                        ambiguous += 1
+                    candidates.append(
+                        DreamCandidate(
+                            fact=fact,
+                            bot_user_id=next(iter(bot_ids), "self"),
+                            vector=self._codec.decode(
+                                bytes(row.vector_blob), dimensions=dimensions
+                            ),
+                            signature=fact_signature(fact),
+                        )
+                    )
+                after_id = fact_ids[-1]
+                if len(rows) < 256:
+                    break
         return DreamCandidateLoad(
             candidates=tuple(candidates),
-            eligible_facts=len(rows),
+            eligible_facts=eligible,
             missing_embeddings=missing,
             ambiguous_bot_facts=ambiguous,
         )
-
-    @staticmethod
-    async def _fact_bot_ids(fact: MemoryFact, *, session: AsyncSession) -> set[str]:
-        if fact.scope_type.value == "self":
-            return {"self"}
-        event_ids = set(
-            await session.scalars(
-                select(ChatEventModel.bot_user_id)
-                .join(MemoryEvidenceModel, MemoryEvidenceModel.event_id == ChatEventModel.id)
-                .where(MemoryEvidenceModel.fact_id == fact.id)
-            )
-        )
-        tool_ids = set(
-            await session.scalars(
-                select(MemoryToolReceiptModel.bot_user_id)
-                .join(
-                    MemoryEvidenceModel,
-                    MemoryEvidenceModel.tool_receipt_id == MemoryToolReceiptModel.id,
-                )
-                .where(MemoryEvidenceModel.fact_id == fact.id)
-            )
-        )
-        return {str(item) for item in (*event_ids, *tool_ids) if item}
 
     async def checkpoint_map(self) -> dict[int, str]:
         async with self.database.sessions() as session:
@@ -1005,14 +1035,14 @@ class DreamRepository:
         await session.flush()
 
     async def cluster_facts(self, cluster: DreamCluster) -> tuple[MemoryFact, ...]:
-        rows: list[MemoryFact] = []
         async with self.database.sessions() as session:
-            for fact_id in cluster.fact_ids:
-                fact = await self._facts.get_fact(fact_id, session=session)
-                if fact is None:
-                    return ()
-                rows.append(fact)
-        return tuple(rows)
+            facts = {
+                fact.id: fact
+                for fact in await self._facts.get_facts(cluster.fact_ids, session=session)
+            }
+        if any(fact_id not in facts for fact_id in cluster.fact_ids):
+            return ()
+        return tuple(facts[fact_id] for fact_id in cluster.fact_ids)
 
     async def save_preview(
         self,

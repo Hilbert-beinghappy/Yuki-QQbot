@@ -127,26 +127,26 @@ async def read_history(
     target = selection.target
     if target.kind == "space":
         routes = await service.router.accessible_group_connections(
-            str(target.id), binding_id=selection.binding_id
+            str(target.id),
+            binding_id=selection.binding_id,
+            presence_id=selection.presence_id,
         )
-        if selection.presence_id:
-            routes = [route for route in routes if route.presence_id == selection.presence_id]
     else:
         binding_args = dict(args)
         if selection.binding_id:
             binding_args["binding_id"] = selection.binding_id
         binding = await service.person_binding(target, binding_args, context)
         async with service.database.sessions() as session:
-            query = select(PresenceModel.id).where(
+            query = select(PresenceModel).where(
                 PresenceModel.enabled.is_(True), PresenceModel.platform == "qq"
             )
             if selection.presence_id:
                 query = query.where(PresenceModel.id == selection.presence_id)
             presences = list(await session.scalars(query.order_by(PresenceModel.id)))
         routes = []
-        for presence_id in presences:
+        for presence in presences:
             try:
-                route = await service.router.resolve_presence(presence_id)
+                route = service.router._presence_connection(presence)
             except RouteSendError:
                 continue
             routes.append(
