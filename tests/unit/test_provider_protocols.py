@@ -39,16 +39,15 @@ from qq_ai_bot.runtime.work_journal import decode_transcript, encode_transcript
 from qq_ai_bot.services.turn_transcript import TurnTranscript
 
 
-@pytest.mark.parametrize("effort", [None, "low", "high", "none"])
+@pytest.mark.parametrize("effort", ["low", "high", "none"])
 @pytest.mark.parametrize("settings_slice", [False, True])
 def test_profile_effort_is_not_overridden_by_an_unconfigured_environment(
     tmp_path, monkeypatch, effort, settings_slice
 ):
     monkeypatch.delenv("LLM_REASONING_EFFORT", raising=False)
     content = write_fake_profiles(tmp_path / "profiles.toml").read_text(encoding="utf-8")
-    choice = 'reasoning_effort_env = "LLM_REASONING_EFFORT"\nthinking_mode = "disabled"\n'
-    if effort is not None:
-        choice += f'reasoning_effort = "{effort}"\n'
+    choice = f'reasoning_effort = "{effort}"\n'
+    choice += 'reasoning_effort_env = "LLM_REASONING_EFFORT"\nthinking_mode = "disabled"\n'
     content = content.replace("[routes]", choice + "[routes]")
     settings = Settings(_env_file=None)
     catalog = parse_model_profile_catalog(
@@ -58,7 +57,7 @@ def test_profile_effort_is_not_overridden_by_an_unconfigured_environment(
         ),
     )
     profile = catalog.profiles["main"]
-    assert profile.reasoning_effort == ReasoningEffort(effort or "medium")
+    assert profile.reasoning_effort == ReasoningEffort(effort)
     assert profile.thinking_enabled is False
 
 

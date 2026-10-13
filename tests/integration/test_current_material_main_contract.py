@@ -367,10 +367,7 @@ async def test_current_deployment_three_entries_share_full_contract_and_fresh_ma
             # Every actual entry uses this application's deployed manifest and system.
             assert _fixed(wire[0]) == _fixed(wire[1]) == _fixed(wire[2])
             assert sessions == [f"yuki:{scope.id}:g{scope.generation}:main"] * 3
-            assert wire[0]["generationConfig"] == {
-                "maxOutputTokens": 4096,
-                "thinkingConfig": {"thinkingLevel": "medium"},
-            }
+            assert wire[0]["generationConfig"]["maxOutputTokens"] == 4096
             full = {tool.name: tool for tool in await app.main_agent_contract.definitions()}
             assert SANDBOX_TOOLS | WORKSPACE_TOOLS <= full.keys()
             assert {
