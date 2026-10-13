@@ -269,12 +269,6 @@ class ToolRuntime:
     def effective_presence_id(self) -> str | None:
         return self.inbound.presence_id if self.inbound is not None else self.presence_id
 
-    @property
-    def image_present(self) -> bool:
-        return bool(
-            self.inbound is not None
-            and (self.inbound.attachments or self.inbound.reply_attachments)
-        )
 
     def require_actor(self) -> ToolActor:
         if self.inbound is not None:

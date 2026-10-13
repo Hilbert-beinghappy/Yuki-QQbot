@@ -219,7 +219,7 @@ class ApplicationContainer:
         self.emoji_selector = emoji.selector
         self.emoji_delivery = emoji.delivery
         self.emoji_worker = emoji.worker
-        self.concurrency = ConcurrencyManager(settings.global_llm_concurrency)
+        self.concurrency = ConcurrencyManager()
         self.turn_coordinator = ConversationTurnCoordinator(
             interrupt_autonomous_on_new_message=(
                 settings.conversation_interrupt_autonomous_on_new_message

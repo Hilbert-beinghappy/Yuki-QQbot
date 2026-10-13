@@ -22,7 +22,6 @@ from qq_ai_bot.capabilities import (
     InProcessToolProvider,
     ToolArtifactWriter,
     ToolExecutionResult,
-    ToolKernelMetrics,
     ToolProviderRegistry,
 )
 from qq_ai_bot.config import Settings
@@ -276,7 +275,6 @@ class ChatService:
         self._plugin_tools: PluginToolProvider | None = None
         self._tool_artifacts = tool_artifacts
         self._tool_invocations = tool_invocations
-        self._tool_metrics = ToolKernelMetrics()
         self._time = time_service
         if memory_context is None:
             memory_repository = MemoryFactRepository(self._ledger._database)
@@ -1020,8 +1018,6 @@ class ChatService:
                     runtime_config,
                     native_images=native_images,
                     attachment_text=attachment_text,
-                    turn_origin=turn_origin,
-                    memory_session=memory_session,
                     turn_snapshot=turn_snapshot,
                 )
                 preparation.advance("work_activation")
@@ -1172,10 +1168,8 @@ class ChatService:
         content: str,
         runtime: RuntimeConfigSnapshot,
         *,
-        turn_origin: TurnOrigin = TurnOrigin.USER_MESSAGE,
         native_images: tuple[ChatImage, ...] = (),
         attachment_text: str = "",
-        memory_session: TurnMemorySession | None = None,
         turn_snapshot: ConversationTurnSnapshot | None = None,
     ) -> tuple[
         tuple[ChatMessage, ...],
@@ -1691,14 +1685,6 @@ class ChatService:
                 config.tooling.result_artifact_retention_seconds
             )
         return runtime
-
-    @staticmethod
-    def _decode_tool_result(value: str) -> dict[str, object]:
-        try:
-            payload = json.loads(value)
-        except json.JSONDecodeError:
-            return {"ok": False, "error": "invalid_tool_result"}
-        return payload if isinstance(payload, dict) else {"ok": False}
 
     async def _record_outbound_message(
         self,

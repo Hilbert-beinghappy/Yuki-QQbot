@@ -15,7 +15,6 @@ from qq_ai_bot.capabilities.coordinator import (
     ToolInvocationCoordinator,
 )
 from qq_ai_bot.capabilities.invocation import ToolInvocationContext
-from qq_ai_bot.capabilities.metrics import ToolKernelMetrics
 from qq_ai_bot.capabilities.models import (
     AuthorityContext,
     CapabilityDescriptor,
@@ -58,7 +57,6 @@ __all__ = [
     "ToolExecutionResult",
     "ToolInvocationContext",
     "ToolInvocationCoordinator",
-    "ToolKernelMetrics",
     "ToolProvider",
     "ToolProviderRegistry",
     "ToolResultBudgeter",

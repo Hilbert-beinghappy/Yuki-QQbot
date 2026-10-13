@@ -101,7 +101,7 @@ async def _service(
         facts=facts,
         ledger=ledger,
         model_executor=InjectedModelExecutor(provider),
-        concurrency=ConcurrencyManager(2),
+        concurrency=ConcurrencyManager(),
     )
     service = MemoryRebuildService(
         settings=settings,
