@@ -1246,37 +1246,30 @@ class MemoryFactRepository:
             )
             if scope_type != MemoryScopeType.SELF.value:
                 raise ValueError("agent reflection evidence is only valid for self memory")
-        from qq_ai_bot.identity.memory_guard import v2_evidence_event_chain_readable
-
         fact_row = await session.get(MemoryFactModel, fact_id)
         if fact_row is None:
             return False
-        if evidence.event_id is not None:
-            event = await session.get(ChatEventModel, evidence.event_id)
-            if event is None or not await v2_evidence_event_chain_readable(
-                session, fact_row, event
-            ):
-                return False
-        else:
-            receipt = await session.get(MemoryToolReceiptModel, evidence.tool_receipt_id)
-            if receipt is None:
-                return False
-            if receipt.trigger_event_id is None:
-                from qq_ai_bot.memory.self_origin import receipt_evidence_readable
-
-                if not await receipt_evidence_readable(
-                    session,
-                    fact=fact_row,
-                    evidence=evidence,
-                    receipt=receipt,
-                ):
-                    return False
-            else:
-                trigger = await session.get(ChatEventModel, receipt.trigger_event_id)
-                if trigger is None or not await v2_evidence_event_chain_readable(
-                    session, fact_row, trigger
-                ):
-                    return False
+        source = select(
+            literal(evidence.event_id).label("event_id"),
+            literal(evidence.tool_receipt_id).label("tool_receipt_id"),
+            literal(evidence.source_speaker_user_id).label("source_speaker_user_id"),
+            literal(evidence.relation.value).label("relation"),
+            literal(evidence.authority.value).label("authority"),
+            literal(evidence.excerpt).label("excerpt"),
+        ).subquery("prepared_evidence")
+        if not await session.scalar(
+            select(MemoryFactModel.id)
+            .join(source, true())
+            .where(
+                MemoryFactModel.id == fact_id,
+                readable_evidence_predicate(
+                    evidence=source.c,
+                    evidence_table=source,
+                    evidence_alias="prepared_evidence",
+                ),
+            )
+        ):
+            return False
         created_at = datetime.now(UTC)
         statement = insert(MemoryEvidenceModel).values(
             fact_id=fact_id,
