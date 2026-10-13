@@ -6,6 +6,7 @@ import asyncio
 import json
 import logging
 import time
+from collections.abc import Awaitable, Callable
 from contextlib import AbstractContextManager, nullcontext
 from dataclasses import replace
 from typing import TYPE_CHECKING, Any
@@ -323,13 +324,65 @@ class MainAgentBackend(AgentToolBackend):
             and await control.has_pending_business_inputs()
         ):
             return _refused_result(name, "new_input_before_execution")
-        if name == "update_short_state" and self._service.runtime.runner.main_contract is not None:
-            outcome = await self._service.runtime.runner.main_contract.state.execute(arguments_json)
-            return (await ToolResultBudgeter(max_characters=None).render(outcome)).text
+
+        async def invoke_effect(
+            action: Callable[[], Awaitable[ToolExecutionResult]],
+        ) -> ToolExecutionResult:
+            from qq_ai_bot.runtime.work_activation import current_work_control
+
+            work = current_work_control.get()
+            if work is not None:
+                if name != "send_message":
+                    await work.validate()
+                if not await work.repository.valid(work.lease):
+                    raise TurnSupersededError("work activation changed")
+                if name != "send_message" and await work.has_pending_business_inputs():
+                    return ToolExecutionResult(
+                        ok=False,
+                        data={"executed": False},
+                        error_code="new_input_before_execution",
+                        public_message="新要求已到达，此调用未执行，请按新要求继续。",
+                        retryable=True,
+                        mutation_committed=False,
+                    )
+            return await action()
+
         if self._runtime.tools_closed:
             return _refused_result(
                 name, "tools_closed", detail="本轮只声明会话前缀工具 schema，不允许真实调用。"
             )
+        if name == "update_short_state" and contract is not None:
+            state = contract.state
+            execution_runtime = self._request_runtime()
+            if execution_runtime.turn_token is not None:
+                await self._service._turn_coordinator.mark_mutation_started(
+                    execution_runtime.turn_token
+                )
+            state_started = False
+
+            async def invoke_state() -> ToolExecutionResult:
+                nonlocal state_started
+                state_started = True
+                return await state.execute(arguments_json)
+
+            try:
+                outcome = await self._service.run_effect(
+                    execution_runtime.turn_snapshot, lambda: invoke_effect(invoke_state)
+                )
+            except (asyncio.CancelledError, WorkBudgetExceeded):
+                raise
+            except Exception as exc:
+                outcome = ToolExecutionResult(
+                    ok=False,
+                    error_code=type(exc).__name__,
+                    public_message="工具执行失败",
+                    retryable=False,
+                    uncertain=state_started,
+                    mutation_committed=None if state_started else False,
+                    provider_id="host_prefix",
+                    tool_name=name,
+                )
+            return (await ToolResultBudgeter(max_characters=None).render(outcome)).text
         capability_runtime = self._capability_runtime
         if capability_runtime is not None:
             validation = capability_runtime.validate_call_result(name, arguments_json)
@@ -388,20 +441,6 @@ class MainAgentBackend(AgentToolBackend):
                     from qq_ai_bot.runtime.work_activation import current_work_control
 
                     work = current_work_control.get()
-                    if work is not None:
-                        if name != "send_message":
-                            await work.validate()
-                        if not await work.repository.valid(work.lease):
-                            raise TurnSupersededError("work activation changed")
-                        if name != "send_message" and await work.has_pending_business_inputs():
-                            return ToolExecutionResult(
-                                ok=False,
-                                data={"executed": False},
-                                error_code="new_input_before_execution",
-                                public_message="新要求已到达，此调用未执行，请按新要求继续。",
-                                retryable=True,
-                                mutation_committed=False,
-                            )
                     binding_started = True
                     if self.counts_toward_limit(name, runtime):
                         self.failed_tool_calls += 1
@@ -440,7 +479,7 @@ class MainAgentBackend(AgentToolBackend):
 
                 outcome = await self._service.run_effect(
                     None if name == "send_message" else execution_runtime.turn_snapshot,
-                    invoke_binding,
+                    lambda: invoke_effect(invoke_binding),
                 )
             except (asyncio.CancelledError, WorkBudgetExceeded):
                 raise
