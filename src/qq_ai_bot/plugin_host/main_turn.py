@@ -118,7 +118,6 @@ async def run_plugin_main_turn(
                     text="",
                     tool_calls_used=0,
                     model_requests=0,
-                    web_was_used=False,
                     work_id=row["id"],
                     work_state=row["state"],
                     suppress_delivery=True,
@@ -134,7 +133,6 @@ async def run_plugin_main_turn(
                     text="",
                     tool_calls_used=0,
                     model_requests=0,
-                    web_was_used=False,
                     work_id=row["id"],
                     work_state=row["state"],
                     suppress_delivery=True,
@@ -391,7 +389,6 @@ async def _execute_plugin_main_turn(
                     text="",
                     tool_calls_used=0,
                     model_requests=0,
-                    web_was_used=False,
                     work_id=cast(dict[str, Any], active.current)["id"],
                     work_state="waiting_external",
                     suppress_delivery=True,
@@ -529,8 +526,6 @@ async def resume_plugin_work(
     if source.get("approval_revision") != host._services.approval_revision:
         raise PluginPermissionError("plugin approved version changed")
     permission = PluginPermission(source["permission"])
-    if permission not in host._approved_permissions:
-        raise PluginPermissionError("plugin work permission was revoked")
     allowed = frozenset(source["allowed_tools"])
     if not allowed <= host._services.agent_capabilities:
         raise PluginPermissionError("plugin work capabilities changed")

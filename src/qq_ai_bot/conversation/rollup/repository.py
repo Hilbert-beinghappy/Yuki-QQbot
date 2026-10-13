@@ -58,7 +58,6 @@ from qq_ai_bot.conversation.rollup.prompt_accounting import (
     durable_uncovered_characters,
     prompt_accounting_characters,
     prompt_visible_event_count,
-    source_accounting_characters,
 )
 from qq_ai_bot.conversation.rollup.renderer import (
     serialize_compaction_source_events,
@@ -567,8 +566,6 @@ class ConversationRollupRepository:
         return await self._policy_for_scope(scope) if self._policy_for_scope else self._config
 
     async def _claim_policy(self, claim: RollupJobClaim) -> RollupPolicyConfig:
-        if claim.conversation_id is None:
-            raise RollupLeaseLostError("canonical rollup claim has no conversation")
         from qq_ai_bot.runtime.work_schema_v1 import work
 
         policy = self._config
@@ -734,8 +731,6 @@ class ConversationRollupRepository:
             )
 
     async def heartbeat(self, claim: RollupJobClaim, *, lease_seconds: int) -> RollupJobClaim:
-        if not claim.conversation_id:
-            raise RollupLeaseLostError("canonical rollup claim has no conversation")
         async with self._database.immediate_session() as session:
             now = _utcnow()
             renewed = now + timedelta(seconds=lease_seconds)
@@ -760,8 +755,6 @@ class ConversationRollupRepository:
         self, claim: RollupJobClaim, *, emergency: bool = False, token_budget: int | None = None
     ) -> RollupCandidate | None:
         now = _utcnow()
-        if not claim.conversation_id:
-            raise RollupLeaseLostError("canonical rollup claim has no conversation")
         policy = await self._claim_policy(claim)
         if token_budget is not None:
             policy = replace(policy, context_token_budget=max(1, token_budget))
@@ -779,8 +772,6 @@ class ConversationRollupRepository:
         """Delete only an unchanged job; otherwise restore it to pending."""
 
         now = _utcnow()
-        if not claim.conversation_id:
-            raise RollupLeaseLostError("canonical rollup claim has no conversation")
         async with self._database.sessions() as session, session.begin():
             coverage_hold = await self._coverage_holds.earliest_source_event_id(
                 session,
@@ -848,8 +839,6 @@ class ConversationRollupRepository:
             if summary_kind is RollupKind.MODEL
             else set()
         )
-        if not claim.conversation_id:
-            raise RollupLeaseLostError("canonical rollup claim has no conversation")
 
         async def commit(session: AsyncSession) -> RollupCommitResult:
             return await self._commit_canonical_candidate(
@@ -881,8 +870,6 @@ class ConversationRollupRepository:
         normalized = summary_text.strip()
         if not normalized:
             raise ValueError("summary violates configured output bounds")
-        if not claim.conversation_id:
-            raise RollupLeaseLostError("canonical rollup claim has no conversation")
 
         async def commit(session: AsyncSession) -> RollupCommitResult:
             return await self._commit_canonical_emergency_overlay(
@@ -903,16 +890,15 @@ class ConversationRollupRepository:
         self, operation: Callable[[AsyncSession], Awaitable[RollupCommitResult]]
     ) -> RollupCommitResult:
         """Reprepare only a rolled-back DB plan, retaining the original paid output."""
-        for attempt in range(3):
+        while True:
             try:
                 async with self._database.sessions() as session, session.begin():
                     # Legacy sqlite3 SELECT does not begin a read transaction.
                     await session.execute(text("BEGIN"))
                     return await operation(session)
             except OperationalError as exc:
-                if getattr(exc.orig, "sqlite_errorcode", None) != 517 or attempt == 2:
+                if getattr(exc.orig, "sqlite_errorcode", None) != 517:
                     raise
-        raise AssertionError("unreachable rollup snapshot retry")
 
     async def retry_infrastructure(
         self,
@@ -921,8 +907,6 @@ class ConversationRollupRepository:
         error_category: str,
         retry_max_seconds: int,
     ) -> None:
-        if not claim.conversation_id:
-            raise RollupLeaseLostError("canonical rollup claim has no conversation")
         async with self._database.immediate_session() as session:
             now = _utcnow()
             job = await session.scalar(
@@ -1328,10 +1312,6 @@ class ConversationRollupRepository:
         batch = take_batch(all_events, self.config)
         if not batch:
             return None
-        characters = source_accounting_characters(
-            batch,
-            timezone=self.config.timezone,
-        )
         fingerprint = source_fingerprint(
             conversation_id=claim.conversation_id,
             generation=claim.generation,
@@ -1347,8 +1327,6 @@ class ConversationRollupRepository:
             source_rollup_revision=revision,
             previous_summary=previous,
             events=batch,
-            event_count=len(batch),
-            projection_characters=characters,
             fingerprint=fingerprint,
         )
 
@@ -1473,10 +1451,8 @@ class ConversationRollupRepository:
                 )
             ).all()
         )
-        events = await _with_proactive_cause_metadata(
-            session,
-            tuple(_event_record(row) for row in rows),
-        )
+        raw_events = tuple(_event_record(row) for row in rows)
+        events = await _with_proactive_cause_metadata(session, raw_events)
         fingerprint = source_fingerprint(
             conversation_id=candidate.conversation_id,
             generation=candidate.generation,
@@ -1494,7 +1470,7 @@ class ConversationRollupRepository:
         remaining_count = conversation.uncovered_event_count - len(events)
         remaining_characters = (
             conversation.uncovered_character_count
-            - durable_uncovered_characters(events, **_prompt_kwargs(self.config))
+            - durable_uncovered_characters(raw_events, **_prompt_kwargs(self.config))
         )
         if min(remaining_count, remaining_characters) < 0:
             raise ConversationCoverageError("rollup uncovered counters changed or drifted")
