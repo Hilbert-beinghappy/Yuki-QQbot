@@ -5,8 +5,7 @@ from __future__ import annotations
 import time
 
 from qq_ai_bot.admin.audit import AdminAuditService
-from qq_ai_bot.admin.config_service import RuntimeConfigService
-from qq_ai_bot.admin.models import ConfigChangeResult, ControlAuditRef
+from qq_ai_bot.admin.models import ControlAuditRef
 from qq_ai_bot.control_plane.principal import ControlPrincipal, PrincipalSource
 from qq_ai_bot.control_plane.targets import SpaceControlTarget
 from qq_ai_bot.domain.control import DecisionContext
@@ -17,17 +16,15 @@ type SpaceAdminContext = DecisionContext[ControlPrincipal, PrincipalSource, Spac
 
 
 class GroupAdminService:
-    """Manage group admission and group-scoped runtime settings."""
+    """Manage group admission."""
 
     def __init__(
         self,
         *,
         groups: GroupSettingsRepository,
-        runtime_config: RuntimeConfigService,
         audit: AdminAuditService,
     ) -> None:
         self._groups = groups
-        self._runtime_config = runtime_config
         self._audit = audit
 
     async def enable_current_group(
@@ -45,26 +42,6 @@ class GroupAdminService:
         audit: ControlAuditRef,
     ) -> GroupSetting:
         return await self._set_enabled(context, False, audit=audit)
-
-    async def set_group_config(
-        self,
-        context: SpaceAdminContext,
-        key: str,
-        value: object,
-        *,
-        audit: ControlAuditRef,
-    ) -> ConfigChangeResult:
-        require_capability(context, "control.group.mutate")
-        group_id = _space_storage_id(context)
-        return await self._runtime_config.set_override(
-            key,
-            value,
-            scope_type="group",
-            scope_id=group_id,
-            actor_user_id=audit.user_id,
-            trigger_message_id=audit.trigger_message_id,
-            conversation_key=audit.conversation_key,
-        )
 
     async def _set_enabled(
         self,
