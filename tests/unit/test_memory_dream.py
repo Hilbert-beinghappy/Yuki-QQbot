@@ -379,7 +379,7 @@ async def test_dream_worker_recovers_disabled_owner_same_run_and_preserves_actua
     case = SimpleNamespace(provider=provider, runner=SimpleNamespace())
     client, captured = wire(case, "chat")
     service._structured = StructuredTaskRunner(case.runner._models)
-    service._concurrency = ConcurrencyManager(2)
+    service._concurrency = ConcurrencyManager()
     run = await dreams.create_run(
         mode=DreamRunMode.FULL,
         statistics=_empty_dream_statistics(),
@@ -505,7 +505,7 @@ async def test_single_source_dream_uses_saved_model_output_and_original_receipt(
     service._settings = make_settings(database.url)
     service._facts, service._mutations, service._repository = facts, mutations, dreams
     service._structured = StructuredTaskRunner(InjectedModelExecutor(provider))
-    service._concurrency = ConcurrencyManager(2)
+    service._concurrency = ConcurrencyManager()
     run = await dreams.create_run(
         mode=DreamRunMode.FULL,
         statistics=_empty_dream_statistics(),
@@ -1147,7 +1147,7 @@ async def test_dream_recompose_consumes_actual_outputs_and_normalizes_model_meta
     service._settings = make_settings(database.url)
     service._facts, service._mutations, service._repository = facts, mutations, dreams
     service._structured = StructuredTaskRunner(InjectedModelExecutor(provider))
-    service._concurrency = ConcurrencyManager(2)
+    service._concurrency = ConcurrencyManager()
     run = await dreams.create_run(
         mode=DreamRunMode.FULL,
         statistics=_empty_dream_statistics(),

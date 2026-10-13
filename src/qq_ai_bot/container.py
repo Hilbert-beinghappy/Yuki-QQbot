@@ -171,7 +171,6 @@ class ApplicationContainer:
         self.model_profiles = model_runtime.profiles
         self.model_clients = model_runtime.clients
         self.model_invocations = model_runtime.invocations
-        self.model_router = model_runtime.router
         self.models = model_runtime.executor
         self.provider = model_runtime.chat_provider
         self.web_module = WebModule(
@@ -220,7 +219,7 @@ class ApplicationContainer:
         self.emoji_selector = emoji.selector
         self.emoji_delivery = emoji.delivery
         self.emoji_worker = emoji.worker
-        self.concurrency = ConcurrencyManager(settings.global_llm_concurrency)
+        self.concurrency = ConcurrencyManager()
         self.turn_coordinator = ConversationTurnCoordinator(
             interrupt_autonomous_on_new_message=(
                 settings.conversation_interrupt_autonomous_on_new_message
@@ -490,10 +489,8 @@ class ApplicationContainer:
         )
         plugins = self.plugin_module.build()
         self.plugins = plugins
-        self.plugin_installations = plugins.installations
         self.plugin_config_values = plugins.config_values
         self.plugin_state = plugins.state
-        self.plugin_audit_repository = plugins.audit_repository
         self.plugin_audit = plugins.audit
         self.plugin_session_repository = plugins.session_repository
         self.plugin_sessions = plugins.sessions
@@ -777,20 +774,13 @@ class ApplicationContainer:
         self.plugin_notification_outbox.wake()
         self.plugin_background_turns.wake()
 
-    def _plugin_invocation_scope(
-        self,
-        plugin_id: str,
-        runtime: ToolRuntimeProjection,
-        *,
-        web_was_used: bool,
-    ) -> object:
+    def _plugin_invocation_scope(self, plugin_id: str, runtime: ToolRuntimeProjection) -> object:
         context = self._plugin_contexts.get(plugin_id)
         if context is None:
             raise RuntimeError("plugin is not running")
         return context.invocation_scope(
             plugin_id,
             runtime,
-            web_was_used=web_was_used,
         )
 
     def _plugin_signal_scope(

@@ -473,6 +473,65 @@ async def test_retained_child_resumes_without_reopening_ancestors_or_resetting_b
     await repo.release(parent.lease)
 
 
+async def test_neutral_resume_cannot_borrow_another_persons_child(database, tmp_path):
+    from qq_ai_bot.identity.canonical_repository import ensure_person
+    from qq_ai_bot.runtime.work_queries import WorkQueries
+    from qq_ai_bot.runtime.work_schema_v1 import inputs
+
+    repo, workers, parent_lease, parent, identity = await stack(database, tmp_path)
+    child_lease = await workers.acquire(identity)
+    child = await repo.get(identity)
+    await repo.transition(child_lease, identity, child["revision"], "waiting_user")
+    await repo.release(child_lease)
+    child = await repo.get(identity)
+    async with database.immediate_session() as writer:
+        owner = await ensure_person(writer, "10001")
+        other = await ensure_person(writer, "10002")
+        source = {"actor_person_id": owner, "principal_kind": "person", "origin": "user_message"}
+        for row in (parent, child):
+            original = json.loads(row["source_json"])
+            await writer.execute(
+                update(work)
+                .where(work.c.id == row["id"])
+                .values(source_json=json.dumps({**original, **source}))
+            )
+    control = SimpleNamespace(
+        repository=repo,
+        lease=parent_lease,
+        current=None,
+        source={**source, "actor_person_id": other},
+    )
+    # The shared directory intentionally exposes safe metadata, not authority.
+    assert await WorkQueries(repo).get(parent_lease, control.source, identity) is not None
+    before = await repo.get(identity)
+    root_before = await repo.get(parent["id"])
+    async with database.sessions() as reader:
+        original_inputs = list((await reader.execute(select(inputs))).mappings())
+    with pytest.raises(ValueError, match="subagent_archived_or_unknown"):
+        await execute_subagent(
+            control,
+            "subagent_control",
+            {"action": "resume", "child_id": identity, "instruction": "replace original goal"},
+            "borrowed-child",
+        )
+    assert await repo.get(identity) == before
+    assert await repo.get(parent["id"]) == root_before
+    async with database.sessions() as reader:
+        assert list((await reader.execute(select(inputs))).mappings()) == original_inputs
+    control.source = {**source, "actor_user_id": "new-account-for-the-same-person"}
+    resumed = await execute_subagent(
+        control,
+        "subagent_control",
+        {"action": "resume", "child_id": identity},
+        "original-owner",
+    )
+    assert resumed["children"][0]["state"] == "queued"
+    after = await repo.get(identity)
+    assert after["goal"] == before["goal"] and after["source_json"] == before["source_json"]
+    assert await repo.get(parent["id"]) == root_before
+    await repo.release(parent_lease)
+
+
 @pytest.mark.parametrize("state", ["suspended", "waiting_user", "failed"])
 async def test_paused_child_resumes_original_goal_without_a_new_instruction(
     database, tmp_path, state
@@ -907,6 +966,9 @@ async def test_paused_descendant_retains_terminal_ancestors_and_resumes_without_
     before = await repo.get(leaf_id)
     await workers.maintain()
     assert (await workers.related(archived_root["id"], archived_child))["archived_at"] is not None
+    original_roots = {
+        item["id"]: await repo.get(item["id"]) for item in (branch, root, archived_root)
+    }
     plugin_id = "test.legacy-background-gc"
     notifications = await approve_background_plugin(
         database,
@@ -991,6 +1053,11 @@ async def test_paused_descendant_retains_terminal_ancestors_and_resumes_without_
             update(work).where(work.c.id == caller["id"]).values(updated=time.time() - 10 * 86400)
         )
     original_caller = await repo.get(caller["id"])
+    original_plain = await repo.get(plain["id"])
+    async with database.sessions() as reader:
+        original_legacy = list(
+            (await reader.execute(select(work).where(work.c.id.in_(legacy.values())))).mappings()
+        )
     for index in range(130):
         newer = await repo.accept(
             parent_lease, source_key=f"newer-terminal:{index}", source={}, goal="finished receipt"
@@ -999,9 +1066,9 @@ async def test_paused_descendant_retains_terminal_ancestors_and_resumes_without_
             parent_lease, newer["id"], {"action": "complete", "call_key": f"newer-done:{index}"}
         )
         await repo.transition(parent_lease, newer["id"], newer["revision"], "completed")
-    await repo.reclaim_terminal()
-    await repo.reclaim_terminal()
-    assert await repo.get(plain["id"]) is None
+    await repo.reclaim_unreferenced_media()
+    await repo.reclaim_unreferenced_media()
+    assert await repo.get(plain["id"]) == original_plain
     assert await repo.get(caller["id"]) == original_caller
     assert (
         json.loads(original_caller["checkpoint_json"])["sync_result"]
@@ -1012,24 +1079,18 @@ async def test_paused_descendant_retains_terminal_ancestors_and_resumes_without_
             list((await reader.execute(select(PluginBackgroundTurnJobModel.__table__))).mappings())
             == jobs_before
         )
-        archived_legacy = (
+        retained_legacy = (
             (await reader.execute(select(work).where(work.c.id.in_(legacy.values()))))
             .mappings()
             .all()
         )
-    assert {item["id"] for item in archived_legacy} == set(legacy.values())
-    for item in archived_legacy:
-        assert json.loads(item["checkpoint_json"]) == {"archived": True}
-        source = json.loads(item["source_json"])
-        assert source["owner"] == "plugin_background" and source["plugin_id"] == plugin_id
-        assert legacy[source["trigger_event_id"]] == item["id"]
-        assert "instruction" not in source and "context_data" not in source
+    assert retained_legacy == original_legacy
     retained = await workers.related(branch["id"], leaf_id)
     assert retained["archived_at"] is None
     assert (await repo.get(leaf_id))["checkpoint_json"] == before["checkpoint_json"]
     assert (await repo.get(leaf_id))["source_json"] == before["source_json"]
-    for item in (branch, root, archived_root):
-        assert json.loads((await repo.get(item["id"]))["checkpoint_json"]) == {"archived": True}
+    for identity, original in original_roots.items():
+        assert await repo.get(identity) == original
     from qq_ai_bot.runtime.work_tree import ancestor_work_ids, budget_root_id
 
     async with database.sessions() as reader:

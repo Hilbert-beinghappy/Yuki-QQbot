@@ -80,6 +80,12 @@ def _key(message: InboundMessage) -> str:
     return runtime_conversation_key(identity=message.scope(), inbound=message)
 
 
+async def _wait_for_worker(service: AutonomousGroupService, scope_key: str) -> None:
+    while (state := service._states.get(scope_key)) is not None and state.task is not None:
+        await asyncio.shield(state.task)
+        await asyncio.sleep(0)
+
+
 async def test_worker_attempts_only_latest_source_and_ignores_older_classification() -> None:
     service = _service(_policy(debounce=0.05))
     attempts: list[int] = []
@@ -98,7 +104,7 @@ async def test_worker_attempts_only_latest_source_and_ignores_older_classificati
     # A slower classification of an older source neither wins nor extends the window.
     service.observe(_message(101), ordinary_attempt=attempt_for(101))
     service.observe(_message(102), ordinary_attempt=attempt_for(102))
-    await service.wait_until_idle(_key(first))
+    await _wait_for_worker(service, _key(first))
 
     assert attempts == [102]
 
@@ -121,8 +127,8 @@ async def test_worker_window_zero_runs_ordinary_even_without_autonomy() -> None:
     service.observe(_message(8, group="20002"), ordinary_attempt=other)
     # Legacy observation without an attempt still needs autonomy and stays idle.
     service.observe(_message(9, group="20003"))
-    await service.wait_until_idle(_key(message))
-    await service.wait_until_idle(_key(_message(8, group="20002")))
+    await _wait_for_worker(service, _key(message))
+    await _wait_for_worker(service, _key(_message(8, group="20002")))
 
     assert attempts == [1] and other_group == [1]
     await service.close()
@@ -200,7 +206,7 @@ async def test_open_floor_fragments_admit_one_turn_for_latest_source(database, t
     assert resent.reason == "group_observed"
     assert coordinator._states[key].version == version
 
-    await autonomous.wait_until_idle(key)
+    await _wait_for_worker(autonomous, key)
     admitted = await _admissions(database)
     assert [row.event_id for row in admitted] == [latest]
     assert len(provider.requests) >= 1
@@ -219,7 +225,7 @@ async def test_explicit_call_during_window_cancels_pending_open_source(database,
     pending = next(iter(harness.processor._observed_human_turns.values()))
     direct = await harness.processor.handle(message(2, "帮我看看", mention=True), sender)
     assert direct.reason == "chat"
-    await autonomous.wait_until_idle(pending.snapshot.scope_key)
+    await _wait_for_worker(autonomous, pending.snapshot.scope_key)
 
     admitted = await _admissions(database)
     assert len(admitted) == 1
@@ -242,7 +248,7 @@ async def test_open_floor_rechecks_require_mention_when_window_closes(database, 
             .where(CanonicalSpaceModel.id == env.space)
             .values(require_mention=True)
         )
-    await autonomous.wait_until_idle(pending.snapshot.scope_key)
+    await _wait_for_worker(autonomous, pending.snapshot.scope_key)
 
     assert await _admissions(database) == [] and provider.requests == []
     await autonomous.close()
@@ -468,7 +474,7 @@ async def test_open_floor_merge_keeps_prior_voice_in_actual_main_input(database,
         assert (
             await harness.processor.handle(message(2, "请按刚才语音的要求处理"), MemorySender())
         ).reason == "ordinary_deferred"
-        await worker.wait_until_idle(observed.snapshot.scope_key)
+        await _wait_for_worker(worker, observed.snapshot.scope_key)
         event = await harness.ledger.get_event(observed.record.id)
         assert VOICE_REQUIREMENT in event.audio_transcript
         assert len(await _admissions(database)) == 1

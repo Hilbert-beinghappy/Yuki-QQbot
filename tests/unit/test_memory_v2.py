@@ -237,7 +237,7 @@ async def test_worker_propagates_cancellation(database: Database) -> None:
         facts=MemoryFactService(MemoryFactRepository(database)),
         ledger=ledger,
         model_executor=InjectedModelExecutor(_CancelledProvider()),
-        concurrency=ConcurrencyManager(1),
+        concurrency=ConcurrencyManager(),
     )
     with pytest.raises(asyncio.CancelledError):
         await worker.process_once()
