@@ -21,7 +21,7 @@ from qq_ai_bot.conversation.projections import (
 from qq_ai_bot.domain.messages import ChatMessage, ChatRequest, InboundMessage
 from qq_ai_bot.event_prompt import ChatEventPromptRenderer
 from qq_ai_bot.execution_trace.phases import collect_phase_metrics
-from qq_ai_bot.model_runtime.capacity import ModelCapacity, estimate_request_tokens
+from qq_ai_bot.model_runtime.capacity import estimate_request_tokens
 from qq_ai_bot.persistence.database import Database
 from qq_ai_bot.persistence.event_repository import EventLedgerRepository
 from qq_ai_bot.runtime.activation_tasks import ActivationTasks
@@ -154,12 +154,7 @@ class MainAgentTurnService:
             assert conversation_id is not None
             repository = self._projections
             view_key = conversation_id
-            capacity_getter = getattr(self._runner._models, "capacity", None)
-            capacity = (
-                capacity_getter(self._runner._task)
-                if callable(capacity_getter)
-                else ModelCapacity()
-            )
+            capacity = self._runner._models.capacity(self._runner._task)
             input_budget = capacity.input_budget(
                 runtime.context.window_tokens, output_tokens=runtime.llm.max_output_tokens
             )
