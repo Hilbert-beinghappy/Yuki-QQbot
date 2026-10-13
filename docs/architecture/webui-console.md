@@ -13,7 +13,8 @@ React + TypeScript + Vite 的正式前端位于 `frontend/`，构建产物进入
 `/api/control/` 调用正在运行的 `ApplicationContainer.control_plane`。
 没有第二个 Bot、独立数据库、前端业务执行器或通用工具 RPC。
 
-复用经确认的 crescent-grove 手帐布局、五种主题、CSS 和 SVG；许可证随静态资源
+复用经确认的 crescent-grove 手帐布局、五种主题及实际使用的 CSS 和 SVG；未使用的模板
+选择器、动画和素材已清除，保留素材的许可证随静态资源
 进入 wheel 和容器。旧预览脚本和示例业务数据没有进入正式前端。
 服务器数据不通过外部 CDN、浏览器存储或第三方脚本分发。
 
