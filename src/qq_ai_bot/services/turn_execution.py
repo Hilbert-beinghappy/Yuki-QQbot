@@ -156,8 +156,6 @@ class _OrdinarySummaryDispatch:
                 await self.runtime.before_model_request()
         if self.control is not None:
             await self.control.reserve_request(auxiliary=True)
-        elif self.runtime.admit_model_request is not None:
-            await self.runtime.admit_model_request()
         self.runtime.auxiliary_requests[0] += 1
         self.runner._record_failure_usage(
             self.tools,
@@ -254,8 +252,6 @@ class _PrimaryDispatch:
                 if work_session is not None:
                     work_session.public_event_ids.update(self.selected_boundary.event_ids)
         else:
-            if self.runtime.admit_model_request is not None:
-                await self.runtime.admit_model_request()
             if self.selected_boundary is not None:
                 await self.selected_boundary.commit()
                 self.observed_event_ids.update(self.selected_boundary.event_ids)
