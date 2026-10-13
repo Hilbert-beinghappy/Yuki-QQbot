@@ -503,6 +503,41 @@ async def test_unmatched_group_voice_does_not_buy_asr_or_enqueue_memory(database
         await worker.close()
 
 
+@pytest.mark.parametrize("waiting", [False, True])
+async def test_overlong_implicit_group_input_keeps_original_wait_unpublished(
+    database, tmp_path, waiting
+):
+    provider = FakeLLMProvider()
+    env, harness, worker, message = await _open_group_scene(
+        database, tmp_path, provider, debounce=60
+    )
+    async with database.immediate_session() as writer:
+        await writer.execute(
+            update(CanonicalSpaceModel)
+            .where(CanonicalSpaceModel.id == env.space)
+            .values(require_mention=True)
+        )
+    if waiting:
+        repository, control, _registered = await _original_wait(database, env)
+    sender = MemorySender()
+    try:
+        result = await harness.processor.handle(
+            message(1, "x" * (harness.settings.max_input_characters + 1)), sender
+        )
+        assert result.reason == ("input_too_long" if waiting else "group_observed")
+        assert not await _admissions(database) and not provider.requests
+        assert len(sender.messages) == int(waiting)
+        if waiting:
+            assert "消息过长" in sender.messages[0].text
+            assert (await WorkWaitRepository(repository).describe(control.current["id"]))[
+                "status"
+            ] == "active"
+        async with database.sessions() as reader:
+            assert await reader.scalar(select(inputs.c.id)) is None
+    finally:
+        await worker.close()
+
+
 async def test_wait_source_generation_change_during_asr_does_not_publish(database, tmp_path):
     provider = FakeLLMProvider()
     env, harness, worker, message = await _open_group_scene(

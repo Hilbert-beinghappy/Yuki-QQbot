@@ -139,7 +139,7 @@ class DreamWorker:
                 try:
                     await self._schedule_if_due()
                     await self._drain_active()
-                except (OSError, RuntimeError, ValueError, IntegrityError) as exc:
+                except Exception as exc:
                     logger.warning("memory_dream_loop_failed error_category=%s", type(exc).__name__)
             self._wake.clear()
             try:
