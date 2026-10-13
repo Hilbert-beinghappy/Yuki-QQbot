@@ -530,8 +530,6 @@ async def resume_plugin_work(
     if source.get("approval_revision") != host._services.approval_revision:
         raise PluginPermissionError("plugin approved version changed")
     permission = PluginPermission(source["permission"])
-    if permission not in host._approved_permissions:
-        raise PluginPermissionError("plugin work permission was revoked")
     allowed = frozenset(source["allowed_tools"])
     if not allowed <= host._services.agent_capabilities:
         raise PluginPermissionError("plugin work capabilities changed")
