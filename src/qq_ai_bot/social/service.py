@@ -1217,7 +1217,6 @@ class SocialService:
         caption: str = "",
         caption_segments: list[dict[str, Any]] | None = None,
     ) -> dict[str, Any]:
-        await self._validate_self_context(context)
         from qq_ai_bot.runtime.effect_outcomes import current_result_capture
 
         capture = current_result_capture.get()
@@ -1239,7 +1238,6 @@ class SocialService:
                 if caption or caption_segments
                 else await self._receipt_result(receipt, context)
             )
-        await self._validate_self_context(context)
         current_group_grant = (
             name in {"send_message", "send_file_caption"}
             and target.kind == "space"
