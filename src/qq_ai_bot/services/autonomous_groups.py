@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import time
+from collections.abc import Awaitable, Callable
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, cast
 
@@ -20,7 +21,6 @@ from qq_ai_bot.conversation.participation import (
 )
 from qq_ai_bot.conversation.scope import runtime_conversation_key
 from qq_ai_bot.domain.messages import InboundMessage
-from qq_ai_bot.domain.profiles import UserProfileSnapshot
 from qq_ai_bot.llm.base import LLMError
 from qq_ai_bot.plugin_host.admission_adapter import PluginAdmissionSignalAdapter
 from qq_ai_bot.runtime.observability import (
@@ -31,13 +31,12 @@ from qq_ai_bot.runtime.observability import (
     new_runtime_turn_id,
     record_observation_safely,
 )
-from qq_ai_bot.services.chat import ChatService, OutboundSender
+from qq_ai_bot.services.chat import ChatService
 from qq_ai_bot.services.plugin_events import content_free_turn_payload, publish_notification
 from qq_ai_bot.services.turn_coordinator import (
     ConversationTurnCoordinator,
     TurnInterruptedError,
     TurnSupersededError,
-    TurnToken,
 )
 from yuki_plugin_sdk.events import EventName
 
@@ -61,9 +60,9 @@ def _authoritative_autonomous_observation_refs(
 class _GroupState:
     # Admission uses the latest observation; durable history already lives in the ledger.
     message: InboundMessage
-    profile: UserProfileSnapshot
-    sender: OutboundSender
-    latest_token: TurnToken | None = None
+    # Host-owned ordinary admission for the latest group_open/continuation source.
+    # None keeps the original local-scoring path. It returns sent messages.
+    ordinary_attempt: Callable[[], Awaitable[int]] | None = None
     revision: int = 0
     consumed_revision: int = -1
     changed: asyncio.Event = field(default_factory=asyncio.Event)
@@ -71,7 +70,7 @@ class _GroupState:
 
 
 class AutonomousGroupService:
-    """Only debounce batches; local scoring owns participation, not Planner."""
+    """Debounce one group; the latest source gets one ordinary or legacy attempt."""
 
     def __init__(
         self,
@@ -114,9 +113,8 @@ class AutonomousGroupService:
     def observe(
         self,
         message: InboundMessage,
-        profile: UserProfileSnapshot,
-        sender: OutboundSender,
-        turn_token: TurnToken | None = None,
+        *,
+        ordinary_attempt: Callable[[], Awaitable[int]] | None = None,
     ) -> None:
         group_id = message.group_id
         if self._closed or group_id is None:
@@ -124,13 +122,17 @@ class AutonomousGroupService:
         scope_key = runtime_conversation_key(identity=message.scope(), inbound=message)
         state = self._states.get(scope_key)
         if state is None:
-            state = _GroupState(message=message, profile=profile, sender=sender)
+            state = _GroupState(message=message, ordinary_attempt=ordinary_attempt)
             self._states[scope_key] = state
         else:
+            # Classification may finish out of order. An older source
+            # must neither replace the newer slot nor extend its quiet window.
+            latest = state.message.source_event_id
+            source = message.source_event_id
+            if latest is not None and source is not None and source < latest:
+                return
             state.message = message
-            state.profile = profile
-            state.sender = sender
-        state.latest_token = turn_token
+            state.ordinary_attempt = ordinary_attempt
         state.revision += 1
         state.changed.set()
         self._ensure_task(scope_key, state)
@@ -193,9 +195,11 @@ class AutonomousGroupService:
                 group_id = state.message.group_id
                 if group_id is None:
                     return
+                ordinary = state.ordinary_attempt is not None
                 runtime = await self._runtime_config.snapshot(group_id=group_id)
                 policy = _conversation_policy(runtime)
-                if not policy.autonomous_enabled:
+                # Ordinary admission is Host policy; only legacy scoring needs autonomy.
+                if not ordinary and not policy.autonomous_enabled:
                     return
                 # One worker absorbs every update until the group has remained
                 # quiet for a full debounce interval.
@@ -252,15 +256,16 @@ class AutonomousGroupService:
         """
 
         started = time.perf_counter()
+        state = self._states.get(scope_key)
+        selected = state.message if state is not None else None
+        ordinary = state is not None and state.ordinary_attempt is not None
         correlation = RuntimeTurnCorrelation(
             turn_id=new_runtime_turn_id(),
-            origin=TurnOrigin.AUTONOMOUS_GROUP,
+            origin=TurnOrigin.USER_MESSAGE if ordinary else TurnOrigin.AUTONOMOUS_GROUP,
         )
         error_category: str | None = None
         sent_messages = 0
         observation_key = scope_key
-        state = self._states.get(scope_key)
-        selected = state.message if state is not None else None
         canonical_conversation_id, canonical_space_id = _authoritative_autonomous_observation_refs(
             selected
         )
@@ -276,7 +281,7 @@ class AutonomousGroupService:
                         correlation,
                         scope_type="group",
                         conversation_key=observation_key,
-                        admission_outcome="autonomous_group",
+                        admission_outcome="ordinary_deferred" if ordinary else "autonomous_group",
                         handled=error_category is None,
                         sent_messages=sent_messages,
                         error_category=error_category,
@@ -296,6 +301,10 @@ class AutonomousGroupService:
         state = self._states.get(scope_key)
         if state is None:
             return 0
+        attempt = state.ordinary_attempt
+        if attempt is not None:
+            # Frozen before the first await; a newer slot gets its own window.
+            return await attempt()
         last = state.message
         if self._participation is None or not await self._participation.legacy_allowed(last):
             return 0

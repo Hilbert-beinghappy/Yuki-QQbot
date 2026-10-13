@@ -305,6 +305,8 @@ class WorkWaitRepository:
         conditions: list[dict[str, Any]],
         reason: str,
         now: float,
+        *,
+        source_event_id: int | None = None,
     ) -> int | None:
         original: Any
         if "work_source_json" in binding:
@@ -384,7 +386,15 @@ class WorkWaitRepository:
                     source_key=f"wait:{binding['id']}",
                     kind="control",
                     work_id=binding["work_id"],
-                    event_id=max(event_ids) if event_ids else None,
+                    # The delivering message owns its admission; every matched
+                    # ref stays in conditions for the Work signal itself.
+                    event_id=(
+                        source_event_id
+                        if source_event_id is not None
+                        else max(event_ids)
+                        if event_ids
+                        else None
+                    ),
                     ready=True,
                     payload_json=encode_json(
                         {"text": json.dumps(payload, ensure_ascii=False), "signal": True}
@@ -516,7 +526,14 @@ class WorkWaitRepository:
             )
             if done:
                 delivered_input = (
-                    await self._deliver(session, dict(binding), conditions, "signal", now)
+                    await self._deliver(
+                        session,
+                        dict(binding),
+                        conditions,
+                        "signal",
+                        now,
+                        source_event_id=event.id if kind == "conversation" else None,
+                    )
                     or delivered_input
                 )
                 continue
@@ -527,11 +544,7 @@ class WorkWaitRepository:
             )
         if delivered_input is not None and on_delivery is not None:
             await on_delivery(session, delivered_input)
-        return (
-            delivered_input
-            if delivered_input is not None
-            else (0 if matched_any and kind == "plugin_event" else None)
-        )
+        return delivered_input if delivered_input is not None else (0 if matched_any else None)
 
     async def match_user_reply(self, event_id: int) -> int | None:
         """A reply to the Work's own question can resume waiting_user."""
@@ -786,9 +799,7 @@ class WorkWaitRepository:
             while len(candidates) < 128:
                 query = self._due_query().order_by(waits.c.created, waits.c.id).limit(128)
                 if cursor is not None:
-                    query = query.where(
-                        tuple_(waits.c.created, waits.c.id) > cursor
-                    )
+                    query = query.where(tuple_(waits.c.created, waits.c.id) > cursor)
                 rows = (await discovery.execute(query)).mappings().all()
                 if not rows:
                     break

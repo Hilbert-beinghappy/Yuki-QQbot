@@ -11,9 +11,6 @@ from dataclasses import dataclass, replace
 from functools import partial
 from typing import Any, Protocol, TypeVar, cast
 
-from sqlalchemy import select
-from sqlalchemy.ext.asyncio import AsyncSession
-
 from qq_ai_bot.admin.config_service import RuntimeConfigService
 from qq_ai_bot.admin.models import RuntimeConfigSnapshot
 from qq_ai_bot.automation.models import TurnOrigin
@@ -27,7 +24,6 @@ from qq_ai_bot.capabilities import (
 )
 from qq_ai_bot.config import Settings
 from qq_ai_bot.conversation.ordinary_admission import (
-    OrdinaryAdmissionDuplicate,
     OrdinaryAdmissionRepository,
     PreparedOrdinaryAdmission,
 )
@@ -691,7 +687,7 @@ class ChatService:
         self._event_publisher = publisher
 
     async def discard_work_input(self, identity: int | None) -> None:
-        if identity is not None:
+        if identity is not None and identity > 0:
             await self._work_repository.discard_input(identity)
 
     def work_is_active(self, conversation_key: str) -> bool:
@@ -714,9 +710,11 @@ class ChatService:
         matched = await WorkWaitRepository(self._work_repository).match_event(
             event_id=event_id,
             kind="conversation",
-            on_delivery=self._admission_publisher(admission) if admission else None,
+            on_delivery=OrdinaryAdmissionRepository(self._ledger._database).publisher(admission)
+            if admission
+            else None,
         )
-        if matched is not None:
+        if matched is not None and matched > 0:
             return matched
         control = self.runtime.bindings.get(conversation_key)
         if (
@@ -724,7 +722,7 @@ class ChatService:
             or control.current is None
             or control.source.get("actor_user_id") != inbound.sender.user_id
         ):
-            return None
+            return matched
         from qq_ai_bot.runtime.work_repository import WorkCapacityError
 
         try:
@@ -738,8 +736,8 @@ class ChatService:
                 ready=False,
             )
         except WorkCapacityError:
-            # The canonical message remains in the ordinary conversation queue.
-            return None
+            # Preserve a partial wait match when mailbox capacity is unavailable.
+            return matched
 
     async def ready_work_input(
         self,
@@ -753,57 +751,12 @@ class ChatService:
         # The durable parent owns this input even if its activation just yielded.
         return await self._work_repository.prepare_input(
             identity,
-            {"text": text[:7000]},
+            {"text": text},
             images=images,
-            before_publish=self._admission_publisher(admission) if admission else None,
+            before_publish=OrdinaryAdmissionRepository(self._ledger._database).publisher(admission)
+            if admission
+            else None,
         )
-
-    def _admission_publisher(
-        self, admission: PreparedOrdinaryAdmission
-    ) -> Callable[[AsyncSession, int], Awaitable[None]]:
-        async def publish(session: AsyncSession, input_id: int) -> None:
-            from qq_ai_bot.conversation.ordinary_admission_db_models import (
-                OrdinaryTurnAdmissionModel,
-            )
-            from qq_ai_bot.runtime.work_repository import WorkConflict
-            from qq_ai_bot.runtime.work_schema_v1 import inputs
-
-            existing = await session.get(OrdinaryTurnAdmissionModel, admission.event.id)
-            source = (
-                await session.execute(
-                    select(
-                        inputs.c.work_id,
-                        inputs.c.conversation_id,
-                        inputs.c.generation,
-                        inputs.c.event_id,
-                    ).where(inputs.c.id == input_id)
-                )
-            ).first()
-            if (
-                source is None
-                or source.work_id is None
-                or source.conversation_id != admission.admission.conversation_id
-                or source.generation != admission.admission.generation
-                or source.event_id != admission.event.id
-            ):
-                raise WorkConflict("ordinary_input_source_mismatch")
-            if (
-                existing is not None
-                and existing.activation_id == admission.admission.activation_id
-                and existing.route == "work"
-                and existing.input_id == input_id
-                and existing.work_id == source.work_id
-            ):
-                return
-            if not await OrdinaryAdmissionRepository(self._ledger._database).commit(
-                admission,
-                session=session,
-                work_id=source.work_id,
-                input_id=input_id,
-            ):
-                raise OrdinaryAdmissionDuplicate("ordinary_already_admitted")
-
-        return publish
 
     async def respond(
         self,

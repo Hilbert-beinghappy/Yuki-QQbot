@@ -8,13 +8,14 @@ import logging
 import time
 from collections import OrderedDict
 from collections.abc import Awaitable, Callable
-from contextlib import AsyncExitStack
+from contextlib import AsyncExitStack, nullcontext
 from dataclasses import dataclass, replace
-from typing import Protocol, cast
+from typing import Literal, Protocol, cast
 from weakref import WeakValueDictionary
 
 from pydantic import ValidationError
 from sqlalchemy.exc import SQLAlchemyError
+from sqlalchemy.ext.asyncio import AsyncSession
 
 from qq_ai_bot.admin.action_service import ActionRegistry
 from qq_ai_bot.admin.audit import AdminAuditService
@@ -220,12 +221,17 @@ class ProcessResult:
     reason: str = ""
 
 
+OrdinaryReason = Literal["group_open", "semantic_invitation", "continuation"]
+
+
 class OrdinaryParticipationService(Protocol):
     async def binding_for_event(self, event_id: int) -> OrdinaryParticipationBinding | None: ...
 
     async def continuation_for_event(
         self, event_id: int
-    ) -> OrdinaryParticipationBinding | None: ...
+    ) -> (
+        tuple[OrdinaryParticipationBinding, Literal["semantic_invitation", "continuation"]] | None
+    ): ...
 
     async def on_ordinary_admitted(
         self, binding: OrdinaryParticipationBinding | None, admission: OrdinaryAdmission
@@ -462,50 +468,64 @@ class MessageProcessor:
         self._participation = service
 
     async def promote_committed_event(
-        self, event_id: int, binding: OrdinaryParticipationBinding
+        self,
+        event_id: int,
+        binding: OrdinaryParticipationBinding | None,
+        *,
+        reason: OrdinaryReason,
+        defer_new_main: bool = False,
     ) -> ProcessResult:
         """Promote the original normalized event, never replay ingress or guess it.
 
         Unadmitted preparation is intentionally process-local. On restart, an
         absent original envelope is not reconstructed from platform IDs/media.
         Committed admission survives and continues to fence duplicate activation.
+
+        ``defer_new_main`` only offers the source to the original Work/wait. It
+        keeps the observation token and returns ``ordinary_deferred`` instead of
+        opening a new Main, so the debounced attempt still owns that decision.
         """
         if await self.ordinary_admissions.get(event_id) is not None:
             return ProcessResult(False, reason="ordinary_already_admitted")
         observed = self._observed_human_turns.get(event_id)
         if observed is None:
             return ProcessResult(False, reason="ordinary_envelope_unavailable")
-        event = await self._ledger.get_event(event_id)
-        if (
-            event is None
-            or str(source_revision(event)) != binding.source_revision
-            or (
-                binding.event_id != event_id
-                or binding.conversation_id != event.canonical_conversation_id
-                or binding.generation != observed.snapshot.generation
-                or event.author_person_id != observed.record.author_person_id
-                or event.ingress_presence_id != observed.record.ingress_presence_id
-            )
-        ):
-            return ProcessResult(False, reason="ordinary_source_changed")
-        group_policy = await self._effective_group_policy(observed.message.group_id)
-        if group_policy is None or not group_policy.enabled:
-            return ProcessResult(False, reason="group_disabled")
         runtime = await self._runtime_config.snapshot(
             user_id=observed.message.sender.user_id, group_id=observed.message.group_id
         )
-        if not runtime.conversation_policy().semantic_participation_enabled:
-            return ProcessResult(False, reason="semantic_disabled")
+        if not defer_new_main:
+            original = await self.promote_committed_event(
+                event_id, None, reason=reason, defer_new_main=True
+            )
+            if original.reason != "ordinary_deferred":
+                return original
+            group_policy = await self._effective_group_policy(observed.message.group_id)
+            if group_policy is None or not group_policy.enabled:
+                return ProcessResult(False, reason="group_disabled")
+            if reason == "group_open":
+                if group_policy.require_mention:
+                    return ProcessResult(False, reason="group_open_closed")
+                if binding is None and self._participation is not None:
+                    binding = await self._participation.binding_for_event(event_id)
+            elif binding is None:
+                return ProcessResult(False, reason="ordinary_binding_unavailable")
+            elif not runtime.conversation_policy().semantic_participation_enabled:
+                return ProcessResult(False, reason="semantic_disabled")
+        else:
+            binding = None
         control = self._chat.runtime.bindings.get(observed.snapshot.scope_key)
         input_only = bool(
             control is not None
             and control.current is not None
             and control.source.get("actor_user_id") == observed.message.sender.user_id
         )
-        token = await self._turn_coordinator.promote_observation(
-            observed.token,
-            preserve_active=input_only,
-        )
+        if defer_new_main:
+            token: TurnToken | None = observed.token
+        else:
+            token = await self._turn_coordinator.promote_observation(
+                observed.token,
+                preserve_active=input_only,
+            )
         if token is None:
             return ProcessResult(False, reason="ordinary_busy_or_superseded")
         snapshot = replace(observed.snapshot, coordinator_version=token.version)
@@ -514,11 +534,11 @@ class MessageProcessor:
                 observed.message,
                 observed.sender,
                 observed.profile,
-                event,
+                observed.record,
                 snapshot,
                 token,
                 runtime,
-                PolicyDecision(True, observed.message.text, reason="semantic_invitation"),
+                PolicyDecision(True, observed.message.text, reason=reason),
                 None,
                 False,
                 False,
@@ -528,7 +548,32 @@ class MessageProcessor:
                 binding,
                 time.perf_counter(),
                 input_only=input_only,
+                defer_new_main=defer_new_main,
             )
+
+    async def _defer_ordinary(
+        self,
+        observed: _ObservedHumanTurn,
+        binding: OrdinaryParticipationBinding | None,
+        reason: Literal["group_open", "continuation"],
+    ) -> ProcessResult:
+        """Give the original Work/wait this input now; merge the new Main by quiet window."""
+
+        event_id = observed.record.id
+        result = await self.promote_committed_event(
+            event_id, None, reason=reason, defer_new_main=True
+        )
+        if result.reason != "ordinary_deferred":
+            return result
+        if self._autonomous is None:
+            return await self.promote_committed_event(event_id, binding, reason=reason)
+
+        async def attempt() -> int:
+            result = await self.promote_committed_event(event_id, binding, reason=reason)
+            return result.sent_messages
+
+        self._autonomous.observe(observed.message, ordinary_attempt=attempt)
+        return ProcessResult(False, reason="ordinary_deferred")
 
     async def handle(
         self,
@@ -711,26 +756,37 @@ class MessageProcessor:
         )
         if callable(configure_hook_timeout):
             configure_hook_timeout(runtime_snapshot.plugins.hook_timeout_seconds)
-        direct_turn = decision.should_respond or admin_candidate
-        turn_token = await self._turn_coordinator.notify_message(
-            coordinator_key,
-            TurnOrigin.USER_MESSAGE,
-            observation=not direct_turn,
-            protect_from_observations=direct_turn,
-            preserve_active=(
-                self._settings.runtime_work_enabled
-                and decision.command is None
-                and direct_match is None
-                and self._chat.work_is_active(coordinator_key)
-            ),
-            preempt_private=(
-                message.scope_type is ScopeType.PRIVATE
-                and direct_turn
-                and decision.command is None
-                and direct_match is None
-                and not self._chat.work_is_active(coordinator_key)
-            ),
+        # An open floor is not an explicit call: its new Main waits for a quiet
+        # window like other implicit sources. Native/prefix/reply/commands stay direct.
+        deferred_open = bool(
+            decision.reason == "group_open" and decision.command is None and direct_match is None
         )
+        direct_turn = (decision.should_respond or admin_candidate) and not deferred_open
+
+        async def notify() -> TurnToken:
+            return await self._turn_coordinator.notify_message(
+                coordinator_key,
+                TurnOrigin.USER_MESSAGE,
+                observation=not direct_turn,
+                protect_from_observations=direct_turn,
+                preserve_active=(
+                    self._settings.runtime_work_enabled
+                    and decision.command is None
+                    and direct_match is None
+                    and self._chat.work_is_active(coordinator_key)
+                ),
+                preempt_private=(
+                    message.scope_type is ScopeType.PRIVATE
+                    and direct_turn
+                    and decision.command is None
+                    and direct_match is None
+                    and not self._chat.work_is_active(coordinator_key)
+                ),
+            )
+
+        # A non-explicit keeper resend must not advance the version that a
+        # pending source of another real message is waiting on.
+        turn_token = await notify() if direct_turn else None
         has_visual_input = VisionService.has_visual_input(message) or (
             self._native_images is not None
             and any(
@@ -822,6 +878,10 @@ class MessageProcessor:
             record = appended.event
             created = appended.created
             scope_state = appended.scope
+        if turn_token is None:
+            if not created:
+                return ProcessResult(False, reason="group_observed")
+            turn_token = await notify()
         message = replace(message, source_event_id=record.id)
         if created and message.attachments and self._conversation_media is not None:
             media_gateway = (
@@ -866,9 +926,9 @@ class MessageProcessor:
             if self._emoji_worker is not None:
                 self._emoji_worker.wake()
 
-        if not decision.should_respond and not admin_candidate:
+        if not direct_turn:
             if record.author_is_human():
-                self._observed_human_turns[record.id] = _ObservedHumanTurn(
+                observed = _ObservedHumanTurn(
                     message,
                     sender,
                     profile,
@@ -878,6 +938,7 @@ class MessageProcessor:
                     created,
                     has_visual_input,
                 )
+                self._observed_human_turns[record.id] = observed
                 # Same bound as the controller's recent event window; this is a
                 # transient envelope cache, not another pending execution store.
                 while len(self._observed_human_turns) > 256:
@@ -885,10 +946,25 @@ class MessageProcessor:
                     old_lock = self._ordinary_locks.get(old_id)
                     if old_lock is not None and not old_lock.locked():
                         self._ordinary_locks.pop(old_id, None)
+                original = await self.promote_committed_event(
+                    record.id, None, reason="group_open", defer_new_main=True
+                )
+                if original.reason != "ordinary_deferred":
+                    return original
+                if deferred_open:
+                    # Every open-floor message was a direct turn before; keep its
+                    # memory evidence even when a later fragment takes the reply.
+                    await self._enqueue_memory(record)
+                    return await self._defer_ordinary(observed, None, "group_open")
                 if self._participation is not None:
-                    binding = await self._participation.continuation_for_event(record.id)
-                    if binding is not None:
-                        return await self.promote_committed_event(record.id, binding)
+                    found = await self._participation.continuation_for_event(record.id)
+                    if found is not None:
+                        implicit_binding, implicit = found
+                        if implicit == "semantic_invitation":
+                            return await self.promote_committed_event(
+                                record.id, implicit_binding, reason=implicit
+                            )
+                        return await self._defer_ordinary(observed, implicit_binding, implicit)
             if (
                 message.scope_type is ScopeType.GROUP
                 and group_policy is not None
@@ -896,7 +972,7 @@ class MessageProcessor:
                 and group_policy.autonomous_enabled
             ):
                 if self._autonomous is not None:
-                    self._autonomous.observe(message, profile, sender, turn_token)
+                    self._autonomous.observe(message)
             return ProcessResult(False, reason="group_observed")
 
         binding = None
@@ -941,6 +1017,7 @@ class MessageProcessor:
         started: float,
         *,
         input_only: bool = False,
+        defer_new_main: bool = False,
     ) -> ProcessResult:
         lock = self._ordinary_locks.setdefault(record.id, asyncio.Lock())
         async with lock:
@@ -964,6 +1041,7 @@ class MessageProcessor:
                 binding,
                 started,
                 input_only=input_only,
+                defer_new_main=defer_new_main,
             )
 
     async def _prepare_foreground(
@@ -986,24 +1064,31 @@ class MessageProcessor:
         started: float,
         *,
         input_only: bool = False,
+        defer_new_main: bool = False,
     ) -> ProcessResult:
+        # defer_new_main: offer the raw source to the original Work/wait only.
+        # It is not a new foreground turn, so newer messages neither cancel nor
+        # supersede it; rate, ASR, media and text limits still apply.
         identity = message.scope()
         coordinator_key = turn_snapshot.scope_key
         event_key = build_event_key(message, identity.key)
-        category = "command" if direct_match is not None or decision.command is not None else "chat"
-        rate = await self._rate_limiter.check(
-            user_id=message.sender.user_id,
-            group_id=message.group_id,
-            category=category,
-        )
-        if not rate.allowed:
-            sent = await self._send_text(
-                message,
-                sender,
-                RATE_LIMIT_MESSAGE,
-                turn_snapshot=turn_snapshot,
+        if not defer_new_main:
+            category = (
+                "command" if direct_match is not None or decision.command is not None else "chat"
             )
-            return ProcessResult(True, int(sent), f"{rate.scope}_rate_limited")
+            rate = await self._rate_limiter.check(
+                user_id=message.sender.user_id,
+                group_id=message.group_id,
+                category=category,
+            )
+            if not rate.allowed:
+                sent = await self._send_text(
+                    message,
+                    sender,
+                    RATE_LIMIT_MESSAGE,
+                    turn_snapshot=turn_snapshot,
+                )
+                return ProcessResult(True, int(sent), f"{rate.scope}_rate_limited")
 
         if direct_match is not None:
             if image_blocks_command:
@@ -1051,10 +1136,41 @@ class MessageProcessor:
             except (TurnInterruptedError, TurnSupersededError, WorkConflict):
                 return ProcessResult(True, reason="turn_interrupted")
 
+        record = await self._ledger.get_event(record.id) or record
+        try:
+            prepared = self.ordinary_admissions.prepare(
+                record, turn_snapshot.generation, turn_token.version
+            )
+            work_input_id = await self._chat.stage_work_input(
+                coordinator_key, message, record.id, admission=prepared
+            )
+        except OrdinaryAdmissionDuplicate:
+            return ProcessResult(False, reason="ordinary_already_admitted")
+        except OrdinaryAdmissionConflict:
+            return ProcessResult(False, reason="ordinary_source_changed")
+        if work_input_id == 0:
+            if defer_new_main:
+                return ProcessResult(True, reason="work_wait_partial")
+            work_input_id = None
+        if defer_new_main and work_input_id is None:
+            return ProcessResult(False, reason="ordinary_deferred")
+        accepted = await self.ordinary_admissions.get(record.id)
+        if accepted is not None:
+            if accepted.activation_id != prepared.admission.activation_id:
+                return ProcessResult(False, reason="ordinary_already_admitted")
+            await self._record_ordinary_participation(record.id, accepted.binding)
+            return ProcessResult(True, reason="work_input_queued")
+        if work_input_id is not None:
+            binding = None
+
         audio = AudioInput()
         if ASRService.has_audio(message):
             try:
-                async with self._turn_coordinator.track(turn_token, "admission"):
+                async with (
+                    nullcontext()
+                    if work_input_id is not None or defer_new_main
+                    else self._turn_coordinator.track(turn_token, "admission")
+                ):
                     if record.audio_transcript:
                         audio = AudioInput(transcript=record.audio_transcript)
                     elif self._asr is not None:
@@ -1066,7 +1182,12 @@ class MessageProcessor:
                         audio = await self._asr.prepare(message, gateway)
                     else:
                         audio = AudioInput(error="not_configured")
-                    if not self._turn_coordinator.is_current(turn_token):
+                    if (
+                        work_input_id is None
+                        and not defer_new_main
+                        and not self._turn_coordinator.is_current(turn_token)
+                    ):
+                        await self._chat.discard_work_input(work_input_id)
                         return ProcessResult(True, reason="turn_interrupted")
                     if audio.transcript and not record.audio_transcript:
                         stored = await self._ledger.set_audio_transcript(
@@ -1075,10 +1196,15 @@ class MessageProcessor:
                             generation=turn_snapshot.generation,
                         )
                         if not stored:
+                            await self._chat.discard_work_input(work_input_id)
                             return ProcessResult(True, reason="turn_interrupted")
                         record = await self._ledger.get_event(record.id) or record
             except (TurnInterruptedError, TurnSupersededError, WorkConflict):
+                await self._chat.discard_work_input(work_input_id)
                 return ProcessResult(True, reason="turn_interrupted")
+            except BaseException:
+                await self._chat.discard_work_input(work_input_id)
+                raise
             if (
                 audio.error
                 and not audio.transcript
@@ -1088,26 +1214,16 @@ class MessageProcessor:
                 sent = await self._send_text(
                     message, sender, audio.failure_message, turn_snapshot=turn_snapshot
                 )
+                await self._chat.discard_work_input(work_input_id)
                 return ProcessResult(True, int(sent), "asr_" + audio.error)
 
         # Deterministic native and direct-plugin commands execute their own reviewed
         # mutation path. Feeding command syntax to the extraction Worker would create
         # a second interpretation of the same write and may pollute long-term memory.
         if created and decision.command is None and direct_match is None and direct_turn:
-            memory_conversation_key = (
-                ResolvedMemoryScope.for_group(record.group_id).partition_key
-                if record.group_id is not None
-                else ResolvedMemoryScope.for_private(
-                    record.private_peer_user_id or record.sender_user_id
-                ).partition_key
-            )
-            await self._memory_worker.enqueue(
-                record.id,
-                memory_conversation_key,
-                content_characters=len(record.evidence_content),
-            )
+            await self._enqueue_memory(record)
         visual_question = sanitize_input(decision.content or message.text)
-        content = sanitize_input(decision.content or (message.text if admin_candidate else ""))
+        content = sanitize_input(decision.content or message.text)
         if message.reply_text:
             quoted = sanitize_input(message.reply_text)
             if quoted:
@@ -1121,44 +1237,8 @@ class MessageProcessor:
         ):
             content = MENTION_ONLY_CONTEXT
         if len(content) > self._settings.max_input_characters:
+            await self._chat.discard_work_input(work_input_id)
             return ProcessResult(False, reason="input_too_long")
-        record = await self._ledger.get_event(record.id) or record
-        if binding is not None and binding.source_revision != str(source_revision(record)):
-            if decision.reason == "semantic_invitation":
-                return ProcessResult(False, reason="ordinary_source_changed")
-            binding = (
-                await self._participation.binding_for_event(record.id)
-                if self._participation is not None
-                else None
-            )
-        try:
-            prepared = self.ordinary_admissions.prepare(
-                record,
-                turn_snapshot.generation,
-                turn_token.version,
-                binding,
-            )
-            if not self._turn_coordinator.is_current(turn_token):
-                return ProcessResult(True, reason="turn_interrupted")
-            work_input_id = await self._chat.stage_work_input(
-                coordinator_key,
-                message,
-                record.id,
-                admission=prepared,
-            )
-        except OrdinaryAdmissionDuplicate:
-            return ProcessResult(False, reason="ordinary_already_admitted")
-        except OrdinaryAdmissionConflict:
-            return ProcessResult(False, reason="ordinary_source_changed")
-        # Conversation wait signals are already complete inputs, published with
-        # their admission in the original wait transaction. Unready media inputs
-        # stay visible so the active Runner can release its lease while preparing.
-        accepted = await self.ordinary_admissions.get(record.id)
-        if accepted is not None:
-            if accepted.activation_id != prepared.admission.activation_id:
-                return ProcessResult(False, reason="ordinary_already_admitted")
-            await self._record_ordinary_participation(record.id, binding)
-            return ProcessResult(True, reason="work_input_queued")
         try:
             visual = await self._analyze_visual_input(
                 message=message,
@@ -1231,7 +1311,11 @@ class MessageProcessor:
         except OrdinaryAdmissionConflict:
             await self._chat.discard_work_input(work_input_id)
             return ProcessResult(False, reason="ordinary_source_changed")
-        if not self._turn_coordinator.is_current(turn_token):
+        if (
+            work_input_id is None
+            and not defer_new_main
+            and not self._turn_coordinator.is_current(turn_token)
+        ):
             await self._chat.discard_work_input(work_input_id)
             return ProcessResult(True, reason="turn_interrupted")
 
@@ -1258,6 +1342,10 @@ class MessageProcessor:
             if ready:
                 await self._record_ordinary_participation(record.id, binding)
                 return ProcessResult(True, reason="work_input_queued")
+        if defer_new_main:
+            # The original owner refused it; drop only this unready preparation.
+            await self._chat.discard_work_input(work_input_id)
+            return ProcessResult(False, reason="ordinary_deferred")
 
         if input_only:
             # A matched activation may have yielded during media preparation.
@@ -1271,8 +1359,26 @@ class MessageProcessor:
                 record, turn_snapshot.generation, promoted.version, binding
             )
 
+        async def admission_allowed(session: AsyncSession) -> bool:
+            if decision.reason != "group_open":
+                return True
+            from qq_ai_bot.conversation.canonical_db_models import CanonicalConversationModel
+            from qq_ai_bot.identity.db_models import CanonicalSpaceModel
+
+            conversation = await session.get(
+                CanonicalConversationModel, prepared.admission.conversation_id
+            )
+            space = (
+                await session.get(CanonicalSpaceModel, conversation.space_id)
+                if conversation
+                else None
+            )
+            return space is not None and not space.require_mention
+
         try:
-            if not await self.ordinary_admissions.commit(prepared):
+            if not await self.ordinary_admissions.commit(
+                prepared, admission_allowed=admission_allowed
+            ):
                 return ProcessResult(False, reason="ordinary_already_admitted")
         except OrdinaryAdmissionConflict:
             return ProcessResult(False, reason="ordinary_source_changed")
@@ -1368,6 +1474,20 @@ class MessageProcessor:
             ),
         )
         return result
+
+    async def _enqueue_memory(self, record: EventRecord) -> None:
+        memory_conversation_key = (
+            ResolvedMemoryScope.for_group(record.group_id).partition_key
+            if record.group_id is not None
+            else ResolvedMemoryScope.for_private(
+                record.private_peer_user_id or record.sender_user_id
+            ).partition_key
+        )
+        await self._memory_worker.enqueue(
+            record.id,
+            memory_conversation_key,
+            content_characters=len(record.evidence_content),
+        )
 
     async def _record_ordinary_participation(
         self, event_id: int, binding: OrdinaryParticipationBinding | None
