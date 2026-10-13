@@ -297,7 +297,7 @@ class VisionSettings(DomainSettings):
     vision_api_key: str
     vision_model: str
     vision_timeout_seconds: float = Field(gt=0)
-    vision_max_retries: int = Field(gt=0)
+    vision_max_retries: int = Field(ge=0)
     vision_global_concurrency: int = Field(gt=0)
     vision_queue_max_pending: int = Field(gt=0)
     vision_queue_timeout_seconds: float = Field(gt=0)
