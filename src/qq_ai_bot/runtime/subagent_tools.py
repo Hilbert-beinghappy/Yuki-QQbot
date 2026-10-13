@@ -42,8 +42,6 @@ def worker_prompt(*, code_enabled: bool) -> str:
     )
 
 
-WORKER_PROMPT = worker_prompt(code_enabled=False)
-
 # Shared implementations, but a separate stable allowlist, never selected from task text.
 WORKER_NAMES = (
     SANDBOX_TOOLS

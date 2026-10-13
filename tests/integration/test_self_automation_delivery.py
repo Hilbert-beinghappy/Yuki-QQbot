@@ -297,7 +297,7 @@ async def test_self_schedule_sdk_read_records_its_actual_call_and_original_sourc
     case.provider._responder = respond
 
     try:
-        with host.invocation_scope(host.plugin_id, sources[0], web_was_used=False):
+        with host.invocation_scope(host.plugin_id, sources[0]):
             sdk_result = await host.agent.run(
                 "Read published workspace artifacts through the approved SDK tool"
             )
