@@ -265,9 +265,6 @@ async def claim_initiative(
                 pending_events=0,
                 pending_characters=characters,
                 pending_since=source.occurred_at,
-                has_yuki_reply=False,
-                has_tool_result=True,
-                high_value_signal=False,
             )
             return (
                 SelfReflectionBatch(

@@ -266,8 +266,6 @@ async def test_reflection_scan_keeps_all_owner_counters_after_unrelated_wal_comm
             assert state.pending_events == len(texts)
             assert state.pending_characters == sum(map(len, texts))
             assert state.pending_since == owner_sources[0].occurred_at
-            assert state.has_yuki_reply == any(row.direction == "outbound" for row in owner_sources)
-            assert not state.has_tool_result
         assert runtime.last_scanned_event_id == events[-1].id
         assert runtime.ingress_events_total == sum(
             bool(row.evidence_content.strip()) for row in sources
@@ -512,7 +510,6 @@ async def test_reflection_transition_keeps_original_source_after_unrelated_wal_c
         expected = [first, tail] if operation == "claim" else [tail]
         assert state.pending_events == len(expected)
         assert state.pending_characters == sum(len(item.content) for item in expected)
-        assert not state.has_yuki_reply and not state.has_tool_result
         assert runtime.last_scanned_event_id == tail.id and runtime.ingress_events_total == 2
         assert (await session.get(InitiativeRunModel, initiative_id)).feedback_sequence == 1
     if operation != "claim":
@@ -1464,7 +1461,6 @@ async def test_incoming_reflection_keeps_complete_source_without_own_reply(datab
         max_characters=100,
         cycle_id="incoming",
     )
-    assert not batch.state.has_yuki_reply and not batch.state.has_tool_result
     assert [item.id for item in batch.events] == [source.id]
     provider = FakeLLMProvider(responder=lambda _: '{"proposals":[],"episodes":[]}')
     reflection = SelfReflectionService(

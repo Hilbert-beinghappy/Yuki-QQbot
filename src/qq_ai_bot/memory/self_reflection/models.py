@@ -199,9 +199,6 @@ class SelfReflectionState:
     pending_events: int
     pending_characters: int
     pending_since: datetime | None
-    has_yuki_reply: bool
-    has_tool_result: bool
-    high_value_signal: bool
 
 
 @dataclass(frozen=True, slots=True)
