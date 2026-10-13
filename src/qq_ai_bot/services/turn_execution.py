@@ -1128,24 +1128,6 @@ class TurnExecution:
                 self.state.control.session.progress["provider_pause_replay"] = True
             else:
                 self.state.control.session.progress.pop("provider_pause_replay", None)
-            if self.state.control.lease.work_id:
-                last_tokens = self.state.control.session.progress.get("context_tokens", 0)
-                samples = self.state.control.session.progress.setdefault("cache_samples", [])
-                samples.append(
-                    {
-                        "sequence": self.state.control.session.sequence,
-                        "chain_id": self.state.transcript.chain_id,
-                        "kind": "compaction"
-                        if compacting
-                        else ("resume" if request_index == 0 and last_tokens else "execution"),
-                        "input": response.prompt_tokens,
-                        "cached": response.cached_prompt_tokens,
-                        "warm_candidate": bool(
-                            response.prompt_tokens and last_tokens >= response.prompt_tokens * 0.95
-                        ),
-                    }
-                )
-                del samples[:-32]
             if response.prompt_tokens is not None:
                 self.state.control.session.progress["context_tokens"] = response.prompt_tokens
             observations = self.state.control.session.progress.setdefault("model_observations", [])
