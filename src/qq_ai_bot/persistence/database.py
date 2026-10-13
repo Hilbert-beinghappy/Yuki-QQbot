@@ -100,7 +100,7 @@ class Database:
                     tables=[
                         table
                         for table in Base.metadata.sorted_tables
-                        if table.name not in {"runtime_work_budgets", "runtime_automation_budgets"}
+                        if table.name != "runtime_work_budgets"
                     ],
                 )
             )

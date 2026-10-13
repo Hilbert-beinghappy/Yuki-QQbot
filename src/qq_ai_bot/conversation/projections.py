@@ -187,7 +187,7 @@ class PromptProjectionRepository:
         if rebuild_reason is not None and rebuild_reason not in REBUILD_REASONS:
             raise ValueError("invalid projection rebuild reason")
         items = deepcopy(items)
-        if len(items) > 262_144 or not all(isinstance(item, dict) for item in items):
+        if not all(isinstance(item, dict) for item in items):
             raise ProjectionCapacityError("projection item limit exceeded")
         payload = json.dumps(items, ensure_ascii=False, separators=(",", ":"), allow_nan=False)
         size = len(payload.encode("utf-8"))
@@ -212,25 +212,19 @@ class PromptProjectionRepository:
         FrozenFragments.load(items)
         prepared_sources = []
 
-        async with self.database.sessions() as prepared_session:
-            prepared_privacy = await privacy_generation(prepared_session)
-
         # Read canonical source facts before taking the writer. Source mutation
         # and privacy are rechecked by the publication CAS.
         with model_detail("projection_sources_read"):
             async with self.database.sessions() as source_reader:
                 await source_reader.execute(text("BEGIN"))
-                snapshot_privacy = await privacy_generation(source_reader)
+                prepared_privacy = await privacy_generation(source_reader)
                 owner = await source_reader.get(CanonicalConversationModel, conversation_id)
                 if owner is None or (owner.generation, owner.starts_after_event_id) != (
                     generation,
                     starts_after_event_id,
                 ):
                     raise ProjectionConflict("projection source generation changed")
-                if (
-                    owner.prompt_source_revision != expected_source_revision
-                    or snapshot_privacy != prepared_privacy
-                ):
+                if owner.prompt_source_revision != expected_source_revision:
                     raise ProjectionConflict("projection source revision changed")
                 candidates: dict[str, dict[str, Any]] = {}
                 for item in items:
@@ -586,16 +580,6 @@ class PromptProjectionRepository:
             else frozenset()
         )
         return stamp, prefix == old_payload, keys
-
-    async def invalidate(self, conversation_id: str) -> None:
-        """Remove model-input copies when a source is deleted/reset; leave the ledger intact."""
-        async with self.database.sessions() as session:
-            await session.execute(
-                delete(PromptProjectionModel).where(
-                    PromptProjectionModel.conversation_id == conversation_id,
-                )
-            )
-            await session.commit()
 
     async def invalidate_view(self, view_key: str, *, reason: str) -> None:
         """Retire an input representation while keeping its next-epoch reason."""
