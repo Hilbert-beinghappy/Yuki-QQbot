@@ -1,9 +1,9 @@
+import { flatten, renderBadge as badge } from "./table-format";
 import { useState } from "react";
 import type { Row } from "./api";
 import type { PageProps } from "./pages";
 import { useQuery } from "./hooks";
 import {
-  renderBadge as badge,
   Badge,
   Empty,
   ErrorNote,
@@ -13,7 +13,7 @@ import {
   Table,
 } from "./components";
 import { SchemaFields } from "./schema-fields";
-import { flatten, stamp } from "./format";
+import { stamp } from "./format";
 import { OwnerPicker } from "./owner-picker";
 
 const labels: Record<string, string> = {

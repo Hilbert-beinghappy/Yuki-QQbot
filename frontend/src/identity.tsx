@@ -1,12 +1,8 @@
+import { renderBadge as badge } from "./table-format";
 import { useState } from "react";
 import type { Row } from "./api";
 import type { PageProps } from "./pages";
-import {
-  renderBadge as badge,
-  JsonNote,
-  QueryList,
-  Section,
-} from "./components";
+import { JsonNote, QueryList, Section } from "./components";
 import { OwnerPicker } from "./owner-picker";
 
 function BindingForm({

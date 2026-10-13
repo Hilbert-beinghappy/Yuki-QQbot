@@ -1,12 +1,12 @@
+import { flatten, renderBadge as status } from "./table-format";
 import type { CommandMethod } from "./control-methods";
-import { flatten, stamp, text } from "./format";
+import { stamp, text } from "./format";
 import { useQuery } from "./hooks";
 import { useState } from "react";
 import type { ReactNode } from "react";
 import type { Row } from "./api";
 import type { Intent } from "./actions";
 import {
-  renderBadge as status,
   Badge,
   Empty,
   ErrorNote,

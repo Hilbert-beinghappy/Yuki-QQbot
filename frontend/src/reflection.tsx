@@ -1,3 +1,4 @@
+import { flatten } from "./table-format";
 import { useState } from "react";
 import type { Row } from "./api";
 import type { PageProps } from "./pages";
@@ -11,7 +12,7 @@ import {
   Table,
 } from "./components";
 import type { Column } from "./components";
-import { flatten, stamp } from "./format";
+import { stamp } from "./format";
 import { OwnerPicker } from "./owner-picker";
 
 const columns: Record<string, Column[]> = {

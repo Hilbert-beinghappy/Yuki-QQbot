@@ -1,4 +1,4 @@
-import { flatten } from "./format";
+import { flatten } from "./table-format";
 import { lazy, Suspense, useState } from "react";
 import type { Row } from "./api";
 import { useQuery } from "./hooks";

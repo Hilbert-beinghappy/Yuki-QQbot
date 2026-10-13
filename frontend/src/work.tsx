@@ -1,13 +1,13 @@
+import { flatten, renderBadge as status } from "./table-format";
 import { useState } from "react";
 import { AutomationHistory } from "./automation-history";
 import { AutomationEditor } from "./automation-editor";
 import type { Row } from "./api";
 import type { PageProps } from "./pages";
 import { useQuery } from "./hooks";
-import { flatten, stamp, text } from "./format";
+import { stamp, text } from "./format";
 import { useDisplayNames } from "./names";
 import {
-  renderBadge as status,
   type Column,
   Empty,
   ErrorNote,

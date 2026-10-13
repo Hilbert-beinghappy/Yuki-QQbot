@@ -1,7 +1,8 @@
+import { flatten, renderBadge as status } from "./table-format";
 import { useState } from "react";
 import type { PageProps } from "./pages";
-import { renderBadge as status, QueryList } from "./components";
-import { flatten, stamp } from "./format";
+import { QueryList } from "./components";
+import { stamp } from "./format";
 
 export function AutomationHistory({
   automationId,
