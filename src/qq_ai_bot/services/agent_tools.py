@@ -170,7 +170,6 @@ class ToolRuntime:
     read_only: bool = False
     read_scope: ConversationScope | None = None
     read_target_id: str | None = None
-    history_limit: int | None = None
     turn_token: TurnToken | None = None
     turn_snapshot: ConversationTurnSnapshot | None = None
     visible_event_ids: frozenset[int] = frozenset()
@@ -1152,7 +1151,7 @@ class AgentToolService:
     async def _recent_history(self, runtime: ToolRuntime) -> ToolExecutionResult:
         rows = await self._ledger.list_scope_recent(
             runtime.conversation_scope(),
-            limit=min(runtime.history_limit or 20, self._settings.recent_history_tool_limit),
+            limit=self._settings.recent_history_tool_limit,
             message_only=True,
         )
         return self._result(

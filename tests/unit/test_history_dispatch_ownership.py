@@ -372,3 +372,35 @@ async def test_same_actor_new_turn_honors_snapshot_boundaries(
         assert provider.requests[2].tools != provider.requests[0].tools
     elif boundary == "profile":
         assert provider.requests[2].tools == provider.requests[0].tools
+
+
+async def test_recent_history_uses_configured_window_above_old_twenty_cap(database, tmp_path):
+    from tests.unit.test_tool_effect_audit import active_work
+
+    from qq_ai_bot.domain.conversations import ConversationScope
+
+    env, owner, runtime = await active_work(database, tmp_path)
+    scope = ConversationScope.group("80001", "20001")
+    for index in range(30):
+        await env.service.writer.append(
+            scope=scope,
+            platform_message_id=f"history-{index}",
+            sender_user_id="10001",
+            direction="inbound",
+            content=f"source {index}",
+        )
+    chat = build_harness(
+        database, make_settings(database.url, recent_history_tool_limit=25)
+    ).processor._chat
+    runtime = replace(
+        runtime,
+        read_scope=scope,
+        scope_type=ScopeType.GROUP,
+        runtime_config=await chat._runtime_config.snapshot(),
+    )
+    result = (await chat._tools.execute("get_recent_chat_history", "{}", runtime)).model_payload()
+    assert result["ok"], result
+    rows = result["data"]["events"]
+    assert len(rows) == 25
+    assert {row["content"] for row in rows} == {f"source {index}" for index in range(5, 30)}
+    await owner.control.repository.release(owner.control.lease)
