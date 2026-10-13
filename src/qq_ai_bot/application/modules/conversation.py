@@ -114,7 +114,6 @@ class ConversationModule:
             people=persistence.people,
             model_executor=models,
             concurrency=self._concurrency,
-            metrics=persistence.memory_metrics,
         )
         memory_mutations = memory_worker.mutations
         agent_tools = AgentToolService(
@@ -197,9 +196,7 @@ class ConversationModule:
                 facts=persistence.memories,
                 mutations=memory_mutations,
                 models=models,
-                metrics=persistence.memory_metrics,
             ),
-            metrics=persistence.memory_metrics,
         )
         memory_dream_repository = DreamRepository(persistence.database)
         memory_evidence_compaction_worker = EvidenceCompactionWorker(

@@ -40,7 +40,6 @@ from qq_ai_bot.services.prompt_composer import PromptComposer, PromptComposition
 from qq_ai_bot.services.turn_transcript import (
     DispatchOrigin,
     dispatch_request,
-    validating_request,
 )
 
 
@@ -286,10 +285,7 @@ class MainAgentTurnService:
                     or projection_closed
                 ):
                     return
-                approved_initial = (
-                    *composition.messages,
-                    *(sequence.public_initial_suffix or ()),
-                )
+                approved_initial = composition.messages
                 if sequence.layout_public_initial is not None:
                     valid_layout = sequence.layout_public_initial == composition.messages
                     expected = (
@@ -604,20 +600,6 @@ class MainAgentTurnService:
         control = runtime.work_control
         if control is not None:
             control.current_message = messages[-1] if messages else None
-        public_suffix = ()
-        validate = runtime.before_model_request
-
-        async def validate_prepared() -> None:
-            if validate is None:
-                return
-            sequence = dispatch_request()
-            if sequence is None:
-                await validate()
-                return
-            with validating_request(replace(sequence, public_initial_suffix=public_suffix)):
-                await validate()
-
-        runtime = replace(runtime, before_model_request=validate_prepared)
         result = await self._runner.run(
             messages,
             replace(

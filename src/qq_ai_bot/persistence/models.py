@@ -934,8 +934,6 @@ class MemorySelfReflectionStateModel(Base):
         ),
     )
 
-    last_policy_reason: Mapped[str | None] = mapped_column(String(32), nullable=True)
-    last_policy_event_id: Mapped[int | None] = mapped_column(Integer, nullable=True)
 
     id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
     conversation_key_hash: Mapped[str] = mapped_column(String(64), nullable=False)
@@ -955,9 +953,6 @@ class MemorySelfReflectionStateModel(Base):
     pending_events: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
     pending_characters: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
     pending_since: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
-    has_yuki_reply: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False)
-    has_tool_result: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False)
-    high_value_signal: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False)
     updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
 
 
