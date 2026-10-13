@@ -160,7 +160,7 @@ async def test_incomplete_provider_label_uses_actual_rollup_json_and_source(payl
 
 @pytest.mark.parametrize("mode", list(StructuredOutputMode))
 @pytest.mark.parametrize("complete_json", [False, True])
-async def test_structured_runner_decodes_incomplete_label_without_extra_model_calls(
+async def test_structured_runner_rejects_incomplete_output_without_repair_calls(
     mode, complete_json
 ):
     from pydantic import BaseModel
@@ -192,16 +192,13 @@ async def test_structured_runner_decodes_incomplete_label_without_extra_model_ca
         structured_input={"value": 1},
         output_model=Result,
         mode=mode,
+        validation_retries=1,
     )
-    if complete_json:
-        result, original = await runner.run_with_response(**arguments)
-        assert result.value == 1
-        assert original is response
-    else:
-        with pytest.raises(StructuredTaskError) as failed:
-            await runner.run_with_response(**arguments)
-        assert failed.value.reason_code == "json_decode"
-        assert failed.value.response is response
+    with pytest.raises(StructuredTaskError) as failed:
+        await runner.run_with_response(**arguments)
+    assert failed.value.reason_code == "output_budget_exhausted"
+    assert failed.value.response is response
+    assert failed.value.attempts == 1
     assert len(provider.requests) == 1
 
 

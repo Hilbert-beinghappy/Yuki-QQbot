@@ -158,7 +158,6 @@ class ToolRuntime:
     gateway: OneBotToolGateway | None
     allow_generic_onebot: bool
     declaration_only: bool = False
-    allow_admin_actions: bool = False
     conversation_key: str = ""
     trigger_message_id: str = ""
     trigger_event_id: int | None = None
@@ -169,7 +168,6 @@ class ToolRuntime:
     tools_closed: bool = False
     read_scope: ConversationScope | None = None
     read_target_id: str | None = None
-    history_limit: int | None = None
     turn_token: TurnToken | None = None
     turn_snapshot: ConversationTurnSnapshot | None = None
     visible_event_ids: frozenset[int] = frozenset()
@@ -892,7 +890,6 @@ class AgentToolService:
                             **self._work_source(),
                             "conversation_id": runtime.effective_conversation_id,
                             "origin": runtime.origin.value,
-                            "allow_admin_actions": runtime.allow_admin_actions,
                             "actor_is_superuser": runtime.actor_is_superuser,
                             "actor_user_id": runtime.actor_user_id,
                             "bot_user_id": runtime.effective_bot_user_id,
@@ -906,12 +903,14 @@ class AgentToolService:
                         if name in EXECUTION_TOOLS
                         else None,
                     )
-                    if result.get("error") == "sandbox_submission_unknown":
+                    if result.get("error"):
                         return self._result(
                             data=result,
-                            error="sandbox_submission_unknown",
-                            detail="沙箱提交结果未确认；核对原执行回执，不能重新提交。",
-                            uncertain=True,
+                            error=str(result["error"]),
+                            detail="沙箱提交结果未确认；核对原执行回执，不能重新提交。"
+                            if result.get("uncertain")
+                            else "沙箱操作未完成",
+                            uncertain=bool(result.get("uncertain")),
                         )
                     return self._result(data=result)
 
@@ -934,7 +933,13 @@ class AgentToolService:
                             runtime=runtime,
                             request_id=invocation.call_id if invocation is not None else None,
                         )
-                        return self._result(data=workspace_result)
+                        return self._result(
+                            data=workspace_result,
+                            error=str(workspace_result["error"])
+                            if workspace_result.get("error")
+                            else None,
+                            uncertain=bool(workspace_result.get("uncertain")),
+                        )
                     except (WorkspaceError, ValueError, OSError) as exc:
                         category = (
                             str(exc) if isinstance(exc, WorkspaceError) else type(exc).__name__
@@ -1145,7 +1150,7 @@ class AgentToolService:
     async def _recent_history(self, runtime: ToolRuntime) -> ToolExecutionResult:
         rows = await self._ledger.list_scope_recent(
             runtime.conversation_scope(),
-            limit=min(runtime.history_limit or 20, self._settings.recent_history_tool_limit),
+            limit=self._settings.recent_history_tool_limit,
             message_only=True,
         )
         return self._result(

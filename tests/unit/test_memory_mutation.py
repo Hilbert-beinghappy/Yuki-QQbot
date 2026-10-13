@@ -633,7 +633,6 @@ async def test_self_create_is_atomic_receipted_and_deduplicated(database: Databa
         content="本群现在周五晚讨论项目",
     )
     claim = MemoryClaim(
-        operation=MemoryClaimOperation.CORRECT,
         subject_ref="group",
         scope_type=MemoryScopeType.GROUP,
         memory_key="schedule",
@@ -647,7 +646,7 @@ async def test_self_create_is_atomic_receipted_and_deduplicated(database: Databa
     group_fact = await facts.get_fact(corrected.fact_id)
     group_evidence = (await facts.list_evidence(group_fact.id))[0]
     assert group_fact.scope_type is MemoryScopeType.GROUP and group_fact.group_id == "3001"
-    assert group_evidence.relation is MemoryEvidenceRelation.CORRECTION
+    assert group_evidence.relation is MemoryEvidenceRelation.GROUP_STATEMENT
     assert group_evidence.authority is MemoryAuthority.GROUP_REPORT
     assert (
         group_evidence.event_id == group_event.id and group_evidence.excerpt == group_event.content
@@ -1718,7 +1717,6 @@ async def test_deterministic_memory_admin_uses_unified_mutation_receipt(
             trigger_message_id=event.platform_message_id,
             trigger_event_id=event.id,
             conversation_key="private:1001",
-            current_message_text=event.content,
             bot_user_id=event.bot_user_id,
             decision_actor_type="command",
         ),

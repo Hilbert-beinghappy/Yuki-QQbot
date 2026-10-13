@@ -8,7 +8,7 @@ import logging
 import time
 from contextlib import AbstractContextManager, nullcontext
 from dataclasses import replace
-from typing import TYPE_CHECKING, Any, cast
+from typing import TYPE_CHECKING, Any
 
 from qq_ai_bot.capabilities import (
     AuthorityContext,
@@ -39,7 +39,7 @@ from qq_ai_bot.services.agent_tools import ToolRuntime
 from qq_ai_bot.services.turn_coordinator import TurnSupersededError
 
 if TYPE_CHECKING:
-    from qq_ai_bot.services.chat import AdminToolService, ChatService
+    from qq_ai_bot.services.chat import ChatService
 
 logger = logging.getLogger(__name__)
 
@@ -75,9 +75,7 @@ class MainAgentBackend(AgentToolBackend):
                 plugin_tools = self._service._plugin_tools
                 if plugin_tools is None:
                     raise LLMError("plugin_media_source_validator_unavailable")
-                await plugin_tools.validate_images(
-                    plugin_images, self._runtime, web_was_used=self._web_was_used
-                )
+                await plugin_tools.validate_images(plugin_images, self._runtime)
             from qq_ai_bot.tool_results.access import access_from_runtime
 
             store = self._service._tool_artifacts
@@ -108,7 +106,6 @@ class MainAgentBackend(AgentToolBackend):
         self.sent_current_texts: list[str] = []
         self.failed_model_requests = 0
         self.failed_tool_calls = 0
-        self._web_was_used = False
         self._catalog: UnifiedToolCatalog | None = None
         self._provider_registry: ToolProviderRegistry | None = None
         self._capability_runtime: TurnCapabilityRuntime | None = None
@@ -140,11 +137,6 @@ class MainAgentBackend(AgentToolBackend):
         return session.contract.read_policy in {
             MemoryReadPolicy.EAGER,
         }
-
-    def mark_native_web_used(self) -> None:
-        """Apply post-Web isolation before same-response local calls execute."""
-
-        self._web_was_used = True
 
     async def protect_native_dispatch(self, runtime: AgentRuntime) -> None:
         """Native effects cannot be ruled out after a transport cancellation."""
@@ -195,9 +187,8 @@ class MainAgentBackend(AgentToolBackend):
             control = current_work_control.get()
         return control is not None and control.lease.work_id is not None
 
-    def definitions(self, runtime: AgentRuntime, *, web_was_used: bool) -> tuple[ChatTool, ...]:
+    def definitions(self, runtime: AgentRuntime) -> tuple[ChatTool, ...]:
         child = self._child_work(runtime)
-        self._web_was_used = self._web_was_used or web_was_used
         if self._runtime.tools_closed:
             self._callable_tool_names = set()
             self._log_tool_exposure((), reason="business_tools_closed")
@@ -223,10 +214,9 @@ class MainAgentBackend(AgentToolBackend):
         self._log_tool_exposure(definitions, reason="ready")
         return definitions
 
-    def refresh_catalog(self, runtime: AgentRuntime, *, web_was_used: bool) -> None:
+    def refresh_catalog(self, runtime: AgentRuntime) -> None:
         """Refresh execution policy without constructing discarded declarations."""
         del runtime
-        self._web_was_used = self._web_was_used or web_was_used
         if self._runtime.tools_closed:
             self._callable_tool_names = set()
             return
@@ -254,7 +244,6 @@ class MainAgentBackend(AgentToolBackend):
         request_runtime = self._request_runtime()
         self._provider_registry = self._service._build_tool_registry(
             request_runtime,
-            web_was_used=self._web_was_used,
         )
         catalog = self._provider_registry.catalog(request_runtime)
         return DescriptorRegistrySnapshot(catalog)
@@ -278,7 +267,6 @@ class MainAgentBackend(AgentToolBackend):
             ),
             origin=self._runtime.origin,
             contains_images=self._runtime.image_present,
-            web_was_used=self._web_was_used,
             tools_closed=self._runtime.tools_closed,
             memory_view=memory_view,
             artifact_available=self._service._tool_artifacts is not None,
@@ -332,11 +320,6 @@ class MainAgentBackend(AgentToolBackend):
             ),
         )
         return handle
-
-    def did_use_web(self) -> bool:
-        """Expose a provider-metadata-derived effect to the shared Agent loop."""
-
-        return self._web_was_used
 
     def pin_web_provider(self) -> AbstractContextManager[None]:
         tools = self._service._tools
@@ -402,7 +385,6 @@ class MainAgentBackend(AgentToolBackend):
             return _refused_result(name, "unknown_capability")
         binding = descriptor.binding
         effective_descriptor = self._effective_descriptor(call, descriptor)
-        is_web_tool = effective_descriptor.namespace_id.startswith("web.")
         is_memory_read_tool = (
             effective_descriptor.namespace_id.startswith("memory.")
             and effective_descriptor.effect is CapabilityEffect.READ_STATE
@@ -452,38 +434,10 @@ class MainAgentBackend(AgentToolBackend):
                     binding_started = True
                     if self.counts_toward_limit(name, runtime):
                         self.failed_tool_calls += 1
-                    from qq_ai_bot.model_runtime.dispatch_guard import model_dispatch_guard
-
-                    async def admit_auxiliary_request() -> None:
-                        if runtime.before_model_request is not None:
-                            await runtime.before_model_request()
-                        assert runtime.auxiliary_requests is not None
-                        if (
-                            runtime.max_model_requests is not None
-                            and invocation.identity.request_sequence + runtime.auxiliary_requests[0]
-                            >= runtime.max_model_requests
-                        ):
-                            raise WorkBudgetExceeded("agent_segment_budget_exhausted")
-                        assert runtime.admit_model_request is not None
-                        runtime.auxiliary_requests[0] += 1
-                        try:
-                            await runtime.admit_model_request()
-                        except BaseException:
-                            runtime.auxiliary_requests[0] -= 1
-                            raise
-                        self.failed_model_requests += 1
-
-                    with (
-                        model_dispatch_guard(admit_auxiliary_request)
-                        if work is None and runtime.admit_model_request is not None
-                        else nullcontext()
-                    ):
-                        return await binding.invoke(
-                            {str(key): value for key, value in parsed.items()},
-                            ToolInvocationContext(
-                                runtime=execution_runtime, call_id=receipt_call_id
-                            ),
-                        )
+                    return await binding.invoke(
+                        {str(key): value for key, value in parsed.items()},
+                        ToolInvocationContext(runtime=execution_runtime, call_id=receipt_call_id),
+                    )
 
                 outcome = await self._service.run_effect(
                     None if name == "send_message" else execution_runtime.turn_snapshot,
@@ -613,8 +567,6 @@ class MainAgentBackend(AgentToolBackend):
                     # The same Host operation the effect row and audit fence use.
                     tool_call_id=receipt_call_id,
                 )
-        if is_web_tool:
-            self._web_was_used = True
         return result
 
     async def observe_response(self, response: Any, runtime: AgentRuntime) -> None:
@@ -697,12 +649,6 @@ class MainAgentBackend(AgentToolBackend):
             self._catalog.by_model_name(call.function.name) if self._catalog is not None else None
         )
         descriptor = entry.descriptor if entry is not None else None
-        admin_tools = getattr(self._service, "_admin_tools", None)
-        if descriptor is not None and descriptor.provider_id == "admin" and admin_tools is not None:
-            return cast("AdminToolService", admin_tools).is_mutating_call(
-                call.function.name,
-                call.function.arguments,
-            )
         return bool(
             descriptor is not None
             and self._effective_descriptor(call, descriptor).risk is not CapabilityRisk.READ

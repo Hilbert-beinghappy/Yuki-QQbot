@@ -22,7 +22,6 @@ class CapabilityPolicyContext:
     authority: AuthorityContext
     origin: TurnOrigin
     contains_images: bool = False
-    web_was_used: bool = False
     conversation_open: bool = True
     tools_closed: bool = False
     memory_view: MemoryCapabilityView | None = None
