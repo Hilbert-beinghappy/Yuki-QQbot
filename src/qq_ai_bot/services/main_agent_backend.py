@@ -166,7 +166,7 @@ class MainAgentBackend(AgentToolBackend):
             return True
         if self._allowed_tools is not None and name not in self._allowed_tools:
             return False
-        return not (self._runtime.tools_closed or self._runtime.read_only)
+        return not self._runtime.tools_closed
 
     def work_query_allowed(self, action: str) -> bool:
         """Read Work facts using the original actor and tree scope."""
@@ -280,7 +280,6 @@ class MainAgentBackend(AgentToolBackend):
             contains_images=self._runtime.image_present,
             web_was_used=self._web_was_used,
             tools_closed=self._runtime.tools_closed,
-            read_only=self._runtime.read_only,
             memory_view=memory_view,
             artifact_available=self._service._tool_artifacts is not None,
         )

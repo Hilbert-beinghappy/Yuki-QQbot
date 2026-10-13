@@ -25,7 +25,6 @@ async def invoke_social(
             invocation is None
             or not invocation.call_id
             or runtime.tools_closed
-            or (runtime.read_only and name == "send_message")
             or actor.principal_kind != "self"
             or runtime.inbound is not None
         ):
@@ -63,7 +62,6 @@ async def invoke_social(
             invocation is None
             or not invocation.call_id
             or runtime.inbound is not None
-            or runtime.read_only
             or runtime.tools_closed
             or not isinstance(event_id, int)
             or not conversation_id
@@ -146,7 +144,6 @@ async def invoke_social(
             TurnOrigin.AUTONOMOUS_GROUP,
             TurnOrigin.SCHEDULED_AUTOMATION,
         }
-        or (runtime.read_only and name != "read_conversation_history")
         or runtime.tools_closed
     ):
         raise SocialError("permission_denied")
