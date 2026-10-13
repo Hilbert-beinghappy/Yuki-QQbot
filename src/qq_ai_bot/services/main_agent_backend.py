@@ -28,9 +28,8 @@ from qq_ai_bot.capabilities.exposure import NO_LONGER_AUTHORIZED
 from qq_ai_bot.capabilities.invocation import Invocation
 from qq_ai_bot.capabilities.runtime import TurnCapabilityRuntime
 from qq_ai_bot.capabilities.validation import UNDECLARED_TOOL
-from qq_ai_bot.domain.messages import ChatImage, ChatTool, ToolCall, ToolFunction
+from qq_ai_bot.domain.messages import ChatImage, ToolCall, ToolFunction
 from qq_ai_bot.llm.base import LLMError
-from qq_ai_bot.runtime.observability import identifier_hash
 from qq_ai_bot.runtime.origin import TurnOrigin as RuntimeTurnOrigin
 from qq_ai_bot.runtime.work_budget import WorkBudgetExceeded
 from qq_ai_bot.services.agent_runner import AgentRuntime, AgentToolBackend
@@ -128,7 +127,6 @@ class MainAgentBackend(AgentToolBackend):
     def _memory(self) -> Any:
         return self._memory_session
 
-
     async def protect_native_dispatch(self, runtime: AgentRuntime) -> None:
         """Native effects cannot be ruled out after a transport cancellation."""
         execution_runtime = self._request_runtime()
@@ -177,30 +175,6 @@ class MainAgentBackend(AgentToolBackend):
 
             control = current_work_control.get()
         return control is not None and control.lease.work_id is not None
-
-    def definitions(self, runtime: AgentRuntime) -> tuple[ChatTool, ...]:
-        child = self._child_work(runtime)
-        if self._runtime.tools_closed:
-            self._callable_tool_names = set()
-            self._log_tool_exposure((), reason="business_tools_closed")
-            return ()
-        capability_runtime = self._ensure_capability_runtime()
-        session = self._memory()
-        if session is not None:
-            capability_runtime.sync_memory_view(session.capability_view())
-        definitions = capability_runtime.definitions()
-        if child:
-            # Root/plugin declarations stay fixed; only a child catalog is its
-            # frozen execution subset.
-            definitions = tuple(
-                tool
-                for tool in definitions
-                if self._allowed_tools is not None and tool.name in self._allowed_tools
-            )
-        definitions = tuple(sorted(definitions, key=lambda tool: tool.name))
-        self._callable_tool_names = set(capability_runtime.callable_capability_ids())
-        self._log_tool_exposure(definitions, reason="ready")
-        return definitions
 
     def refresh_catalog(self, runtime: AgentRuntime) -> None:
         """Refresh execution policy without constructing discarded declarations."""
@@ -259,25 +233,6 @@ class MainAgentBackend(AgentToolBackend):
             policy_context=policy_context,
         )
         return self._capability_runtime
-
-    def _log_tool_exposure(
-        self,
-        definitions: tuple[ChatTool, ...],
-        *,
-        reason: str,
-    ) -> None:
-        """Log bounded capability metadata without message text or tool arguments."""
-
-        exposed_tools = ",".join(sorted(tool.name for tool in definitions)) or "none"
-        logger.info(
-            "agent_tools_exposed conversation_hash=%s origin=%s "
-            "tools=%s exposed_count=%d reason=%s",
-            identifier_hash(self._runtime.conversation_key) or "missing",
-            self._runtime.origin.value,
-            exposed_tools,
-            len(definitions),
-            reason,
-        )
 
     async def archive_code_result(self, text: str) -> str | None:
         """Full program result as an authorized artifact; the model sees a preview."""
