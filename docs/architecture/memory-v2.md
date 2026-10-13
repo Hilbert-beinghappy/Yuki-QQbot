@@ -134,3 +134,5 @@ Control Plane 仍要求 capability。
   历史验收记录不覆盖本页。
 
 Memory mutation 的來源與候選解析可並行準備，不使用進程全域鎖跨外部查證串行所有 mutation。提交仍由原 SQLite writer、來源/owner 快照比對與 mutation receipt 完成；不在 writer 內解析身份或調用 embedding。
+
+Hygiene 因缺少有效來源失效的 fact 使用 `invalid_provenance`，與狀態事件相同；不記成 `administrator_invalidated`。原歷史原因仍可讀，不回寫舊事件。
