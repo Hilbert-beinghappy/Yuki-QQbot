@@ -1177,13 +1177,18 @@ class SocialService:
                     await self.emoji_delivery.record_send_accepted(
                         outbound, source="agent_delivery"
                     )
-                    if context.inbound is not None:
-                        await self.emoji_delivery.record_success(
-                            outbound,
-                            inbound=context.inbound,
-                            source="agent",
-                            ledger_recorded=True,
-                        )
+                    await self.emoji_delivery.record_success(
+                        outbound,
+                        private_peer_user_id=route.external_target_id
+                        if target.kind == "person"
+                        else None,
+                        group_id=route.external_target_id if target.kind == "space" else None,
+                        trigger_message_id=context.inbound.message_id
+                        if context.inbound is not None
+                        else "",
+                        source="agent",
+                        ledger_recorded=True,
+                    )
                 except Exception:
                     # A post-send metric must never turn a durable success into
                     # an apparent failure that tempts the model to resend.
