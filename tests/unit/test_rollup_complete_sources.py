@@ -303,7 +303,9 @@ async def test_candidate_carries_its_hot_output_policy() -> None:
     assert model.output_budgets and set(model.output_budgets) == {1234}
 
 
-async def _seed_private(database, *, peer: str, count: int, policy: RollupPolicyConfig):
+async def _seed_private(
+    database, *, peer: str, count: int, policy: RollupPolicyConfig, content: str = "tiny fact"
+):
     from qq_ai_bot.domain.conversations import ConversationScope
     from qq_ai_bot.identity.canonical_repository import ensure_person, ensure_presence
     from qq_ai_bot.persistence.scoped_event_uow import ScopedEventLedgerUnitOfWork
@@ -319,10 +321,64 @@ async def _seed_private(database, *, peer: str, count: int, policy: RollupPolicy
             platform_message_id=f"{peer}-{index}",
             sender_user_id=peer,
             direction="inbound",
-            content="tiny fact",
+            content=content,
             occurred_at=datetime(2026, 10, 1, tzinfo=UTC),
         )
     return scope
+
+
+@pytest.mark.asyncio
+async def test_foreground_rollup_can_finish_more_than_five_batches(database) -> None:
+    from tests.conftest import make_settings
+
+    from qq_ai_bot.conversation.rollup.repository import ConversationRollupRepository
+    from qq_ai_bot.conversation.scope import ConversationTurnSnapshot
+    from qq_ai_bot.domain.messages import ChatMessage
+    from qq_ai_bot.persistence.repositories import EventLedgerRepository
+    from qq_ai_bot.services.context_assembler import ContextAssembler
+    from qq_ai_bot.time.service import TimeContextService
+
+    policy = RollupPolicyConfig(batch_max_events=1)
+    scope = await _seed_private(
+        database, peer="1014", count=20, policy=policy, content="source event " * 80
+    )
+    repository = ConversationRollupRepository(database, policy)
+    original = await repository.load_prompt_snapshot(scope)
+    turn = ConversationTurnSnapshot(
+        conversation_id=original.scope.id,
+        scope_key=original.scope.runtime_scope_key,
+        generation=original.scope.generation,
+        trigger_event_id=original.raw_events[-1].id,
+        coordinator_version=1,
+    )
+    model = RecordingModel()
+    assembler = ContextAssembler(
+        settings=make_settings(
+            "sqlite+aiosqlite:///:memory:", conversation_rollup_model_timeout_seconds=30
+        ),
+        ledger=EventLedgerRepository(database),
+        time_service=TimeContextService(),
+        rollup_repository=repository,
+        rollup_service=ConversationRollupService(models=model, config=policy, timeout_seconds=30),
+    )
+    snapshot = await assembler._load_history_snapshot(
+        scope, turn=turn, before_event_id=None, token_budget=1024
+    )
+    completed, _, _, advanced = await assembler._ensure_uncovered_fits_budget(
+        snapshot=snapshot,
+        recent=snapshot.recent,
+        current_event_id=None,
+        content="now",
+        yuki_account_ids=frozenset({"8000"}),
+        current_message_override=ChatMessage("user", "now"),
+        remainder=1024,
+        identity=scope,
+        turn=turn,
+    )
+    assert len(model.sources) > 5
+    assert advanced and completed.raw_complete
+    assert completed.uncovered_view is not None
+    assert assembler._uncovered_tokens(completed.uncovered_view, completed.rollup_text) <= 1024
 
 
 @pytest.mark.asyncio
