@@ -9,7 +9,6 @@ from tests.conftest import make_settings
 from tests.support.social_identity_cases import social_env
 
 from qq_ai_bot.domain.conversations import ConversationScope
-from qq_ai_bot.memory.metrics import MemoryLifecycleMetrics
 from qq_ai_bot.memory.self_reflection.repository import SelfReflectionRepository
 from qq_ai_bot.memory.self_reflection.worker import SelfReflectionWorker
 from qq_ai_bot.persistence.models import ChatEventModel, MemorySelfReflectionCycleModel
@@ -61,7 +60,6 @@ async def test_failed_reports_settle_and_allow_later_real_delivery(database, tmp
         settings=make_settings(database.url),
         repository=SelfReflectionRepository(database),
         service=SimpleNamespace(),
-        metrics=MemoryLifecycleMetrics(),
     )
     worker.social = env.service
     await worker._deliver_reports()
