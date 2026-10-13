@@ -7,7 +7,7 @@ import pytest
 from sqlalchemy import update
 from tests.conftest import MemorySender, make_settings
 from tests.support.autonomy_repository_helpers import _accept, _enable, _scene
-from tests.unit.test_auto_reply_merge import _admissions, _open_group_scene
+from tests.unit.test_auto_reply_merge import _admissions, _open_group_scene, _wait_for_worker
 
 from qq_ai_bot.admin.config_service import RuntimeConfigService
 from qq_ai_bot.conversation.autonomy_repository import AutonomyRepository
@@ -51,7 +51,7 @@ async def test_four_flags_new_ordinary_admission_and_explicit_call(
     result = await harness.processor.handle(message(1, "implicit ordinary"), MemorySender())
     assert result.reason == "ordinary_deferred"
     observed = next(iter(harness.processor._observed_human_turns.values()))
-    await worker.wait_until_idle(observed.snapshot.scope_key)
+    await _wait_for_worker(worker, observed.snapshot.scope_key)
     assert len(await _admissions(database)) == int(auto)
     direct = await harness.processor.handle(
         message(2, "explicit call", mention=True), MemorySender()

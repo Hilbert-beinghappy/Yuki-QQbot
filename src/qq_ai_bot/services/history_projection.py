@@ -67,32 +67,6 @@ class PreparedHistory:
             ),
         )
 
-    async def commit(
-        self,
-        fragments: FrozenFragments,
-    ) -> ProjectionSnapshot:
-        """Call after authority/source validation, immediately before model dispatch.
-
-        Retries reuse this immutable preparation; no model output is interpreted
-        as a platform send, and concurrent preparations cannot replace each other.
-        """
-        if self.committed is not None:
-            if self.committed_input == list(fragments.items):
-                return self.committed
-        publication = await self.prepare_commit(fragments)
-        async with self.repository.database.immediate_session() as writer:
-            self.committed = await publication(writer)
-        self.committed_input = list(fragments.items)
-        logger.info(
-            "prompt_projection_committed view=%s epoch=%s revision=%d reason=%s items=%d",
-            self.view_key,
-            self.committed.epoch_id,
-            self.committed.revision,
-            self.committed.rebuild_reason,
-            len(fragments.items),
-        )
-        return self.committed
-
 
 async def prepare_history(
     repository: PromptProjectionRepository,

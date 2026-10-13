@@ -21,7 +21,6 @@ from qq_ai_bot.capabilities import (
     InProcessToolProvider,
     ToolArtifactWriter,
     ToolExecutionResult,
-    ToolKernelMetrics,
     ToolProviderRegistry,
 )
 from qq_ai_bot.config import Settings
@@ -162,12 +161,7 @@ class AutomationToolProvider(Protocol):
 class PluginToolProvider(Protocol):
     """Approved Plugin API tools merged into the existing Yuki Agent loop."""
 
-    def definitions(
-        self,
-        runtime: ToolRuntime,
-        *,
-        web_was_used: bool,
-    ) -> tuple[ChatTool, ...]: ...
+    def definitions(self, runtime: ToolRuntime) -> tuple[ChatTool, ...]: ...
 
     def owns(self, name: str) -> bool: ...
 
@@ -176,7 +170,7 @@ class PluginToolProvider(Protocol):
     def is_read_only(self, name: str) -> bool: ...
 
     async def validate_images(
-        self, images: tuple[ChatImage, ...], runtime: ToolRuntime, *, web_was_used: bool
+        self, images: tuple[ChatImage, ...], runtime: ToolRuntime
     ) -> None: ...
 
     async def execute(
@@ -185,7 +179,6 @@ class PluginToolProvider(Protocol):
         arguments_json: str,
         runtime: ToolRuntime,
         *,
-        web_was_used: bool,
         expected_contract: str | None = None,
     ) -> ToolExecutionResult: ...
 
@@ -280,7 +273,6 @@ class ChatService:
         self._plugin_tools: PluginToolProvider | None = None
         self._tool_artifacts = tool_artifacts
         self._tool_invocations = tool_invocations
-        self._tool_metrics = ToolKernelMetrics()
         self._time = time_service
         if memory_context is None:
             memory_repository = MemoryFactRepository(self._ledger._database)
@@ -398,12 +390,7 @@ class ChatService:
             budget = int(budget * runtime.context.compaction_trigger_ratio)
         return max(1, budget - fixed - (4096 if maintenance else 0))
 
-    def _build_tool_registry(
-        self,
-        runtime: ToolRuntime,
-        *,
-        web_was_used: bool,
-    ) -> ToolProviderRegistry:
+    def _build_tool_registry(self, runtime: ToolRuntime) -> ToolProviderRegistry:
         """Adapt every domain service once; execution later uses bindings only."""
 
         registry = ToolProviderRegistry()
@@ -614,14 +601,12 @@ class ChatService:
                         name,
                         arguments,
                         context,
-                        web_was_used=web_was_used,
                         expected_contract=expected,
                     )
                 return await plugin.execute(
                     name,
                     arguments,
                     context,
-                    web_was_used=web_was_used,
                 )
 
             registry.register(
@@ -630,7 +615,6 @@ class ChatService:
                     source=CapabilityTrustSource.PLUGIN,
                     definitions=lambda context: plugin.definitions(
                         context,
-                        web_was_used=web_was_used,
                     ),
                     execute=plugin_execute,
                     plugin_read_only=plugin.is_read_only,
@@ -738,7 +722,6 @@ class ChatService:
         content: str,
         sender: OutboundSender,
         *,
-        autonomous: bool = False,
         runtime_snapshot: RuntimeConfigSnapshot | None = None,
         visual_input_present: bool = False,
         native_images: tuple[ChatImage, ...] = (),
@@ -755,7 +738,6 @@ class ChatService:
             from qq_ai_bot.services.turn_coordinator import HistorySourceChangedError
 
             arguments: dict[str, Any] = dict(
-                autonomous=autonomous,
                 runtime_snapshot=runtime_snapshot,
                 visual_input_present=visual_input_present,
                 native_images=native_images,
@@ -836,7 +818,6 @@ class ChatService:
         content: str,
         sender: OutboundSender,
         *,
-        autonomous: bool = False,
         runtime_snapshot: RuntimeConfigSnapshot | None = None,
         visual_input_present: bool = False,
         native_images: tuple[ChatImage, ...] = (),
@@ -849,7 +830,7 @@ class ChatService:
         with self.runtime.executions.track():
             if turn_snapshot is not None:
                 inbound = replace(inbound, source_event_id=turn_snapshot.trigger_event_id)
-            turn_origin = TurnOrigin.AUTONOMOUS_GROUP if autonomous else TurnOrigin.USER_MESSAGE
+            turn_origin = TurnOrigin.USER_MESSAGE
             conversation_key = runtime_conversation_key(
                 identity=identity,
                 turn=turn_snapshot,
@@ -985,7 +966,7 @@ class ChatService:
                 preparation.advance("memory_and_repair")
                 memory_session = self.open_memory_session(
                     inbound,
-                    autonomous=autonomous,
+                    autonomous=False,
                 )
                 if memory_session is not None:
                     memory_cleanup.push_async_callback(memory_session.close)
@@ -1007,8 +988,6 @@ class ChatService:
                     runtime_config,
                     native_images=native_images,
                     attachment_text=attachment_text,
-                    turn_origin=turn_origin,
-                    memory_session=memory_session,
                     turn_snapshot=turn_snapshot,
                 )
                 preparation.advance("work_activation")
@@ -1028,8 +1007,6 @@ class ChatService:
                     if callable(getattr(sender, "call_api", None))
                     else None
                 )
-                if self._memory_context is not None and memory_session is not None:
-                    self._memory_context.metrics.record_runtime_access(memory_session.contract)
                 runtime = ToolRuntime(
                     inbound=inbound,
                     gateway=gateway,
@@ -1039,7 +1016,6 @@ class ChatService:
                     actor_is_superuser=inbound.sender.user_id in self._settings.superusers,
                     runtime_config=runtime_config,
                     origin=turn_origin,
-                    read_only=False,
                     turn_token=turn_token,
                     turn_snapshot=turn_snapshot,
                     visible_event_ids=visible_event_ids,
@@ -1160,10 +1136,8 @@ class ChatService:
         content: str,
         runtime: RuntimeConfigSnapshot,
         *,
-        turn_origin: TurnOrigin = TurnOrigin.USER_MESSAGE,
         native_images: tuple[ChatImage, ...] = (),
         attachment_text: str = "",
-        memory_session: TurnMemorySession | None = None,
         turn_snapshot: ConversationTurnSnapshot | None = None,
     ) -> tuple[
         tuple[ChatMessage, ...],
@@ -1601,7 +1575,6 @@ class ChatService:
                 read_scope=identity,
                 target_presence_id=presence_id,
                 tools_closed=False,
-                read_only=False,
                 turn_token=turn_token,
                 turn_snapshot=turn_snapshot,
                 visible_event_ids=composition.visible_event_ids,
@@ -1680,14 +1653,6 @@ class ChatService:
                 config.tooling.result_artifact_retention_seconds
             )
         return runtime
-
-    @staticmethod
-    def _decode_tool_result(value: str) -> dict[str, object]:
-        try:
-            payload = json.loads(value)
-        except json.JSONDecodeError:
-            return {"ok": False, "error": "invalid_tool_result"}
-        return payload if isinstance(payload, dict) else {"ok": False}
 
     async def _record_outbound_message(
         self,

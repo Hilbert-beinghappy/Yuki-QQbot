@@ -91,14 +91,7 @@ class AutonomousGroupService:
         self._admission_signals = admission_signals
         self._turn_observations = turn_observations
         self._states: dict[str, _GroupState] = {}
-        self._task_failures = 0
         self._closed = False
-
-    @property
-    def task_failures(self) -> int:
-        """Return the process-local count of observed background task failures."""
-
-        return self._task_failures
 
     def consume_rollup_history(self, conversation_id: str, event_id: int) -> None:
         """Do not schedule another observation for history a recovery already handled."""
@@ -163,7 +156,6 @@ class AutonomousGroupService:
         except asyncio.CancelledError:
             pass
         except Exception as exc:
-            self._task_failures += 1
             logger.exception(
                 "autonomous_group_task_failed exception_category=%s",
                 type(exc).__name__,
@@ -221,13 +213,11 @@ class AutonomousGroupService:
             ):
                 pass
             except SQLAlchemyError as exc:
-                self._task_failures += 1
                 logger.warning(
                     "autonomous_group_task_failed exception_category=%s",
                     type(exc).__name__,
                 )
             except (LLMError, OSError, RuntimeError, ValueError, TypeError) as exc:
-                self._task_failures += 1
                 logger.warning(
                     "autonomous_group_task_failed exception_category=%s",
                     type(exc).__name__,
@@ -351,17 +341,6 @@ class AutonomousGroupService:
     def observe_context(self, message: InboundMessage, *, direct: bool) -> None:
         if self._participation is not None:
             self._participation.observe_context(message, direct=direct)
-
-    async def wait_until_idle(self, scope_key: str) -> None:
-        while True:
-            state = self._states.get(scope_key)
-            if state is None or state.task is None:
-                return
-            task = state.task
-            await asyncio.shield(task)
-            # Let the ownership callback restart a task if an update raced with
-            # the worker's last revision check.
-            await asyncio.sleep(0)
 
     async def close(self) -> None:
         self._closed = True
