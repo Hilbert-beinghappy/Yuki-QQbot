@@ -346,7 +346,7 @@ class MemoryWorker:
                     self.metrics.increment(f"claims_rejected_{validation.reason_code}")
                     continue
             validated_count += 1
-            self.metrics.increment(f"claims_{claim.operation.value}ed")
+            self.metrics.increment("claims_asserted")
             if validated.fact.authority.value == "third_party":
                 self.metrics.increment("claims_third_party")
             result = await self.mutations.mutate_validated_claim(
