@@ -1140,7 +1140,11 @@ class TurnExecution:
         if self.state.control is not None and self.state.control.session is not None:
             await self.state.control.session.save("paired")
         if response.incomplete_reason != "pause_turn":
-            if not self.state.continuation_native_tools and not response.native_tool_events:
+            if (
+                response.tool_calls
+                and not self.state.continuation_native_tools
+                and not response.native_tool_events
+            ):
                 return Continue()
             raise LLMIncompleteResponseError("provider response was incomplete")
         if response.continuation is None:
