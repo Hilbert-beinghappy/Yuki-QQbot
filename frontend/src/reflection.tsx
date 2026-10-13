@@ -11,10 +11,9 @@ import {
   Table,
 } from "./components";
 import type { Column } from "./components";
-import { stamp } from "./format";
+import { flatten, stamp } from "./format";
 import { OwnerPicker } from "./owner-picker";
 
-const flatten = (row: Row): Row => ({ ...row, ...((row.fields as Row) || {}) });
 const columns: Record<string, Column[]> = {
   states: [
     ["canonical_person_id", "Person"],

@@ -1,3 +1,9 @@
+import type { Row } from "./api";
+
+export function flatten(row: Row): Row {
+  return { ...row, ...((row.fields as Row) || {}) };
+}
+
 export function stamp(value: unknown) {
   if (!value) return "未记录";
   const date = new Date(

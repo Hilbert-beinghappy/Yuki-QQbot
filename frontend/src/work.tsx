@@ -4,10 +4,10 @@ import { AutomationEditor } from "./automation-editor";
 import type { Row } from "./api";
 import type { PageProps } from "./pages";
 import { useQuery } from "./hooks";
-import { stamp, text } from "./format";
+import { flatten, stamp, text } from "./format";
 import { useDisplayNames } from "./names";
 import {
-  Badge,
+  renderBadge as status,
   type Column,
   Empty,
   ErrorNote,
@@ -15,8 +15,6 @@ import {
   QueryList,
   Section,
 } from "./components";
-const flatten = (row: Row): Row => ({ ...row, ...((row.fields as Row) || {}) });
-const status = (value: unknown) => <Badge value={value} />;
 
 function WorkActions({
   workId,

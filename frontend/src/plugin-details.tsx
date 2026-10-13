@@ -3,6 +3,7 @@ import type { Row } from "./api";
 import type { PageProps } from "./pages";
 import { useQuery } from "./hooks";
 import {
+  renderBadge as badge,
   Badge,
   Empty,
   ErrorNote,
@@ -12,7 +13,7 @@ import {
   Table,
 } from "./components";
 import { SchemaFields } from "./schema-fields";
-import { stamp } from "./format";
+import { flatten, stamp } from "./format";
 import { OwnerPicker } from "./owner-picker";
 
 const labels: Record<string, string> = {
@@ -39,8 +40,6 @@ const labels: Record<string, string> = {
   send_text: "发送文本",
   send_card: "发送卡片",
 };
-const flatten = (row: Row): Row => ({ ...row, ...((row.fields as Row) || {}) });
-const badge = (value: unknown) => <Badge value={value} />;
 
 function ConfigDraft({ fields, props }: { fields: Row; props: PageProps }) {
   const [values, change] = useState(fields.values as Row);

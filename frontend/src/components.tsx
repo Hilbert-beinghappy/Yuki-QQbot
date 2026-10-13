@@ -47,6 +47,10 @@ export function Section({
     </section>
   );
 }
+export function renderBadge(value: unknown) {
+  return <Badge value={value} />;
+}
+
 export function Badge({ value }: { value: unknown }) {
   return (
     <span

@@ -1,11 +1,12 @@
 import type { CommandMethod } from "./control-methods";
-import { stamp, text } from "./format";
+import { flatten, stamp, text } from "./format";
 import { useQuery } from "./hooks";
 import { useState } from "react";
 import type { ReactNode } from "react";
 import type { Row } from "./api";
 import type { Intent } from "./actions";
 import {
+  renderBadge as status,
   Badge,
   Empty,
   ErrorNote,
@@ -29,8 +30,6 @@ export interface PageProps {
   conversation: string;
   chatContent?: boolean;
 }
-const flatten = (row: Row): Row => ({ ...row, ...((row.fields as Row) || {}) });
-const status = (value: unknown) => <Badge value={value} />;
 
 export function Health({
   refresh,

@@ -1,7 +1,12 @@
 import { useState } from "react";
 import type { Row } from "./api";
 import type { PageProps } from "./pages";
-import { Badge, JsonNote, QueryList, Section } from "./components";
+import {
+  renderBadge as badge,
+  JsonNote,
+  QueryList,
+  Section,
+} from "./components";
 import { OwnerPicker } from "./owner-picker";
 
 function BindingForm({
@@ -222,7 +227,6 @@ export function Identity(props: PageProps) {
     [route, setRoute] = useState<Row | null>(null),
     [createRoute, setCreateRoute] = useState(false),
     [register, setRegister] = useState(false);
-  const badge = (value: unknown) => <Badge value={value} />;
   return (
     <>
       {(["person", "space"] as const).map((kind) => (

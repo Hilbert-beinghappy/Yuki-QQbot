@@ -1,11 +1,7 @@
 import { useState } from "react";
-import type { Row } from "./api";
 import type { PageProps } from "./pages";
-import { Badge, QueryList } from "./components";
-import { stamp } from "./format";
-
-const flatten = (row: Row): Row => ({ ...row, ...((row.fields as Row) || {}) });
-const status = (value: unknown) => <Badge value={value} />;
+import { renderBadge as status, QueryList } from "./components";
+import { flatten, stamp } from "./format";
 
 export function AutomationHistory({
   automationId,
