@@ -124,7 +124,6 @@ class AgentRuntime:
     max_model_requests: int | None
     prompt_diagnostics: PromptRequestDiagnostics | None = None
     before_model_request: Callable[[], Awaitable[None]] | None = None
-    admit_model_request: Callable[[], Awaitable[None]] | None = None
     canonical_conversation_id: str | None = None
     conversation_generation: int | None = None
     dynamic_context_prepared: bool = False
@@ -147,7 +146,6 @@ class AgentRunResult:
     text: str
     tool_calls_used: int
     model_requests: int
-    web_was_used: bool
     messages_sent: int = 0
     native_tool_events: tuple[NativeToolEvent, ...] = ()
     citations: tuple[ResponseCitation, ...] = ()
@@ -159,7 +157,7 @@ class AgentRunResult:
 
 
 class AgentToolBackend(CoordinatedToolBackend, Protocol):
-    def definitions(self, runtime: AgentRuntime, *, web_was_used: bool) -> tuple[ChatTool, ...]: ...
+    def definitions(self, runtime: AgentRuntime) -> tuple[ChatTool, ...]: ...
 
     async def execute_call(self, invocation: Invocation) -> str: ...
 
@@ -180,7 +178,7 @@ class AgentToolBackend(CoordinatedToolBackend, Protocol):
     def record_failure_usage(self, *, tool_calls: int, model_requests: int) -> None:
         pass
 
-    def refresh_catalog(self, runtime: AgentRuntime, *, web_was_used: bool) -> None:
+    def refresh_catalog(self, runtime: AgentRuntime) -> None:
         pass
 
     def pin_web_provider(self) -> AbstractContextManager[None]:
@@ -194,12 +192,6 @@ class AgentToolBackend(CoordinatedToolBackend, Protocol):
 
     async def archive_code_result(self, text: str) -> str | None:
         return None
-
-    def mark_native_web_used(self) -> None:
-        pass
-
-    def did_use_web(self) -> bool:
-        return False
 
     async def observe_response(self, response: ChatResponse, runtime: AgentRuntime) -> None:
         pass
@@ -410,7 +402,6 @@ class AgentRunner:
         *,
         runtime_config: RuntimeConfigSnapshot,
         allowed_capabilities: frozenset[str],
-        web_was_used: bool = False,
     ) -> tuple[tuple[ChatTool, ...], tuple[NativeToolDefinition, ...]]:
         """Use the dispatch tool shape for both preparation and the actual request."""
         web_config = runtime_config.web
@@ -427,7 +418,6 @@ class AgentRunner:
             allowed_capabilities=allowed_capabilities,
             web_mode=web_mode,
             search_mode=search_mode,
-            web_was_used=web_was_used,
         )
         excluded = self._native_tools.excluded_function_names(
             protocol=protocol,
@@ -537,7 +527,6 @@ class AgentRunner:
                 text="",
                 tool_calls_used=control.tools_started,
                 model_requests=control.requests_started,
-                web_was_used=False,
                 suppress_delivery=True,
                 work_state=control.ending,
                 outcome=outcome,
