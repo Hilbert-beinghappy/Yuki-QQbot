@@ -16,7 +16,6 @@ from qq_ai_bot.memory.enums import (
     MemoryStatus,
 )
 from qq_ai_bot.memory.extraction import MemoryClaim
-from qq_ai_bot.memory.metrics import MemoryLifecycleMetrics
 from qq_ai_bot.memory.models import MemoryCandidate, MemoryResolutionPlan
 from qq_ai_bot.memory.service import MemoryFactService
 from qq_ai_bot.memory.subjects import SubjectResolutionContext
@@ -68,14 +67,12 @@ class MemoryClaimProcessor:
         settings: Settings,
         facts: MemoryFactService,
         validator: MemoryClaimValidator | None = None,
-        metrics: MemoryLifecycleMetrics | None = None,
     ) -> None:
         self._settings = settings
         self._facts = facts
         self._validator = validator or MemoryClaimValidator(
             timezone_name=settings.default_timezone,
         )
-        self.metrics = metrics or MemoryLifecycleMetrics()
 
     def validate(
         self,
