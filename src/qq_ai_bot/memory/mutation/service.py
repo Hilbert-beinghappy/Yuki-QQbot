@@ -22,7 +22,6 @@ from qq_ai_bot.memory.claim_processor import (
     MemoryClaimProcessor,
     MemoryClaimResolution,
     MemoryProcessingContext,
-    ResolvedMemoryClaim,
 )
 from qq_ai_bot.memory.dream.db_models import (
     MemoryDreamClusterModel,
@@ -44,7 +43,6 @@ from qq_ai_bot.memory.enums import (
     MemoryFactRelationType,
     MemoryInvalidationReason,
     MemoryKind,
-    MemoryProcessingSource,
     MemoryResolutionAction,
     MemoryReviewState,
     MemoryScopeType,
@@ -172,7 +170,6 @@ class MemoryMutationService:
         self._receipts = receipts or MemoryMutationReceiptRepository(facts.repository.database)
         self._subjects = subject_resolver or SubjectResolver()
         self._temporal = temporal_resolver or MemoryTemporalResolver()
-        self._lock = asyncio.Lock()
 
     async def mutate(
         self,
@@ -1188,236 +1185,232 @@ class MemoryMutationService:
     ) -> MemoryMutationResult:
         request = prepared.request
         context = prepared.context
-        async with self._lock:
-            existing = await self._receipts.find(
+        existing = await self._receipts.find(
+            idempotency_key=prepared.idempotency_key,
+            claim_fingerprint=prepared.claim_fingerprint,
+        )
+        if existing is not None:
+            return MemoryMutationResult.from_receipt(
+                existing,
+                deduplicated=True,
+                requested_operation=request.operation,
+            )
+        evidence_sources = (prepared.evidence, *additional_evidence)
+        async with self._facts.repository.transaction() as source_session:
+            source_snapshot = await self._mutation_source_snapshot(
+                context.event, evidence_sources, session=source_session
+            )
+        claim_resolution: MemoryClaimResolution | None = None
+        if request.operation is MemoryMutationOperation.CREATE:
+            if prepared.claim is None:
+                raise MemoryMutationRejected("validated_claim_required")
+            claim_resolution = self._processor.resolve(
+                prepared.claim,
+                MemoryProcessingContext(
+                    event=context.event,
+                    config_scope=context.config_scope,
+                ),
+            )
+        mutation_id = str(uuid.uuid4())
+
+        async def apply(session: AsyncSession) -> MemoryMutationResult:
+            duplicate = await self._receipts.find(
                 idempotency_key=prepared.idempotency_key,
                 claim_fingerprint=prepared.claim_fingerprint,
+                session=session,
             )
-            if existing is not None:
-                return MemoryMutationResult.from_receipt(
-                    existing,
-                    deduplicated=True,
-                    requested_operation=request.operation,
-                )
-            evidence_sources = (prepared.evidence, *additional_evidence)
-            async with self._facts.repository.transaction() as source_session:
-                source_snapshot = await self._mutation_source_snapshot(
-                    context.event, evidence_sources, session=source_session
-                )
-            claim_resolution: MemoryClaimResolution | None = None
-            if request.operation is MemoryMutationOperation.CREATE:
-                if prepared.claim is None:
-                    raise MemoryMutationRejected("validated_claim_required")
-                claim_resolution = await self._processor.resolve(
-                    prepared.claim,
-                    MemoryProcessingContext(
-                        source=MemoryProcessingSource.LIVE,
-                        event=context.event,
-                        config_scope=context.config_scope,
-                    ),
-                )
-            mutation_id = str(uuid.uuid4())
-
-            async def apply(session: AsyncSession) -> MemoryMutationResult:
-                duplicate = await self._receipts.find(
-                    idempotency_key=prepared.idempotency_key,
-                    claim_fingerprint=prepared.claim_fingerprint,
-                    session=session,
-                )
-                if duplicate is not None:
-                    return MemoryMutationResult.from_receipt(
-                        duplicate,
-                        deduplicated=True,
-                        requested_operation=request.operation,
-                    )
-                from qq_ai_bot.runtime.effect_outcomes import current_result_capture
-
-                capture = current_result_capture.get()
-                if capture is not None and not (capture.work_id and capture.effect_key):
-                    capture = None
-                try:
-                    current_owners = (
-                        self._facts.persisted_target_owners(prepared.fact)
-                        if request.target is None and prepared.fact is not None
-                        else await self._facts.requested_target_owners(
-                            prepared.target, session=session
-                        )
-                    )
-                    current_actor = (
-                        await self._facts.resolve_person_id(
-                            context.trigger_actor_user_id, session=session
-                        )
-                        if context.event is not None
-                        else None
-                    )
-                except MemoryPartitionResolutionError:
-                    raise MemoryMutationRejected("memory_resolution_snapshot_changed") from None
-                if (
-                    current_owners != prepared.target_owners
-                    or current_actor != prepared.actor_person_id
-                    or await self._mutation_source_snapshot(
-                        context.event, evidence_sources, session=session
-                    )
-                    != source_snapshot
-                ):
-                    raise MemoryMutationRejected("memory_resolution_snapshot_changed")
-                facts = tuple(
-                    fact for fact in (prepared.fact, prepared.merge_fact) if fact is not None
-                )
-                if isinstance(claim_resolution, ResolvedMemoryClaim):
-                    facts = (*facts, *(row.fact for row in claim_resolution.candidates))
-                targets: tuple[MemoryFact | MemoryFactCreate, ...] = facts
-                if prepared.claim is not None:
-                    targets = (*targets, prepared.claim.fact)
-                replacement = None
-                if request.operation in {
-                    MemoryMutationOperation.REASSIGN,
-                    MemoryMutationOperation.UPDATE_METADATA,
-                }:
-                    replacement = self._version_replacement(prepared)
-                    targets = (*targets, replacement)
-                await self._facts.prepare_evidence_write(
-                    tuple(fact.id for fact in facts),
-                    session=session,
-                    targets=targets,
-                )
-                current_facts = {
-                    fact.id: fact
-                    for fact in await self._facts.repository.get_facts(
-                        tuple(fact.id for fact in facts),
-                        session=session,
-                    )
-                }
-                for snapshot in facts:
-                    current = current_facts.get(snapshot.id)
-                    if (
-                        current is None
-                        or fact_signature(current) != fact_signature(snapshot)
-                        or (
-                            self._facts.target_signature(
-                                scope_type=current.scope_type,
-                                visibility_type=current.visibility_type,
-                                owners=self._facts.persisted_target_owners(current),
-                            )
-                            != self._facts.target_signature(
-                                scope_type=snapshot.scope_type,
-                                visibility_type=snapshot.visibility_type,
-                                owners=self._facts.persisted_target_owners(snapshot),
-                            )
-                        )
-                    ):
-                        raise MemoryMutationRejected("memory_resolution_snapshot_changed")
-                if request.operation is MemoryMutationOperation.MERGE:
-                    source = self._required_fact(prepared)
-                    target = prepared.merge_fact
-                    if target is None:
-                        raise MemoryMutationRejected("merge_fact_required")
-                    await self._facts.prepare_evidence_copy((source.id,), target, session=session)
-                elif request.operation is MemoryMutationOperation.CORRECT:
-                    source = self._required_fact(prepared)
-                    assert prepared.claim is not None
-                    await self._facts.prepare_evidence_copy(
-                        (source.id,),
-                        prepared.claim.fact,
-                        session=session,
-                    )
-                elif replacement is not None:
-                    source = self._required_fact(prepared)
-                    await self._facts.prepare_evidence_copy(
-                        (source.id,),
-                        replacement,
-                        session=session,
-                        authority=(
-                            replacement.authority
-                            if request.operation is MemoryMutationOperation.REASSIGN
-                            else None
-                        ),
-                    )
-                reserved = await self._receipts.reserve(
-                    mutation_id=mutation_id,
-                    idempotency_key=prepared.idempotency_key,
-                    claim_fingerprint=prepared.claim_fingerprint,
-                    target_fingerprint=prepared.target_fingerprint,
-                    trigger_event_id=context.event.id if context.event else None,
-                    initiative_run_id=context.initiative_run_id,
-                    conversation_key=context.conversation_key,
-                    current_group_id=context.group_id,
-                    turn_origin=context.turn_origin,
-                    delegation_mode=context.delegation_mode,
-                    trigger_actor_user_id=context.trigger_actor_user_id,
-                    decision_actor_type=context.decision_actor_type,
-                    decision_actor_id=context.decision_actor_id,
-                    executed_by_bot_user_id=context.executed_by_bot_user_id,
-                    requested_operation=request.operation,
-                    created_at=datetime.now(UTC),
-                    session=session,
-                )
-                if capture is not None:
-                    from qq_ai_bot.runtime.work_activation import current_work_control
-                    from qq_ai_bot.runtime.work_repository import WorkRepository
-
-                    control = current_work_control.get()
-                    if control is not None:
-                        await control.repository._assert_lease(session, control.lease)
-                    await WorkRepository.bind_domain_receipt(
-                        session,
-                        capture.work_id,
-                        capture.effect_key,
-                        f"memory:{reserved.mutation_id}",
-                    )
-                applied = await self._apply(
-                    prepared,
-                    session=session,
-                    claim_resolution=claim_resolution,
-                )
-                if applied.new_fact_id is not None and additional_evidence:
-                    await self._facts.append_evidence_bundle(
-                        applied.new_fact_id,
-                        additional_evidence,
-                        confirmed_at=context.occurred_at,
-                        session=session,
-                    )
-                if applied.new_fact_id is not None and self_reflection_result is not None:
-                    run_id, result_kind, result_index = self_reflection_result
-                    session.add(
-                        MemorySelfReflectionResultModel(
-                            run_id=run_id,
-                            fact_id=applied.new_fact_id,
-                            result_kind=result_kind,
-                            result_index=result_index,
-                            created_at=datetime.now(UTC),
-                        )
-                    )
-                receipt = await self._receipts.finalize(
-                    reserved.id,
-                    applied_operation=applied.operation,
-                    old_fact_id=applied.old_fact_id,
-                    new_fact_id=applied.new_fact_id,
-                    outcome=applied.outcome,
-                    reason_code=applied.reason_code,
-                    session=session,
-                )
-                return MemoryMutationResult.from_receipt(receipt, deduplicated=False)
-
-            try:
-                result = await self._facts.repository.apply_evidence_write(apply)
-            except BaseException as exc:
-                # Unknown commit acknowledgements are resolved by the original receipt.
-                # Cancellation still propagates after verification; never replay the work.
-                try:
-                    duplicate = await self._receipts.find(
-                        idempotency_key=prepared.idempotency_key,
-                        claim_fingerprint=prepared.claim_fingerprint,
-                    )
-                except BaseException as verification_error:
-                    raise exc from verification_error
-                if isinstance(exc, asyncio.CancelledError) or duplicate is None:
-                    raise
+            if duplicate is not None:
                 return MemoryMutationResult.from_receipt(
                     duplicate,
                     deduplicated=True,
                     requested_operation=request.operation,
                 )
+            from qq_ai_bot.runtime.effect_outcomes import current_result_capture
+
+            capture = current_result_capture.get()
+            if capture is not None and not (capture.work_id and capture.effect_key):
+                capture = None
+            try:
+                current_owners = (
+                    self._facts.persisted_target_owners(prepared.fact)
+                    if request.target is None and prepared.fact is not None
+                    else await self._facts.requested_target_owners(
+                        prepared.target, session=session
+                    )
+                )
+                current_actor = (
+                    await self._facts.resolve_person_id(
+                        context.trigger_actor_user_id, session=session
+                    )
+                    if context.event is not None
+                    else None
+                )
+            except MemoryPartitionResolutionError:
+                raise MemoryMutationRejected("memory_resolution_snapshot_changed") from None
+            if (
+                current_owners != prepared.target_owners
+                or current_actor != prepared.actor_person_id
+                or await self._mutation_source_snapshot(
+                    context.event, evidence_sources, session=session
+                )
+                != source_snapshot
+            ):
+                raise MemoryMutationRejected("memory_resolution_snapshot_changed")
+            facts = tuple(
+                fact for fact in (prepared.fact, prepared.merge_fact) if fact is not None
+            )
+            targets: tuple[MemoryFact | MemoryFactCreate, ...] = facts
+            if prepared.claim is not None:
+                targets = (*targets, prepared.claim.fact)
+            replacement = None
+            if request.operation in {
+                MemoryMutationOperation.REASSIGN,
+                MemoryMutationOperation.UPDATE_METADATA,
+            }:
+                replacement = self._version_replacement(prepared)
+                targets = (*targets, replacement)
+            await self._facts.prepare_evidence_write(
+                tuple(fact.id for fact in facts),
+                session=session,
+                targets=targets,
+            )
+            current_facts = {
+                fact.id: fact
+                for fact in await self._facts.repository.get_facts(
+                    tuple(fact.id for fact in facts),
+                    session=session,
+                )
+            }
+            for snapshot in facts:
+                current = current_facts.get(snapshot.id)
+                if (
+                    current is None
+                    or fact_signature(current) != fact_signature(snapshot)
+                    or (
+                        self._facts.target_signature(
+                            scope_type=current.scope_type,
+                            visibility_type=current.visibility_type,
+                            owners=self._facts.persisted_target_owners(current),
+                        )
+                        != self._facts.target_signature(
+                            scope_type=snapshot.scope_type,
+                            visibility_type=snapshot.visibility_type,
+                            owners=self._facts.persisted_target_owners(snapshot),
+                        )
+                    )
+                ):
+                    raise MemoryMutationRejected("memory_resolution_snapshot_changed")
+            if request.operation is MemoryMutationOperation.MERGE:
+                source = self._required_fact(prepared)
+                target = prepared.merge_fact
+                if target is None:
+                    raise MemoryMutationRejected("merge_fact_required")
+                await self._facts.prepare_evidence_copy((source.id,), target, session=session)
+            elif request.operation is MemoryMutationOperation.CORRECT:
+                source = self._required_fact(prepared)
+                assert prepared.claim is not None
+                await self._facts.prepare_evidence_copy(
+                    (source.id,),
+                    prepared.claim.fact,
+                    session=session,
+                )
+            elif replacement is not None:
+                source = self._required_fact(prepared)
+                await self._facts.prepare_evidence_copy(
+                    (source.id,),
+                    replacement,
+                    session=session,
+                    authority=(
+                        replacement.authority
+                        if request.operation is MemoryMutationOperation.REASSIGN
+                        else None
+                    ),
+                )
+            reserved = await self._receipts.reserve(
+                mutation_id=mutation_id,
+                idempotency_key=prepared.idempotency_key,
+                claim_fingerprint=prepared.claim_fingerprint,
+                target_fingerprint=prepared.target_fingerprint,
+                trigger_event_id=context.event.id if context.event else None,
+                initiative_run_id=context.initiative_run_id,
+                conversation_key=context.conversation_key,
+                current_group_id=context.group_id,
+                turn_origin=context.turn_origin,
+                delegation_mode=context.delegation_mode,
+                trigger_actor_user_id=context.trigger_actor_user_id,
+                decision_actor_type=context.decision_actor_type,
+                decision_actor_id=context.decision_actor_id,
+                executed_by_bot_user_id=context.executed_by_bot_user_id,
+                requested_operation=request.operation,
+                created_at=datetime.now(UTC),
+                session=session,
+            )
+            if capture is not None:
+                from qq_ai_bot.runtime.work_activation import current_work_control
+                from qq_ai_bot.runtime.work_repository import WorkRepository
+
+                control = current_work_control.get()
+                if control is not None:
+                    await control.repository._assert_lease(session, control.lease)
+                await WorkRepository.bind_domain_receipt(
+                    session,
+                    capture.work_id,
+                    capture.effect_key,
+                    f"memory:{reserved.mutation_id}",
+                )
+            applied = await self._apply(
+                prepared,
+                session=session,
+                claim_resolution=claim_resolution,
+            )
+            if applied.new_fact_id is not None and additional_evidence:
+                await self._facts.append_evidence_bundle(
+                    applied.new_fact_id,
+                    additional_evidence,
+                    confirmed_at=context.occurred_at,
+                    session=session,
+                )
+            if applied.new_fact_id is not None and self_reflection_result is not None:
+                run_id, result_kind, result_index = self_reflection_result
+                session.add(
+                    MemorySelfReflectionResultModel(
+                        run_id=run_id,
+                        fact_id=applied.new_fact_id,
+                        result_kind=result_kind,
+                        result_index=result_index,
+                        created_at=datetime.now(UTC),
+                    )
+                )
+            receipt = await self._receipts.finalize(
+                reserved.id,
+                applied_operation=applied.operation,
+                old_fact_id=applied.old_fact_id,
+                new_fact_id=applied.new_fact_id,
+                outcome=applied.outcome,
+                reason_code=applied.reason_code,
+                session=session,
+            )
+            return MemoryMutationResult.from_receipt(receipt, deduplicated=False)
+
+        try:
+            result = await self._facts.repository.apply_evidence_write(apply)
+        except BaseException as exc:
+            # Unknown commit acknowledgements are resolved by the original receipt.
+            # Cancellation still propagates after verification; never replay the work.
+            try:
+                duplicate = await self._receipts.find(
+                    idempotency_key=prepared.idempotency_key,
+                    claim_fingerprint=prepared.claim_fingerprint,
+                )
+            except BaseException as verification_error:
+                raise exc from verification_error
+            if isinstance(exc, asyncio.CancelledError) or duplicate is None:
+                raise
+            return MemoryMutationResult.from_receipt(
+                duplicate,
+                deduplicated=True,
+                requested_operation=request.operation,
+            )
         if not result.deduplicated:
             await self._schedule_embedding_after_commit(result.new_fact_id)
         return result
@@ -1600,144 +1593,112 @@ class MemoryMutationService:
         claim_fingerprint = _fingerprint(common)
         idempotency_key = _fingerprint({**common, "operation": operation.value})
         target_fingerprint = _fingerprint(target_payload)
-        async with self._lock:
-            existing = await self._receipts.find(
+        existing = await self._receipts.find(
+            idempotency_key=idempotency_key,
+            claim_fingerprint=claim_fingerprint,
+        )
+        if existing is not None:
+            return MemoryMutationResult.from_receipt(
+                existing,
+                deduplicated=True,
+                requested_operation=operation,
+            )
+        claim_resolution = self._processor.resolve(claim, processing_context)
+        mutation_id = str(uuid.uuid4())
+
+        async def apply(session: AsyncSession) -> MemoryMutationResult:
+            duplicate = await self._receipts.find(
                 idempotency_key=idempotency_key,
                 claim_fingerprint=claim_fingerprint,
+                session=session,
             )
-            if existing is not None:
-                return MemoryMutationResult.from_receipt(
-                    existing,
-                    deduplicated=True,
-                    requested_operation=operation,
-                )
-            claim_resolution = await self._processor.resolve(claim, processing_context)
-            mutation_id = str(uuid.uuid4())
-
-            async def apply(session: AsyncSession) -> MemoryMutationResult:
-                duplicate = await self._receipts.find(
-                    idempotency_key=idempotency_key,
-                    claim_fingerprint=claim_fingerprint,
-                    session=session,
-                )
-                if duplicate is not None:
-                    return MemoryMutationResult.from_receipt(
-                        duplicate,
-                        deduplicated=True,
-                        requested_operation=operation,
-                    )
-                try:
-                    current_owners = await self._facts.requested_target_owners(
-                        claim.fact, session=session
-                    )
-                    current_actor = await self._facts.resolve_person_id(
-                        event.sender_user_id, session=session
-                    )
-                except MemoryPartitionResolutionError:
-                    raise MemoryMutationRejected("memory_resolution_snapshot_changed") from None
-                if (
-                    current_owners != target_owners
-                    or current_actor != actor_person_id
-                    or await self._mutation_source_snapshot(
-                        event, (claim.evidence,), session=session
-                    )
-                    != source_snapshot
-                ):
-                    raise MemoryMutationRejected("memory_resolution_snapshot_changed")
-                facts = (
-                    tuple(row.fact for row in claim_resolution.candidates)
-                    if isinstance(claim_resolution, ResolvedMemoryClaim)
-                    else ()
-                )
-                await self._facts.prepare_evidence_write(
-                    tuple(fact.id for fact in facts),
-                    session=session,
-                    targets=(claim.fact, *facts),
-                )
-                current_facts = {
-                    fact.id: fact
-                    for fact in await self._facts.repository.get_facts(
-                        tuple(fact.id for fact in facts),
-                        session=session,
-                    )
-                }
-                for snapshot in facts:
-                    current = current_facts.get(snapshot.id)
-                    if (
-                        current is None
-                        or fact_signature(current) != fact_signature(snapshot)
-                        or (
-                            self._facts.target_signature(
-                                scope_type=current.scope_type,
-                                visibility_type=current.visibility_type,
-                                owners=self._facts.persisted_target_owners(current),
-                            )
-                            != self._facts.target_signature(
-                                scope_type=snapshot.scope_type,
-                                visibility_type=snapshot.visibility_type,
-                                owners=self._facts.persisted_target_owners(snapshot),
-                            )
-                        )
-                    ):
-                        raise MemoryMutationRejected("memory_resolution_snapshot_changed")
-                await fence_memory_job_claim(session, job)
-                reserved = await self._receipts.reserve(
-                    mutation_id=mutation_id,
-                    idempotency_key=idempotency_key,
-                    claim_fingerprint=claim_fingerprint,
-                    target_fingerprint=target_fingerprint,
-                    trigger_event_id=event.id,
-                    conversation_key=conversation_key,
-                    current_group_id=event.group_id,
-                    turn_origin=event.origin,
-                    delegation_mode="automatic_extraction",
-                    trigger_actor_user_id=event.sender_user_id,
-                    decision_actor_type=MemoryDecisionActorType.WORKER,
-                    decision_actor_id="memory_worker",
-                    executed_by_bot_user_id=event.bot_user_id,
-                    requested_operation=operation,
-                    created_at=datetime.now(UTC),
-                    session=session,
-                )
-                processed = await self._processor.apply_resolution(
-                    claim_resolution,
-                    session=session,
-                )
-                applied = self._claim_applied(
-                    action=processed.action,
-                    fact_id=processed.fact_id,
-                    reason_code=processed.reason_code,
-                )
-                receipt = await self._receipts.finalize(
-                    reserved.id,
-                    applied_operation=applied.operation,
-                    old_fact_id=applied.old_fact_id,
-                    new_fact_id=applied.new_fact_id,
-                    outcome=applied.outcome,
-                    reason_code=applied.reason_code,
-                    session=session,
-                )
-                return MemoryMutationResult.from_receipt(receipt, deduplicated=False)
-
-            try:
-                result = await self._facts.repository.apply_evidence_write(apply)
-            except BaseException as exc:
-                # Unknown commit acknowledgements are resolved by the original receipt.
-                # Cancellation still propagates after verification; never replay the work.
-                try:
-                    duplicate = await self._receipts.find(
-                        idempotency_key=idempotency_key,
-                        claim_fingerprint=claim_fingerprint,
-                    )
-                except BaseException as verification_error:
-                    raise exc from verification_error
-                if isinstance(exc, asyncio.CancelledError) or duplicate is None:
-                    raise
+            if duplicate is not None:
                 return MemoryMutationResult.from_receipt(
                     duplicate,
                     deduplicated=True,
                     requested_operation=operation,
                 )
+            try:
+                current_owners = await self._facts.requested_target_owners(
+                    claim.fact, session=session
+                )
+                current_actor = await self._facts.resolve_person_id(
+                    event.sender_user_id, session=session
+                )
+            except MemoryPartitionResolutionError:
+                raise MemoryMutationRejected("memory_resolution_snapshot_changed") from None
+            if (
+                current_owners != target_owners
+                or current_actor != actor_person_id
+                or await self._mutation_source_snapshot(
+                    event, (claim.evidence,), session=session
+                )
+                != source_snapshot
+            ):
+                raise MemoryMutationRejected("memory_resolution_snapshot_changed")
+            await self._facts.prepare_evidence_write(
+                (),
+                session=session,
+                targets=(claim.fact,),
+            )
+            await fence_memory_job_claim(session, job)
+            reserved = await self._receipts.reserve(
+                mutation_id=mutation_id,
+                idempotency_key=idempotency_key,
+                claim_fingerprint=claim_fingerprint,
+                target_fingerprint=target_fingerprint,
+                trigger_event_id=event.id,
+                conversation_key=conversation_key,
+                current_group_id=event.group_id,
+                turn_origin=event.origin,
+                delegation_mode="automatic_extraction",
+                trigger_actor_user_id=event.sender_user_id,
+                decision_actor_type=MemoryDecisionActorType.WORKER,
+                decision_actor_id="memory_worker",
+                executed_by_bot_user_id=event.bot_user_id,
+                requested_operation=operation,
+                created_at=datetime.now(UTC),
+                session=session,
+            )
+            processed = await self._processor.apply_resolution(
+                claim_resolution,
+                session=session,
+            )
+            applied = self._claim_applied(
+                action=processed.action,
+                fact_id=processed.fact_id,
+                reason_code=processed.reason_code,
+            )
+            receipt = await self._receipts.finalize(
+                reserved.id,
+                applied_operation=applied.operation,
+                old_fact_id=applied.old_fact_id,
+                new_fact_id=applied.new_fact_id,
+                outcome=applied.outcome,
+                reason_code=applied.reason_code,
+                session=session,
+            )
+            return MemoryMutationResult.from_receipt(receipt, deduplicated=False)
+
+        try:
+            result = await self._facts.repository.apply_evidence_write(apply)
+        except BaseException as exc:
+            # Unknown commit acknowledgements are resolved by the original receipt.
+            # Cancellation still propagates after verification; never replay the work.
+            try:
+                duplicate = await self._receipts.find(
+                    idempotency_key=idempotency_key,
+                    claim_fingerprint=claim_fingerprint,
+                )
+            except BaseException as verification_error:
+                raise exc from verification_error
+            if isinstance(exc, asyncio.CancelledError) or duplicate is None:
+                raise
+            return MemoryMutationResult.from_receipt(
+                duplicate,
+                deduplicated=True,
+                requested_operation=operation,
+            )
         if not result.deduplicated:
             await self._schedule_embedding_after_commit(result.new_fact_id)
         return result
@@ -2003,11 +1964,8 @@ class MemoryMutationService:
                     existing_fact_id=fact.id,
                     new_fact_status=MemoryStatus.CONTESTED,
                     new_conflict_state=MemoryConflictState.CONTESTED,
-                    existing_status=MemoryStatus.ACTIVE,
-                    existing_conflict_state=MemoryConflictState.CONTESTED,
                     relation_types=(MemoryFactRelationType.CONTRADICTS,),
                     reason_code="agent_requested_contest",
-                    append_evidence=True,
                     create_new_fact=True,
                 ),
                 session=session,
@@ -2320,7 +2278,6 @@ class MemoryMutationService:
             and (category is None or fact.category == category)
         )
         if len(exact) == 1:
-            self._facts.metrics.increment("memory_mutation_locator_unique_count")
             return exact[0]
         candidates = tuple(
             MemoryMutationCandidate(
@@ -2335,12 +2292,10 @@ class MemoryMutationService:
             for fact in rows[:3]
         )
         if candidates:
-            self._facts.metrics.increment("memory_mutation_locator_ambiguous_count")
             raise MemoryMutationRejected(
                 "memory_candidate_ambiguous",
                 candidates=candidates,
             )
-        self._facts.metrics.increment("memory_mutation_locator_not_found_count")
         raise MemoryMutationRejected("memory_candidate_not_found")
 
     @staticmethod
@@ -2424,7 +2379,6 @@ class MemoryMutationService:
 
         if target.scope_type is MemoryScopeType.SELF or request.visibility is None:
             return request
-        self._facts.metrics.increment("memory_mutation_non_self_visibility_ignored_count")
         return request.model_copy(update={"visibility": None})
 
     @staticmethod
@@ -2838,21 +2792,8 @@ class MemoryMutationService:
         )
 
     async def _schedule_embedding_after_commit(self, fact_id: int | None) -> None:
-        if fact_id is None:
-            return
-        try:
-            fact = await self._facts.get_fact(fact_id)
-            if fact is None or fact.status is not MemoryStatus.ACTIVE:
-                return
+        if fact_id is not None:
             await self._facts.schedule_embedding(fact_id)
-        except asyncio.CancelledError:
-            raise
-        except Exception as exc:
-            logger.warning(
-                "memory_mutation_embedding_schedule_failed fact_id=%d category=%s",
-                fact_id,
-                type(exc).__name__,
-            )
 
     @staticmethod
     def _rejected(

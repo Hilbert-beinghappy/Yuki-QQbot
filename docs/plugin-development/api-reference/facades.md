@@ -43,18 +43,18 @@ memory.delete(memory_id) -> PluginResult
 
 ```
 
-`memory.search()` 在 Plugin API 3.4 内部复用主程序的 `MemoryRetriever`：插件作用域校验先确定
+`memory.search()` 在 Plugin API 3.5 内部复用主程序的 `MemoryRetriever`：插件作用域校验先确定
 真实人物或群，随后 FTS 与可选 Embedding 都只在该 SQL 硬过滤范围内召回，并由确定性 RRF
 融合。插件不能选择 Provider/profile、获取原始向量、提交 FTS 语法、通过关键词改变
 `subject_id`，也不会在无匹配时回退加载全部事实。返回记录只包含有界的
 `retrieval_reason`；`list_person()` / `list_group()` 仍用于确定性列表。Embedding 关闭或故障时
-自动保持词法行为；当前 Plugin API 版本由 SDK 的 `PLUGIN_API_VERSION` 定义，为 `3.4`。
+自动保持词法行为；当前 Plugin API 版本由 SDK 的 `PLUGIN_API_VERSION` 定义，为 `3.5`。
 
 从 Yuki `3.0.0b2` 开始，`memory.update()` 会创建 explicit correction 新版本并让旧 fact 进入
 superseded，不原地改写旧正文；`memory.delete()` 会以
 `plugin_explicit_invalidation` 将事实标记为 invalidated，不物理删除事实、证据或状态历史。
 插件不能设置 authority、status、conflict_state、supersedes_id，也不能跨人物/群合并或解决
-冲突。这些写入语义保留在当前 Plugin API 3.4 中，不代表 Host 兼容旧 1.x 插件。
+冲突。这些写入语义保留在当前 Plugin API 3.5 中，不代表 Host 兼容旧 1.x 插件。
 
 Yuki 3.0.0 对 MemoryFacade 做了正式 contract freeze：稳定方法为 `list_person`、`list_group`、
 `search`、`add`、`update`、`delete`。插件不能访问原始向量、历史 rebuild、质量 fixture、全局
@@ -117,7 +117,7 @@ handle/SHA/expiry。完全相同的重试返回原 receipt；任一字段不同�
 
 ```python
 automation.list_current_owner() -> tuple[Mapping, ...]
-automation.create_task(task: Mapping[str, JsonValue]) -> PluginResult
+automation.create_task(task: Mapping[str, JsonValue], *, request_id: str) -> PluginResult
 automation.update_task(task_id, task: Mapping[str, JsonValue]) -> PluginResult
 automation.pause(task_id) -> PluginResult
 automation.resume(task_id) -> PluginResult
@@ -163,3 +163,5 @@ reason及原统计，同步与异步不因等待时间不同丢字段。普通Pl
 需要补充资料时调用
 `ctx.agent.resume(work_id, text, request_id="稳定的调用标识")`，在原历史后追加并交给 Host 续跑。
 同一 request_id 重放复用原输入，不同内容明确冲突；已归档、取消或完成的工作不会另建新任务。
+
+定時任務 create_task 的 request_id 標識本次插件操作，同一操作重試使用原 ID；不同任務使用不同 ID。Host 與真實插件、來源及原調用共同綁定，改參數重用同 ID 返回 creation key conflict。

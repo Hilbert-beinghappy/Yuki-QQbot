@@ -96,6 +96,7 @@ class MemoryStateAction(StrEnum):
 
 
 class MemoryInvalidationReason(StrEnum):
+    INVALID_PROVENANCE = "invalid_provenance"
     USER_RETRACTED = "user_retracted"
     ADMINISTRATOR_INVALIDATED = "administrator_invalidated"
     EXPIRED = "expired"
@@ -111,16 +112,6 @@ class MemoryTemporalMode(StrEnum):
     PERSISTENT = "persistent"
     TEMPORARY = "temporary"
     EPISODE = "episode"
-
-
-class MemorySemanticRelation(StrEnum):
-    SAME_CLAIM = "same_claim"
-    CONFIRMS = "confirms"
-    SUPERSEDES = "supersedes"
-    CONTRADICTS = "contradicts"
-    COEXISTS = "coexists"
-    UNRELATED = "unrelated"
-    RETRACTS = "retracts"
 
 
 class MemoryResolutionAction(StrEnum):
