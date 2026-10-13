@@ -7,7 +7,7 @@ from tests.unit.test_memory_mutation import _context, _event, _service
 from tests.unit.test_memory_v2 import _claim
 
 from qq_ai_bot.memory.claim_processor import MemoryProcessingContext
-from qq_ai_bot.memory.enums import MemoryProcessingSource, MemoryScopeType
+from qq_ai_bot.memory.enums import MemoryScopeType
 from qq_ai_bot.memory.mutation.models import (
     MemoryMutationOperation,
     MemoryMutationRequest,
@@ -29,17 +29,20 @@ async def test_independent_resolutions_do_not_hold_a_global_mutation_lock(
     ]
     both_entered = asyncio.Event()
     count = 0
-    original = processor.resolve
+    original = service._receipts.find
 
-    async def resolve(*args, **kwargs):
+    async def find(*args, **kwargs):
+        original_result = await original(*args, **kwargs)
+        if kwargs.get("session") is not None:
+            return original_result
         nonlocal count
         count += 1
         if count == 2:
             both_entered.set()
         await asyncio.wait_for(both_entered.wait(), timeout=3)
-        return await original(*args, **kwargs)
+        return original_result
 
-    monkeypatch.setattr(processor, "resolve", resolve)
+    monkeypatch.setattr(service._receipts, "find", find)
     if entry == "tool":
         request = MemoryMutationRequest(
             operation=MemoryMutationOperation.CREATE,
@@ -59,7 +62,7 @@ async def test_independent_resolutions_do_not_hold_a_global_mutation_lock(
         tasks = [
             service.mutate_validated_claim(
                 processor.validate(_claim(), source),
-                MemoryProcessingContext(source=MemoryProcessingSource.LIVE, event=source),
+                MemoryProcessingContext(event=source),
                 conversation_key=f"private:{source.sender_user_id}",
                 job=claimed[source.id],
             )
