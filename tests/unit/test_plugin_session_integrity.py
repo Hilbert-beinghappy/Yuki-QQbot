@@ -30,7 +30,7 @@ async def test_private_session_keeps_long_history_and_complete_sdk_result(
         plugin_id=plugin_id,
         name="Integrity",
         version="1.0.0",
-        plugin_api="3.4",
+        plugin_api="3.5",
         yuki_requires=">=3.0.0,<4.0",
         manifest_hash="ab" * 32,
         entrypoint="plugin:Integrity",

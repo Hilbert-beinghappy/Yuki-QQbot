@@ -270,14 +270,6 @@ class EmojiDeliveryService:
                     },
                 )
 
-    async def record_send_attempted(self, message: OutboundMessage, *, source: str) -> None:
-        if any(media.emoji_id for media in message.media):
-            await publish_notification(
-                self._event_publisher,
-                EventName.EMOJI_SEND_ATTEMPTED,
-                {"source": source},
-            )
-
     async def record_send_accepted(self, message: OutboundMessage, *, source: str) -> None:
         if any(media.emoji_id for media in message.media):
             await publish_notification(
@@ -285,12 +277,3 @@ class EmojiDeliveryService:
                 EventName.EMOJI_SEND_ACCEPTED,
                 {"source": source},
             )
-
-    async def record_failure(self, message: OutboundMessage, *, source: str) -> None:
-        for media in message.media:
-            if media.emoji_id:
-                await publish_notification(
-                    self._event_publisher,
-                    EventName.EMOJI_SEND_FAILED,
-                    {"emoji_id": media.emoji_id, "source": source},
-                )
