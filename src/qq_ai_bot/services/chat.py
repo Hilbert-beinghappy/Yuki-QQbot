@@ -164,12 +164,7 @@ class AutomationToolProvider(Protocol):
 class PluginToolProvider(Protocol):
     """Approved Plugin API tools merged into the existing Yuki Agent loop."""
 
-    def definitions(
-        self,
-        runtime: ToolRuntime,
-        *,
-        web_was_used: bool,
-    ) -> tuple[ChatTool, ...]: ...
+    def definitions(self, runtime: ToolRuntime) -> tuple[ChatTool, ...]: ...
 
     def owns(self, name: str) -> bool: ...
 
@@ -178,7 +173,7 @@ class PluginToolProvider(Protocol):
     def is_read_only(self, name: str) -> bool: ...
 
     async def validate_images(
-        self, images: tuple[ChatImage, ...], runtime: ToolRuntime, *, web_was_used: bool
+        self, images: tuple[ChatImage, ...], runtime: ToolRuntime
     ) -> None: ...
 
     async def execute(
@@ -187,7 +182,6 @@ class PluginToolProvider(Protocol):
         arguments_json: str,
         runtime: ToolRuntime,
         *,
-        web_was_used: bool,
         expected_contract: str | None = None,
     ) -> ToolExecutionResult: ...
 
@@ -400,12 +394,7 @@ class ChatService:
             budget = int(budget * runtime.context.compaction_trigger_ratio)
         return max(1, budget - fixed - (4096 if maintenance else 0))
 
-    def _build_tool_registry(
-        self,
-        runtime: ToolRuntime,
-        *,
-        web_was_used: bool,
-    ) -> ToolProviderRegistry:
+    def _build_tool_registry(self, runtime: ToolRuntime) -> ToolProviderRegistry:
         """Adapt every domain service once; execution later uses bindings only."""
 
         registry = ToolProviderRegistry()
@@ -616,14 +605,12 @@ class ChatService:
                         name,
                         arguments,
                         context,
-                        web_was_used=web_was_used,
                         expected_contract=expected,
                     )
                 return await plugin.execute(
                     name,
                     arguments,
                     context,
-                    web_was_used=web_was_used,
                 )
 
             registry.register(
@@ -632,7 +619,6 @@ class ChatService:
                     source=CapabilityTrustSource.PLUGIN,
                     definitions=lambda context: plugin.definitions(
                         context,
-                        web_was_used=web_was_used,
                     ),
                     execute=plugin_execute,
                     plugin_read_only=plugin.is_read_only,

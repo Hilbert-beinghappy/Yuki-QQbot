@@ -245,7 +245,6 @@ def _owned_work_result(row: Mapping[str, Any], source: Mapping[str, Any]) -> _Ho
             text=checkpoint.get("sync_result") or "",
             tool_calls_used=0,
             model_requests=0,
-            web_was_used=False,
             work_id=row["id"],
             work_state=row["state"],
         ),
@@ -279,7 +278,6 @@ class PluginInvocation:
     delegated_authority: DelegatedAuthority | None = field(default=None, repr=False)
     allowed_capabilities: frozenset[str] = field(default_factory=frozenset)
     source_event_id: int | None = None
-    web_was_used: bool = False
     legacy_conversation_key: str | None = None
     person_id: str | None = None
     space_id: str | None = None
@@ -627,11 +625,7 @@ class HostPluginContext:
         await self._scheduler.stop()
 
     def invocation_scope(
-        self,
-        plugin_id: str,
-        runtime: ToolRuntimeProjection,
-        *,
-        web_was_used: bool,
+        self, plugin_id: str, runtime: ToolRuntimeProjection
     ) -> _InvocationBinding:
         """Adapter helper accepting the existing ToolRuntime without importing it."""
 
@@ -664,7 +658,6 @@ class HostPluginContext:
             allowed_capabilities=frozenset(
                 cast(Iterable[str], getattr(runtime, "allowed_capabilities", ()))
             ),
-            web_was_used=web_was_used,
         )
         return self.bind(invocation)
 
@@ -1522,7 +1515,6 @@ class _AgentFacade:
                     text="",
                     tool_calls_used=0,
                     model_requests=0,
-                    web_was_used=False,
                     work_id=work_id,
                     work_state="cancelled",
                 ),

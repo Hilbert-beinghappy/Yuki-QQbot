@@ -75,9 +75,7 @@ class MainAgentBackend(AgentToolBackend):
                 plugin_tools = self._service._plugin_tools
                 if plugin_tools is None:
                     raise LLMError("plugin_media_source_validator_unavailable")
-                await plugin_tools.validate_images(
-                    plugin_images, self._runtime, web_was_used=self._web_was_used
-                )
+                await plugin_tools.validate_images(plugin_images, self._runtime)
             from qq_ai_bot.tool_results.access import access_from_runtime
 
             store = self._service._tool_artifacts
@@ -108,7 +106,6 @@ class MainAgentBackend(AgentToolBackend):
         self.sent_current_texts: list[str] = []
         self.failed_model_requests = 0
         self.failed_tool_calls = 0
-        self._web_was_used = False
         self._catalog: UnifiedToolCatalog | None = None
         self._provider_registry: ToolProviderRegistry | None = None
         self._capability_runtime: TurnCapabilityRuntime | None = None
@@ -140,11 +137,6 @@ class MainAgentBackend(AgentToolBackend):
         return session.contract.read_policy in {
             MemoryReadPolicy.EAGER,
         }
-
-    def mark_native_web_used(self) -> None:
-        """Apply post-Web isolation before same-response local calls execute."""
-
-        self._web_was_used = True
 
     async def protect_native_dispatch(self, runtime: AgentRuntime) -> None:
         """Native effects cannot be ruled out after a transport cancellation."""
@@ -195,9 +187,8 @@ class MainAgentBackend(AgentToolBackend):
             control = current_work_control.get()
         return control is not None and control.lease.work_id is not None
 
-    def definitions(self, runtime: AgentRuntime, *, web_was_used: bool) -> tuple[ChatTool, ...]:
+    def definitions(self, runtime: AgentRuntime) -> tuple[ChatTool, ...]:
         child = self._child_work(runtime)
-        self._web_was_used = self._web_was_used or web_was_used
         if self._runtime.tools_closed:
             self._callable_tool_names = set()
             self._log_tool_exposure((), reason="business_tools_closed")
@@ -223,10 +214,9 @@ class MainAgentBackend(AgentToolBackend):
         self._log_tool_exposure(definitions, reason="ready")
         return definitions
 
-    def refresh_catalog(self, runtime: AgentRuntime, *, web_was_used: bool) -> None:
+    def refresh_catalog(self, runtime: AgentRuntime) -> None:
         """Refresh execution policy without constructing discarded declarations."""
         del runtime
-        self._web_was_used = self._web_was_used or web_was_used
         if self._runtime.tools_closed:
             self._callable_tool_names = set()
             return
@@ -254,7 +244,6 @@ class MainAgentBackend(AgentToolBackend):
         request_runtime = self._request_runtime()
         self._provider_registry = self._service._build_tool_registry(
             request_runtime,
-            web_was_used=self._web_was_used,
         )
         catalog = self._provider_registry.catalog(request_runtime)
         return DescriptorRegistrySnapshot(catalog)
@@ -278,7 +267,6 @@ class MainAgentBackend(AgentToolBackend):
             ),
             origin=self._runtime.origin,
             contains_images=self._runtime.image_present,
-            web_was_used=self._web_was_used,
             tools_closed=self._runtime.tools_closed,
             read_only=self._runtime.read_only,
             memory_view=memory_view,
@@ -333,11 +321,6 @@ class MainAgentBackend(AgentToolBackend):
             ),
         )
         return handle
-
-    def did_use_web(self) -> bool:
-        """Expose a provider-metadata-derived effect to the shared Agent loop."""
-
-        return self._web_was_used
 
     def pin_web_provider(self) -> AbstractContextManager[None]:
         tools = self._service._tools
@@ -403,7 +386,6 @@ class MainAgentBackend(AgentToolBackend):
             return _refused_result(name, "unknown_capability")
         binding = descriptor.binding
         effective_descriptor = self._effective_descriptor(call, descriptor)
-        is_web_tool = effective_descriptor.namespace_id.startswith("web.")
         is_memory_read_tool = (
             effective_descriptor.namespace_id.startswith("memory.")
             and effective_descriptor.effect is CapabilityEffect.READ_STATE
@@ -614,8 +596,6 @@ class MainAgentBackend(AgentToolBackend):
                     # The same Host operation the effect row and audit fence use.
                     tool_call_id=receipt_call_id,
                 )
-        if is_web_tool:
-            self._web_was_used = True
         return result
 
     async def observe_response(self, response: Any, runtime: AgentRuntime) -> None:

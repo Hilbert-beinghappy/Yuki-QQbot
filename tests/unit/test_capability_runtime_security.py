@@ -255,7 +255,7 @@ async def test_memory_failure_can_continue_and_reuse_original_effect(database, t
         max_model_requests=None,
         work_control=owner.control,
     )
-    declared = backend.definitions(context, web_was_used=False)
+    declared = backend.definitions(context)
     assert not any(tool.name.startswith("admin_") for tool in declared)
     calls = []
 
@@ -304,7 +304,7 @@ async def test_memory_failure_can_continue_and_reuse_original_effect(database, t
     assert await owner.journal.effect_state(original.identity.operation_id) == "accepted"
     fact = await facts.get_fact(replacement["data"]["new_fact_id"])
     assert fact.content == "现在住在北京"
-    assert backend.definitions(context, web_was_used=False) == declared
+    assert backend.definitions(context) == declared
     assert (await owner.control.repository.get(owner.control.current["id"]))["tool_calls"] == 4
     await owner.control.repository.release(owner.control.lease)
 
