@@ -157,8 +157,6 @@ class AgentRunResult:
 
 
 class AgentToolBackend(CoordinatedToolBackend, Protocol):
-    def definitions(self, runtime: AgentRuntime) -> tuple[ChatTool, ...]: ...
-
     async def execute_call(self, invocation: Invocation) -> str: ...
 
     def parallel_safe(self, name: str, runtime: AgentRuntime) -> bool: ...
@@ -519,18 +517,6 @@ class AgentRunner:
                             original = original.exceptions[0]
                         raise original from exc
                 raise
-        except (WorkBudgetExceeded, WorkCapacityError) as exc:
-            if control is None or control.current is None:
-                raise
-            outcome = await control.recover_failure(exc)
-            return AgentRunResult(
-                text="",
-                tool_calls_used=control.tools_started,
-                model_requests=control.requests_started,
-                suppress_delivery=True,
-                work_state=control.ending,
-                outcome=outcome,
-            )
         except Exception as exc:
             if control is None or control.current is None:
                 raise

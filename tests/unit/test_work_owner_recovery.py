@@ -588,7 +588,7 @@ async def test_persistent_maintenance_errors_do_not_block_original_work_selectio
         resumed.append(item["id"])
         return None
 
-    monkeypatch.setattr(repository, "reclaim_terminal", failed_reclaim)
+    monkeypatch.setattr(repository, "reclaim_unreferenced_media", failed_reclaim)
     monkeypatch.setattr(ProtocolStore, "cleanup", failed_cleanup)
     scheduler = WorkScheduler(repository, resume, chat_admission_enabled=True)
     for _ in range(2):

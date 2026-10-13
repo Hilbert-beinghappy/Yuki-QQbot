@@ -59,6 +59,7 @@ child 使用自己的 lease，在取得执行权后复用 root 的激活监督�
 暂停或等待父任务的子任务可直接 `resume` 原目标，无需新增 instruction 或伪造补充消息。
 完成后同一 ID 可追加真实新要求，此时 `resume` 携带 instruction。
 尚未归档的子节点沿原 ID、来源和累计预算继续，不重开已完成祖先；其他暂停树不阻挡，执行沿原租约。
+无当前 Work 时恢复子节点，复用主 Work 的本地来源授权查询；共享目录中的安全元数据不授予恢复或追加指令权限。
 
 工作者租约不占聊天会话锁；取消和会话 generation 变化使旧租约失效，迟到结果不得交付。
 恢复时读取原执行回执，未知执行结果先查询原 run_id，不能重跑。
@@ -111,7 +112,9 @@ GC 有界标记未引用对象 deleting，再在 SQLite writer 外删除文件�
 `SUBAGENTS_ENABLED` 默认关闭，只控制新任务接纳；关闭后已存在的任务仍收拢运行。
 `AGENT_MAX_MODEL_REQUESTS=24`、`AGENT_MAX_TOOL_CALLS=32` 更新旧环境里的显式配置。
 主、子任务窗口由所选模型 Profile 的容量合同统一提供，不保留子任务独有的默认窗口。
-`SUBAGENT_CONCURRENCY` 配置后台激活并发，模型池仍保留前台名额；关闭调度器取消并等待
+`SUBAGENT_CONCURRENCY` 由调度器控制后台激活并发，收尾 reconcile 租约不占执行名额。
+同一 SQLite 数据库只允许一个活动 Application；仓储仍核验每个工作者的原执行租约和 generation。
+模型池仍保留前台名额；关闭调度器取消并等待
 所有活跃 worker 收拢，错误由各次激活返回，不存放在共享执行器的当前状态。
 
 定向协议测试直接比较 Chat Completions、DeepSeek Responses 和 OpenAI Responses 的

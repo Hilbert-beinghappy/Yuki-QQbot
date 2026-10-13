@@ -416,7 +416,7 @@ class ScopedEventLedgerUnitOfWork:
                         ) = prepared.counters
                         conversation.updated_at = now
                         signalled = await signal_canonical_rollup_if_needed(
-                            session, conversation, self._config, force_existing=True
+                            session, conversation, force_existing=True
                         )
                     else:
                         self.metrics.late_visual_after_coverage += 1
@@ -1041,7 +1041,7 @@ class ScopedEventLedgerUnitOfWork:
         from qq_ai_bot.conversation.canonical_rollup import signal_canonical_rollup_if_needed
 
         signalled = await signal_canonical_rollup_if_needed(
-            session, conversation, self._config, force_existing=not plugin_external
+            session, conversation, force_existing=not plugin_external
         )
         return ScopedAppendResult(
             event=_event_record(row),

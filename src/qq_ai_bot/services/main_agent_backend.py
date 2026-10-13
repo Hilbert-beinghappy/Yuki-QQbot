@@ -6,6 +6,7 @@ import asyncio
 import json
 import logging
 import time
+from collections.abc import Awaitable, Callable
 from contextlib import AbstractContextManager, nullcontext
 from dataclasses import replace
 from typing import TYPE_CHECKING, Any
@@ -28,10 +29,8 @@ from qq_ai_bot.capabilities.exposure import NO_LONGER_AUTHORIZED
 from qq_ai_bot.capabilities.invocation import Invocation
 from qq_ai_bot.capabilities.runtime import TurnCapabilityRuntime
 from qq_ai_bot.capabilities.validation import UNDECLARED_TOOL
-from qq_ai_bot.domain.messages import ChatImage, ChatTool, ToolCall, ToolFunction
+from qq_ai_bot.domain.messages import ChatImage, ToolCall, ToolFunction
 from qq_ai_bot.llm.base import LLMError
-from qq_ai_bot.memory.runtime.contract import MemoryReadPolicy
-from qq_ai_bot.runtime.observability import identifier_hash
 from qq_ai_bot.runtime.origin import TurnOrigin as RuntimeTurnOrigin
 from qq_ai_bot.runtime.work_budget import WorkBudgetExceeded
 from qq_ai_bot.services.agent_runner import AgentRuntime, AgentToolBackend
@@ -110,7 +109,6 @@ class MainAgentBackend(AgentToolBackend):
         self._provider_registry: ToolProviderRegistry | None = None
         self._capability_runtime: TurnCapabilityRuntime | None = None
         self._callable_tool_names: set[str] = set()
-        self._tool_turn_recorded = False
         self._response_sequence = 0
 
     def record_failure_usage(self, *, tool_calls: int, model_requests: int) -> None:
@@ -129,14 +127,6 @@ class MainAgentBackend(AgentToolBackend):
 
     def _memory(self) -> Any:
         return self._memory_session
-
-    def _eager_memory_read(self) -> bool:
-        session = self._memory()
-        if session is None:
-            return False
-        return session.contract.read_policy in {
-            MemoryReadPolicy.EAGER,
-        }
 
     async def protect_native_dispatch(self, runtime: AgentRuntime) -> None:
         """Native effects cannot be ruled out after a transport cancellation."""
@@ -158,7 +148,7 @@ class MainAgentBackend(AgentToolBackend):
             return True
         if self._allowed_tools is not None and name not in self._allowed_tools:
             return False
-        return not (self._runtime.tools_closed or self._runtime.read_only)
+        return not self._runtime.tools_closed
 
     def work_query_allowed(self, action: str) -> bool:
         """Read Work facts using the original actor and tree scope."""
@@ -187,33 +177,6 @@ class MainAgentBackend(AgentToolBackend):
             control = current_work_control.get()
         return control is not None and control.lease.work_id is not None
 
-    def definitions(self, runtime: AgentRuntime) -> tuple[ChatTool, ...]:
-        child = self._child_work(runtime)
-        if self._runtime.tools_closed:
-            self._callable_tool_names = set()
-            self._log_tool_exposure((), reason="business_tools_closed")
-            return ()
-        capability_runtime = self._ensure_capability_runtime()
-        session = self._memory()
-        if session is not None:
-            capability_runtime.sync_memory_view(session.capability_view())
-        definitions = capability_runtime.definitions()
-        if child:
-            # Root/plugin declarations stay fixed; only a child catalog is its
-            # frozen execution subset.
-            definitions = tuple(
-                tool
-                for tool in definitions
-                if self._allowed_tools is not None and tool.name in self._allowed_tools
-            )
-        definitions = tuple(sorted(definitions, key=lambda tool: tool.name))
-        self._callable_tool_names = set(capability_runtime.callable_capability_ids())
-        if not self._tool_turn_recorded and definitions:
-            self._service._tool_metrics.record_tool_enabled_turn()
-            self._tool_turn_recorded = True
-        self._log_tool_exposure(definitions, reason="ready")
-        return definitions
-
     def refresh_catalog(self, runtime: AgentRuntime) -> None:
         """Refresh execution policy without constructing discarded declarations."""
         del runtime
@@ -225,9 +188,6 @@ class MainAgentBackend(AgentToolBackend):
         if session is not None:
             capability_runtime.sync_memory_view(session.capability_view())
         self._callable_tool_names = set(capability_runtime.callable_capability_ids())
-        if not self._tool_turn_recorded and self._callable_tool_names:
-            self._service._tool_metrics.record_tool_enabled_turn()
-            self._tool_turn_recorded = True
 
     def _ensure_capability_runtime(self) -> TurnCapabilityRuntime:
         if self._capability_runtime is not None:
@@ -265,10 +225,7 @@ class MainAgentBackend(AgentToolBackend):
                     else "person"
                 ),
             ),
-            origin=self._runtime.origin,
-            contains_images=self._runtime.image_present,
             tools_closed=self._runtime.tools_closed,
-            read_only=self._runtime.read_only,
             memory_view=memory_view,
             artifact_available=self._service._tool_artifacts is not None,
         )
@@ -277,25 +234,6 @@ class MainAgentBackend(AgentToolBackend):
             policy_context=policy_context,
         )
         return self._capability_runtime
-
-    def _log_tool_exposure(
-        self,
-        definitions: tuple[ChatTool, ...],
-        *,
-        reason: str,
-    ) -> None:
-        """Log bounded capability metadata without message text or tool arguments."""
-
-        exposed_tools = ",".join(sorted(tool.name for tool in definitions)) or "none"
-        logger.info(
-            "agent_tools_exposed conversation_hash=%s origin=%s "
-            "tools=%s exposed_count=%d reason=%s",
-            identifier_hash(self._runtime.conversation_key) or "missing",
-            self._runtime.origin.value,
-            exposed_tools,
-            len(definitions),
-            reason,
-        )
 
     async def archive_code_result(self, text: str) -> str | None:
         """Full program result as an authorized artifact; the model sees a preview."""
@@ -354,13 +292,65 @@ class MainAgentBackend(AgentToolBackend):
             and await control.has_pending_business_inputs()
         ):
             return _refused_result(name, "new_input_before_execution")
-        if name == "update_short_state" and self._service.runtime.runner.main_contract is not None:
-            outcome = await self._service.runtime.runner.main_contract.state.execute(arguments_json)
-            return (await ToolResultBudgeter(max_characters=None).render(outcome)).text
+
+        async def invoke_effect(
+            action: Callable[[], Awaitable[ToolExecutionResult]],
+        ) -> ToolExecutionResult:
+            from qq_ai_bot.runtime.work_activation import current_work_control
+
+            work = current_work_control.get()
+            if work is not None:
+                if name != "send_message":
+                    await work.validate()
+                if not await work.repository.valid(work.lease):
+                    raise TurnSupersededError("work activation changed")
+                if name != "send_message" and await work.has_pending_business_inputs():
+                    return ToolExecutionResult(
+                        ok=False,
+                        data={"executed": False},
+                        error_code="new_input_before_execution",
+                        public_message="新要求已到达，此调用未执行，请按新要求继续。",
+                        retryable=True,
+                        mutation_committed=False,
+                    )
+            return await action()
+
         if self._runtime.tools_closed:
             return _refused_result(
                 name, "tools_closed", detail="本轮只声明会话前缀工具 schema，不允许真实调用。"
             )
+        if name == "update_short_state" and contract is not None:
+            state = contract.state
+            execution_runtime = self._request_runtime()
+            if execution_runtime.turn_token is not None:
+                await self._service._turn_coordinator.mark_mutation_started(
+                    execution_runtime.turn_token
+                )
+            state_started = False
+
+            async def invoke_state() -> ToolExecutionResult:
+                nonlocal state_started
+                state_started = True
+                return await state.execute(arguments_json)
+
+            try:
+                outcome = await self._service.run_effect(
+                    execution_runtime.turn_snapshot, lambda: invoke_effect(invoke_state)
+                )
+            except (asyncio.CancelledError, WorkBudgetExceeded):
+                raise
+            except Exception as exc:
+                outcome = ToolExecutionResult(
+                    ok=False,
+                    error_code=type(exc).__name__,
+                    public_message="工具执行失败",
+                    retryable=False,
+                    uncertain=state_started,
+                    mutation_committed=None if state_started else False,
+                    provider_id="host_prefix",
+                    tool_name=name,
+                )
+            return (await ToolResultBudgeter(max_characters=None).render(outcome)).text
         capability_runtime = self._capability_runtime
         if capability_runtime is not None:
             validation = capability_runtime.validate_call_result(name, arguments_json)
@@ -386,14 +376,6 @@ class MainAgentBackend(AgentToolBackend):
             return _refused_result(name, "unknown_capability")
         binding = descriptor.binding
         effective_descriptor = self._effective_descriptor(call, descriptor)
-        is_memory_read_tool = (
-            effective_descriptor.namespace_id.startswith("memory.")
-            and effective_descriptor.effect is CapabilityEffect.READ_STATE
-        )
-        if is_memory_read_tool and not self._eager_memory_read():
-            self._service._tool_metrics.record_automatic_memory_read_tool_call(
-                locator_fallback=False
-            )
         config = self._runtime.runtime_config
         assert config is not None
         mutating = self._is_mutating_call(call)
@@ -415,23 +397,6 @@ class MainAgentBackend(AgentToolBackend):
 
                 async def invoke_binding() -> ToolExecutionResult:
                     nonlocal binding_started
-                    from qq_ai_bot.runtime.work_activation import current_work_control
-
-                    work = current_work_control.get()
-                    if work is not None:
-                        if name != "send_message":
-                            await work.validate()
-                        if not await work.repository.valid(work.lease):
-                            raise TurnSupersededError("work activation changed")
-                        if name != "send_message" and await work.has_pending_business_inputs():
-                            return ToolExecutionResult(
-                                ok=False,
-                                data={"executed": False},
-                                error_code="new_input_before_execution",
-                                public_message="新要求已到达，此调用未执行，请按新要求继续。",
-                                retryable=True,
-                                mutation_committed=False,
-                            )
                     binding_started = True
                     if self.counts_toward_limit(name, runtime):
                         self.failed_tool_calls += 1
@@ -442,7 +407,7 @@ class MainAgentBackend(AgentToolBackend):
 
                 outcome = await self._service.run_effect(
                     None if name == "send_message" else execution_runtime.turn_snapshot,
-                    invoke_binding,
+                    lambda: invoke_effect(invoke_binding),
                 )
             except (asyncio.CancelledError, WorkBudgetExceeded):
                 raise
@@ -549,11 +514,6 @@ class MainAgentBackend(AgentToolBackend):
                 else None,
             ).render(outcome)
             result = budgeted.text
-            self._service._tool_metrics.record_invocation(
-                descriptor.provider_id,
-                descriptor.provider_tool_name or descriptor.model_name,
-                outcome.ok,
-            )
             if self._service._tool_invocations is not None:
                 await self._service._record_tool_invocation(
                     runtime=execution_runtime,
