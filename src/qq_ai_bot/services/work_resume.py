@@ -420,7 +420,8 @@ class WorkResumer:
                         inbound=inbound,
                         gateway=None,
                         allow_generic_onebot=False,
-                        actor_is_superuser=bool(source.get("actor_is_superuser")),
+                        actor_is_superuser=recovered.actor_user_id
+                        in self.services.settings.superusers,
                         conversation_key=key,
                         trigger_message_id=original.platform_message_id,
                         execution_id=item["id"],

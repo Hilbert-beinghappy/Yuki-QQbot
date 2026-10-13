@@ -116,7 +116,6 @@ class AdminModule:
         )
         groups = GroupAdminService(
             groups=self._groups,
-            runtime_config=self._runtime_config,
             audit=audit,
         )
         private_access = PrivateAccessAdminService(

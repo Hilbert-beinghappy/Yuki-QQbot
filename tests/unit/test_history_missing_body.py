@@ -7,7 +7,7 @@ from datetime import UTC, datetime, timedelta
 from uuid import uuid4
 
 import pytest
-from sqlalchemy import delete, event, insert, select, update
+from sqlalchemy import delete, event, insert, select, text, update
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 from tests.unit.test_canonical_ingress import _Bot, _message, _stack
 
@@ -537,3 +537,41 @@ async def test_publication_still_rejects_change_after_missing_history_prepare(da
     with pytest.raises(ProjectionConflict):
         async with database.immediate_session() as writer:
             await publication(writer)
+
+
+async def test_projection_uses_privacy_from_its_source_snapshot(database, monkeypatch):
+    _ledger, context, _seed = await scene(database, 16)
+    version = context.read_version
+    repository = PromptProjectionRepository(database)
+    frozen = FrozenFragments.load([]).extend_history(
+        context.history_fragments, context.history_event_fragments
+    )
+    execute = AsyncSession.execute
+    changed = False
+
+    async def change_before_snapshot(session, statement, *args, **kwargs):
+        nonlocal changed
+        if str(statement) == "BEGIN" and not changed:
+            changed = True
+            async with database.immediate_session() as writer:
+                await writer.execute(
+                    text("INSERT INTO execution_trace_state(id,privacy_generation) VALUES(1,1)")
+                )
+        return await execute(session, statement, *args, **kwargs)
+
+    monkeypatch.setattr(AsyncSession, "execute", change_before_snapshot)
+    publication = await repository.prepare_commit(
+        view_key="a" * 64,
+        context_key="b" * 64,
+        conversation_id=version.conversation_id,
+        generation=version.generation,
+        expected_source_revision=version.prompt_source_revision,
+        starts_after_event_id=version.starts_after_event_id,
+        items=list(frozen.items),
+        rebuild_reason="bootstrap",
+    )
+    async with database.immediate_session() as writer:
+        published = await publication(writer)
+    assert changed
+    assert published.items() == list(frozen.items)
+    assert await repository.read("a" * 64) == published

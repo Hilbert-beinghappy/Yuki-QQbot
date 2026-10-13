@@ -22,9 +22,6 @@ def tool(name, args=None, identity=None):
     return ToolCall(identity or name, ToolFunction(name, json.dumps(args or {})))
 
 
-START = {"text": "先查原因，再修复。"}
-
-
 async def case(database, tmp_path, responses, *, reporting="interactive", send_status="succeeded"):
     env = await social_env(database, tmp_path)
     repository = WorkRepository(database)
