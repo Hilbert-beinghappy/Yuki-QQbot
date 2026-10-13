@@ -907,12 +907,14 @@ class AgentToolService:
                         if name in EXECUTION_TOOLS
                         else None,
                     )
-                    if result.get("error") == "sandbox_submission_unknown":
+                    if result.get("error"):
                         return self._result(
                             data=result,
-                            error="sandbox_submission_unknown",
-                            detail="沙箱提交结果未确认；核对原执行回执，不能重新提交。",
-                            uncertain=True,
+                            error=str(result["error"]),
+                            detail="沙箱提交结果未确认；核对原执行回执，不能重新提交。"
+                            if result.get("uncertain")
+                            else "沙箱操作未完成",
+                            uncertain=bool(result.get("uncertain")),
                         )
                     return self._result(data=result)
 
@@ -937,7 +939,13 @@ class AgentToolService:
                             runtime=runtime,
                             request_id=invocation.call_id if invocation is not None else None,
                         )
-                        return self._result(data=workspace_result)
+                        return self._result(
+                            data=workspace_result,
+                            error=str(workspace_result["error"])
+                            if workspace_result.get("error")
+                            else None,
+                            uncertain=bool(workspace_result.get("uncertain")),
+                        )
                     except (WorkspaceError, ValueError, OSError) as exc:
                         category = (
                             str(exc) if isinstance(exc, WorkspaceError) else type(exc).__name__
