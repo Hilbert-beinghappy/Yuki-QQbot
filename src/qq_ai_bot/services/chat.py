@@ -1037,8 +1037,6 @@ class ChatService:
                     if callable(getattr(sender, "call_api", None))
                     else None
                 )
-                if self._memory_context is not None and memory_session is not None:
-                    self._memory_context.metrics.record_runtime_access(memory_session.contract)
                 runtime = ToolRuntime(
                     inbound=inbound,
                     gateway=gateway,

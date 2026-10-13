@@ -20,7 +20,6 @@ from qq_ai_bot.conversation.canonical_db_models import CanonicalConversationMode
 from qq_ai_bot.identity.db_models import SpaceBindingModel
 from qq_ai_bot.llm.fake import FakeLLMProvider
 from qq_ai_bot.memory.enums import MemoryKind, MemoryScopeType, MemoryStatus, SelfMemoryVisibility
-from qq_ai_bot.memory.metrics import MemoryLifecycleMetrics
 from qq_ai_bot.memory.models import MemoryFactCreate
 from qq_ai_bot.memory.mutation.models import (
     MemoryDecisionActorType,
@@ -389,7 +388,6 @@ async def test_initiative_claim_keeps_original_paid_window_after_unrelated_wal_c
         facts=facts,
         mutations=mutations,
         models=InjectedModelExecutor(provider),
-        metrics=MemoryLifecycleMetrics(),
     )
     checkpoint = fingerprint = None
     if run_state == "retry":
@@ -854,7 +852,6 @@ async def test_silent_receipt_windows_keep_large_source_complete_and_remaining_s
         facts=facts,
         mutations=mutations,
         models=InjectedModelExecutor(provider),
-        metrics=MemoryLifecycleMetrics(),
     )
     (first,) = await claim(database, "large-first", max_characters=4000)
     assert first.first_receipt_id == first.last_receipt_id
@@ -902,7 +899,6 @@ async def test_silent_original_receipt_window_retries_without_reselecting_new_bu
         facts=facts,
         mutations=mutations,
         models=InjectedModelExecutor(provider),
-        metrics=MemoryLifecycleMetrics(),
     )
     assert await reflection.reflect(retried) == (0, 0)
     payload = json.loads(provider.requests[0].messages[-1].content)
@@ -1050,7 +1046,6 @@ async def test_silent_service_episode_keeps_checkpoint_without_second_model_requ
         facts=facts,
         mutations=mutations,
         models=InjectedModelExecutor(provider),
-        metrics=MemoryLifecycleMetrics(),
     )
     projected, _, _, event_map, _ = await reflection._input(batch)
     assert projected.source_kind == "initiative_tools" and not projected.events and not event_map
@@ -1338,7 +1333,6 @@ async def test_reflection_model_reuses_restore_and_metadata_domain_operations(da
         facts=facts,
         mutations=mutations,
         models=InjectedModelExecutor(provider),
-        metrics=MemoryLifecycleMetrics(),
     )
     assert await reflection.reflect(batch) == (1, 1)
     assert await reflection.reflect(batch) == (1, 1)
@@ -1473,7 +1467,6 @@ async def test_incoming_reflection_keeps_complete_source_without_own_reply(datab
         facts=facts,
         mutations=mutations,
         models=InjectedModelExecutor(provider),
-        metrics=MemoryLifecycleMetrics(),
     )
     assert await reflection.reflect(batch) == (0, 0)
     payload = json.loads(provider.requests[0].messages[-1].content)

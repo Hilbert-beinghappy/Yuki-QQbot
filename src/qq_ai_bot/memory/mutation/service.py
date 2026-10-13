@@ -2281,7 +2281,6 @@ class MemoryMutationService:
             and (category is None or fact.category == category)
         )
         if len(exact) == 1:
-            self._facts.metrics.increment("memory_mutation_locator_unique_count")
             return exact[0]
         candidates = tuple(
             MemoryMutationCandidate(
@@ -2296,12 +2295,10 @@ class MemoryMutationService:
             for fact in rows[:3]
         )
         if candidates:
-            self._facts.metrics.increment("memory_mutation_locator_ambiguous_count")
             raise MemoryMutationRejected(
                 "memory_candidate_ambiguous",
                 candidates=candidates,
             )
-        self._facts.metrics.increment("memory_mutation_locator_not_found_count")
         raise MemoryMutationRejected("memory_candidate_not_found")
 
     @staticmethod
@@ -2385,7 +2382,6 @@ class MemoryMutationService:
 
         if target.scope_type is MemoryScopeType.SELF or request.visibility is None:
             return request
-        self._facts.metrics.increment("memory_mutation_non_self_visibility_ignored_count")
         return request.model_copy(update={"visibility": None})
 
     @staticmethod

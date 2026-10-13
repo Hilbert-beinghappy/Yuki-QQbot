@@ -2381,7 +2381,6 @@ class AgentToolService:
             outcome,
             result_count,
         )
-        self._memory_context.metrics.record_read_outcome(outcome)
 
     async def _call_onebot(
         self, arguments: dict[str, Any], runtime: ToolRuntime
