@@ -4,10 +4,8 @@ from qq_ai_bot.capabilities.binding import InProcessToolBinding, ToolBinding
 from qq_ai_bot.capabilities.catalog import (
     ToolProvider,
     ToolProviderRegistry,
-    ToolScopeSummary,
     UnifiedToolCatalog,
     UnifiedToolCatalogEntry,
-    estimate_chat_tool_tokens,
     safe_model_tool_name,
 )
 from qq_ai_bot.capabilities.coordinator import (
@@ -60,10 +58,8 @@ __all__ = [
     "ToolProvider",
     "ToolProviderRegistry",
     "ToolResultBudgeter",
-    "ToolScopeSummary",
     "UnifiedToolCatalog",
     "UnifiedToolCatalogEntry",
-    "estimate_chat_tool_tokens",
     "resolve_mutation_commit",
     "safe_model_tool_name",
 ]

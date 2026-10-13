@@ -70,17 +70,7 @@ def _descriptor(
 
 
 def _entry(descriptor: CapabilityDescriptor) -> UnifiedToolCatalogEntry:
-    return UnifiedToolCatalogEntry(
-        descriptor=descriptor,
-        provider_id="core",
-        scope_ids=descriptor.scope_ids,
-        compact_description=descriptor.description or descriptor.model_name,
-        tags=descriptor.tags,
-        searchable_text=descriptor.model_name,
-        estimated_schema_tokens=12,
-        available=True,
-        revision=descriptor.schema_version,
-    )
+    return UnifiedToolCatalogEntry(descriptor=descriptor)
 
 
 def test_schema_validation_rejects_invalid_arguments() -> None:
@@ -410,8 +400,6 @@ def test_destructive_uses_actual_permissions() -> None:
 def test_catalog_entry_round_trip_for_security_fixtures() -> None:
     catalog = UnifiedToolCatalog(
         entries=(_entry(_descriptor("web_search", namespace="web.search")),),
-        scopes=(),
-        revision="rev",
     )
     assert catalog.by_model_name("web_search") is not None
     assert catalog.by_model_name("missing") is None
@@ -422,7 +410,7 @@ def _runtime(
     append_only: bool = True,
     memory_view: MemoryCapabilityView | None = None,
 ) -> TurnCapabilityRuntime:
-    catalog = UnifiedToolCatalog(entries=entries, scopes=(), revision="abcd1234")
+    catalog = UnifiedToolCatalog(entries=entries)
     snapshot = DescriptorRegistrySnapshot(catalog)
     return TurnCapabilityRuntime(
         registry=snapshot,
