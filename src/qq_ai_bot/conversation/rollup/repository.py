@@ -903,16 +903,15 @@ class ConversationRollupRepository:
         self, operation: Callable[[AsyncSession], Awaitable[RollupCommitResult]]
     ) -> RollupCommitResult:
         """Reprepare only a rolled-back DB plan, retaining the original paid output."""
-        for attempt in range(3):
+        while True:
             try:
                 async with self._database.sessions() as session, session.begin():
                     # Legacy sqlite3 SELECT does not begin a read transaction.
                     await session.execute(text("BEGIN"))
                     return await operation(session)
             except OperationalError as exc:
-                if getattr(exc.orig, "sqlite_errorcode", None) != 517 or attempt == 2:
+                if getattr(exc.orig, "sqlite_errorcode", None) != 517:
                     raise
-        raise AssertionError("unreachable rollup snapshot retry")
 
     async def retry_infrastructure(
         self,
