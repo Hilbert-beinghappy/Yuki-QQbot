@@ -369,7 +369,7 @@ async def test_current_deployment_three_entries_share_full_contract_and_fresh_ma
             assert sessions == [f"yuki:{scope.id}:g{scope.generation}:main"] * 3
             assert wire[0]["generationConfig"] == {
                 "maxOutputTokens": 4096,
-                "thinkingConfig": {"thinkingLevel": "low"},
+                "thinkingConfig": {"thinkingLevel": "medium"},
             }
             full = {tool.name: tool for tool in await app.main_agent_contract.definitions()}
             assert SANDBOX_TOOLS | WORKSPACE_TOOLS <= full.keys()
