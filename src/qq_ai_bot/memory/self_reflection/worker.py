@@ -122,12 +122,9 @@ class SelfReflectionWorker:
                 break
             batches = await self._repository.claim_due(
                 scheduled_slot=f"{local.date().isoformat()}:{cycle['id'][3:15]}:{attempted}",
-                local_date=local.date().isoformat(),
                 event_threshold=self._settings.memory_self_reflection_event_threshold,
                 character_threshold=self._settings.memory_self_reflection_character_threshold,
                 max_wait_seconds=self._settings.memory_self_reflection_max_wait_seconds,
-                max_sessions=1,
-                max_daily_calls=self._settings.memory_self_reflection_max_daily_calls,
                 max_events=self._settings.memory_self_reflection_max_events,
                 max_characters=self._settings.memory_self_reflection_max_characters,
                 force=cycle["trigger"] == "manual",

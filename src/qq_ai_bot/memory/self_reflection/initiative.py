@@ -61,7 +61,6 @@ async def claim_initiative(
     database: Database,
     *,
     max_characters: int,
-    excluded_conversation_keys: frozenset[str],
     cycle_id: str | None,
 ) -> tuple[SelfReflectionBatch, ...]:
     now = datetime.now(UTC)
@@ -141,8 +140,6 @@ async def claim_initiative(
             except MemoryPartitionResolutionError:
                 continue
             partition_hash = hashlib.sha256(source.partition.encode()).hexdigest()
-            if partition_hash in excluded_conversation_keys:
-                continue
             cursor = cursors.get(initiative.id)
             last = cursor.last_receipt_id if cursor else 0
             window = windows.get(initiative.id)
