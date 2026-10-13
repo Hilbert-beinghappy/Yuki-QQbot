@@ -9,6 +9,7 @@ import pytest
 from sqlalchemy import select
 from tests.conftest import build_harness, make_settings
 from tests.support.background_authority import approve_background_plugin
+from tests.support.fixed_contract_fixture import bind_main_contract
 from tests.support.social_identity_cases import social_env
 
 from qq_ai_bot.capabilities.results import ToolExecutionResult, ToolResultBudgeter
@@ -82,6 +83,7 @@ async def test_plugin_wakeup_send_receipt_only_requires_actor_for_actual_archive
         provider,
     )
     chat = harness.processor._chat
+    bind_main_contract(harness, tmp_path)
     chat._tools.social_service = env.service
     store = ToolArtifactRepository(database, tmp_path / "tool-artifacts", retention_seconds=60)
     chat._tool_artifacts = store

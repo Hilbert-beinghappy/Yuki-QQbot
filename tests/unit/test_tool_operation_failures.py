@@ -14,7 +14,7 @@ from qq_ai_bot.domain.conversations import ScopeType
 from qq_ai_bot.domain.messages import InboundMessage, SenderIdentity
 from qq_ai_bot.memory.repository import MemoryFactRepository
 from qq_ai_bot.memory.service import MemoryFactService
-from qq_ai_bot.persistence.repositories import AgentActionRepository, EventLedgerRepository
+from qq_ai_bot.persistence.repositories import EventLedgerRepository
 from qq_ai_bot.sandbox.client import SandboxClient
 from qq_ai_bot.services.agent_tools import AgentToolService, ToolRuntime
 
@@ -36,7 +36,6 @@ async def test_tool_operation_receipt(database, tool, payload, committed):
         settings=make_settings(database.url),
         ledger=EventLedgerRepository(database),
         memories=MemoryFactService(MemoryFactRepository(database)),
-        actions=AgentActionRepository(database),
     )
     backend = SimpleNamespace(execute=AsyncMock(return_value=payload))
     tools.workspace_service = backend

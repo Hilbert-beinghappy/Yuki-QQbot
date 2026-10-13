@@ -1387,21 +1387,6 @@ class MemoryEmbeddingJobModel(Base):
     error_category: Mapped[str | None] = mapped_column(String(64), nullable=True)
 
 
-class AgentActionModel(Base):
-    """A bounded audit entry for a model-issued OneBot action."""
-
-    __tablename__ = "agent_actions"
-    __table_args__ = (Index("ix_agent_actions_actor_created", "actor_user_id", "created_at"),)
-
-    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
-    actor_user_id: Mapped[str | None] = mapped_column(String(64), nullable=True)
-    action: Mapped[str] = mapped_column(String(128), nullable=False)
-    success: Mapped[bool] = mapped_column(Boolean, nullable=False)
-    duration_seconds: Mapped[float] = mapped_column(Float, nullable=False)
-    error_category: Mapped[str | None] = mapped_column(String(64), nullable=True)
-    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
-
-
 class RuntimeConfigOverrideModel(Base):
     """One validated runtime configuration override at an exact scope."""
 

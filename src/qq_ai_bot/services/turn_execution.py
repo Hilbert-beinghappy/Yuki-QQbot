@@ -82,7 +82,7 @@ class TurnState:
 
     transcript: TurnTranscript
     evidence_observation: EvidenceObservation
-    fixed_definitions: tuple[ChatTool, ...] | None = None
+    fixed_definitions: tuple[ChatTool, ...] = ()
     staged_evidence_results: int = 0
     calls_used: int = 0
     native_events: list[NativeToolEvent] = field(default_factory=list)
@@ -527,14 +527,9 @@ class TurnExecution:
 
     async def request(self, request_index: int) -> ChatResponse | End | LoopSignal:
 
-        if self.state.fixed_definitions is not None:
-            if self.tools is not None:
-                self.tools.refresh_catalog(self.runtime)
-            self.state.definitions = self.state.fixed_definitions
-        else:
-            self.state.definitions = (
-                self.tools.definitions(self.runtime) if self.tools is not None else ()
-            )
+        if self.tools is not None:
+            self.tools.refresh_catalog(self.runtime)
+        self.state.definitions = self.state.fixed_definitions
         web_config = self.runtime.runtime_config.web
         try:
             web_mode = WebMode(web_config.mode)

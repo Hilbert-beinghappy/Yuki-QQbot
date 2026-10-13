@@ -80,7 +80,7 @@ class MemoryFactService:
             await self._embedding_scheduler.schedule(
                 fact_id,
             )
-        except (OSError, RuntimeError, ValueError) as exc:
+        except Exception as exc:
             logger.warning(
                 "memory_embedding_schedule_failed fact_id=%d error_category=%s",
                 fact_id,
@@ -241,7 +241,7 @@ class MemoryFactService:
                     session=owned,
                 )
             )
-            if result is not None and result.status is MemoryStatus.ACTIVE and plan.create_new_fact:
+            if result is not None and plan.create_new_fact:
                 await self.schedule_embedding(result.id)
             return result
         await self.prepare_evidence_write(
@@ -756,7 +756,7 @@ class MemoryFactService:
                     session=owned,
                 )
             )
-            if result is not None and result.status is MemoryStatus.ACTIVE:
+            if result is not None:
                 await self.schedule_embedding(result.id)
             return result
         await self.prepare_evidence_write((fact_id,), session=session, targets=(replacement,))

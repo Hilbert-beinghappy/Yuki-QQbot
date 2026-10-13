@@ -112,7 +112,9 @@ GC 有界标记未引用对象 deleting，再在 SQLite writer 外删除文件�
 `SUBAGENTS_ENABLED` 默认关闭，只控制新任务接纳；关闭后已存在的任务仍收拢运行。
 `AGENT_MAX_MODEL_REQUESTS=24`、`AGENT_MAX_TOOL_CALLS=32` 更新旧环境里的显式配置。
 主、子任务窗口由所选模型 Profile 的容量合同统一提供，不保留子任务独有的默认窗口。
-`SUBAGENT_CONCURRENCY` 配置后台激活并发，模型池仍保留前台名额；关闭调度器取消并等待
+`SUBAGENT_CONCURRENCY` 由调度器控制后台激活并发，收尾 reconcile 租约不占执行名额。
+同一 SQLite 数据库只允许一个活动 Application；仓储仍核验每个工作者的原执行租约和 generation。
+模型池仍保留前台名额；关闭调度器取消并等待
 所有活跃 worker 收拢，错误由各次激活返回，不存放在共享执行器的当前状态。
 
 定向协议测试直接比较 Chat Completions、DeepSeek Responses 和 OpenAI Responses 的
