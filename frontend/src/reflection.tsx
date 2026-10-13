@@ -23,7 +23,6 @@ const columns: Record<string, Column[]> = {
     ["latest_event_id", "最新事件"],
     ["pending_events", "待处理事件"],
     ["pending_since", "最早等待", stamp],
-    ["last_policy_reason", "策略原因"],
   ],
   runs: [
     ["id", "批次"],
