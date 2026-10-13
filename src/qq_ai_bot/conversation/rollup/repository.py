@@ -1473,10 +1473,8 @@ class ConversationRollupRepository:
                 )
             ).all()
         )
-        events = await _with_proactive_cause_metadata(
-            session,
-            tuple(_event_record(row) for row in rows),
-        )
+        raw_events = tuple(_event_record(row) for row in rows)
+        events = await _with_proactive_cause_metadata(session, raw_events)
         fingerprint = source_fingerprint(
             conversation_id=candidate.conversation_id,
             generation=candidate.generation,
@@ -1494,7 +1492,7 @@ class ConversationRollupRepository:
         remaining_count = conversation.uncovered_event_count - len(events)
         remaining_characters = (
             conversation.uncovered_character_count
-            - durable_uncovered_characters(events, **_prompt_kwargs(self.config))
+            - durable_uncovered_characters(raw_events, **_prompt_kwargs(self.config))
         )
         if min(remaining_count, remaining_characters) < 0:
             raise ConversationCoverageError("rollup uncovered counters changed or drifted")
