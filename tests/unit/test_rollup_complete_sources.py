@@ -89,7 +89,7 @@ class RecordingModel:
 def candidate() -> RollupCandidate:
     events = (replace(event(), content="new-source " * 100 + "LAST_CONSTRAINT", segments=()),)
     return RollupCandidate(
-        "11111111-1111-4111-8111-111111111111", 1, 0, 0, "", events, 1, 100, "source-fingerprint"
+        "11111111-1111-4111-8111-111111111111", 1, 0, 0, "", events, "source-fingerprint"
     )
 
 
