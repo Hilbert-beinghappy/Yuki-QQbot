@@ -9,6 +9,7 @@ from types import SimpleNamespace
 
 import pytest
 from sqlalchemy import func, select, update
+from sqlalchemy.exc import OperationalError
 from tests.conftest import make_settings
 from tests.support.correctness_wire import wire
 from tests.support.model_executor import InjectedModelExecutor
@@ -1192,3 +1193,38 @@ async def test_dream_recompose_consumes_actual_outputs_and_normalizes_model_meta
     assert len(provider.requests) == 1
     async with database.sessions() as session:
         assert await session.scalar(select(func.count(MemoryMutationReceiptModel.id))) == 2
+
+
+@pytest.mark.parametrize("cancelled", [False, True])
+async def test_dream_loop_database_failure_and_cancellation(database, monkeypatch, cancelled):
+    from unittest.mock import AsyncMock
+
+    worker = DreamWorker(
+        settings=make_settings(database.url, memory_dream_poll_seconds=0.001),
+        repository=SimpleNamespace(),
+        service=SimpleNamespace(),
+    )
+    attempts = 0
+
+    async def schedule():
+        nonlocal attempts
+        attempts += 1
+        if attempts == 1:
+            if cancelled:
+                raise asyncio.CancelledError
+            raise OperationalError("schedule", {}, RuntimeError("database unavailable"))
+        worker._stop.set()
+        worker._wake.set()
+
+    drain = AsyncMock()
+    monkeypatch.setattr(worker, "_schedule_if_due", schedule)
+    monkeypatch.setattr(worker, "_drain_active", drain)
+    worker._wake.set()
+    if cancelled:
+        with pytest.raises(asyncio.CancelledError):
+            await worker._run()
+        drain.assert_not_awaited()
+    else:
+        await asyncio.wait_for(worker._run(), timeout=2)
+        assert attempts == 2
+        drain.assert_awaited_once()

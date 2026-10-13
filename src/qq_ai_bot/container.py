@@ -14,7 +14,6 @@ from sqlalchemy.exc import SQLAlchemyError
 
 from qq_ai_bot import __version__
 from qq_ai_bot.adapters.onebot.group_recovery import QQGroupRecovery
-from qq_ai_bot.admin.action_service import ActionRegistry
 from qq_ai_bot.admin.config_service import RuntimeConfigService
 from qq_ai_bot.admin.models import RuntimeConfigSnapshot
 from qq_ai_bot.admin.permission_catalog import PermissionCatalogService
@@ -125,11 +124,9 @@ class ApplicationContainer:
             max_media_bytes=settings.vision_max_prepared_bytes,
             max_media_frames=settings.vision_max_frames_per_turn,
         )
-        self.admin_action_registry = ActionRegistry()
         self.permission_catalog = PermissionCatalogService(
             settings=settings,
             config_registry=self.runtime_config.registry,
-            action_registry=self.admin_action_registry,
         )
         self.conversation_scopes = persistence.conversation_scopes
         self.conversation_rollups = persistence.conversation_rollups
@@ -402,8 +399,6 @@ class ApplicationContainer:
             settings=settings,
             database=self.database,
             runtime_config=self.runtime_config,
-            action_registry=self.admin_action_registry,
-            permission_catalog=self.permission_catalog,
             memories=self.memories,
             memory_context=self.memory_context,
             memory_index=self.memory_index,
@@ -417,7 +412,6 @@ class ApplicationContainer:
             emoji_storage=self.emoji_storage,
             emoji_collector=self.emoji_collector,
             emoji_worker=self.emoji_worker,
-            memory_rebuild=self.memory_rebuild_service,
             memory_mutations=self.memory_mutations,
             ledger=self.ledger,
             memory_self_reflection=self.memory_self_reflection_worker,
@@ -431,9 +425,6 @@ class ApplicationContainer:
         self.private_access_admin = admin.private_access
         self.config_admin = admin.config
         self.emoji_admin = admin.emoji
-        self.admin_actions = admin.actions
-        self.admin_capabilities = admin.capabilities
-        self.chat.set_admin_tools(self.admin_capabilities)
         self.automation_module = AutomationModule(
             settings=settings,
             database=self.database,
@@ -580,7 +571,6 @@ class ApplicationContainer:
             plugin_commands=self.plugin_commands,
             emoji_admin=self.emoji_admin,
             model_invocations=self.model_invocations,
-            memory_rebuild=self.memory_rebuild_service,
         )
         self.canonical_ingress = CanonicalIngressResolver(
             self.database,
@@ -784,20 +774,13 @@ class ApplicationContainer:
         self.plugin_notification_outbox.wake()
         self.plugin_background_turns.wake()
 
-    def _plugin_invocation_scope(
-        self,
-        plugin_id: str,
-        runtime: ToolRuntimeProjection,
-        *,
-        web_was_used: bool,
-    ) -> object:
+    def _plugin_invocation_scope(self, plugin_id: str, runtime: ToolRuntimeProjection) -> object:
         context = self._plugin_contexts.get(plugin_id)
         if context is None:
             raise RuntimeError("plugin is not running")
         return context.invocation_scope(
             plugin_id,
             runtime,
-            web_was_used=web_was_used,
         )
 
     def _plugin_signal_scope(

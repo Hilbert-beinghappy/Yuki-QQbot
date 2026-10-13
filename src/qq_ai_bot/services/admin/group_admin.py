@@ -46,37 +46,6 @@ class GroupAdminService:
     ) -> GroupSetting:
         return await self._set_enabled(context, False, audit=audit)
 
-    async def set_autonomous_enabled(
-        self,
-        context: SpaceAdminContext,
-        enabled: bool,
-        *,
-        audit: ControlAuditRef,
-    ) -> GroupSetting:
-        require_capability(context, "control.group.mutate")
-        group_id = _space_storage_id(context)
-        started = time.perf_counter()
-        async with self._audit.transaction() as session:
-            before = await self._groups.get(group_id, session=session)
-            after = await self._groups.set_autonomous_enabled(
-                group_id,
-                enabled,
-                session=session,
-            )
-            await self._audit.record(
-                actor=audit,
-                capability="group",
-                operation="set_autonomous_enabled",
-                target_type="group",
-                target_id=group_id,
-                before={"autonomous_enabled": before.autonomous_enabled if before else None},
-                after={"autonomous_enabled": enabled},
-                success=True,
-                duration_seconds=time.perf_counter() - started,
-                session=session,
-            )
-        return after
-
     async def set_group_config(
         self,
         context: SpaceAdminContext,

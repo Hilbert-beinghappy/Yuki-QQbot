@@ -35,6 +35,7 @@ Worker、Main Agent、自省和 Dream 的新事实复用 [变更合同](memory-c
 事实正文使用真实身份或名片。历史引用继续匹配原实际来源，不用当前展示名改写旧 quote。
 同 owner/key 可以创建独立 active 事实；纠正和撤回按实际 fact ID 执行。0102 只删除四个单 active
 唯一索引，保留已部署 0101 的全部事实与历史回执。
+自动提取与 Rebuild 只生成新事实，不声明确认、纠正或撤回操作；这些操作仍由实际 fact ID 的变更入口执行。
 
 提取、自省和 Dream 分别绑定 `memory_extraction`、`memory_self_reflection`、`memory_dream`
 任务，可各自选择 Profile，也可共享配置；Rebuild 复用提取，Embedding 独立配置。结构化

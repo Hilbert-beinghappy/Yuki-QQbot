@@ -1569,3 +1569,79 @@ async def test_reflection_only_live_source_ranges_block_claim_and_cursor(databas
             assert state.last_event_id == initial.id
         else:
             assert state.last_event_id == current.id and state.pending_events == 0
+
+
+async def test_isolated_receipt_windows_do_not_starve_later_initiatives(database):
+    from sqlalchemy import insert
+
+    from qq_ai_bot.memory.self_reflection.db_models import InitiativeReflectionWindowModel
+
+    _, _, initial, old_id = await seed(database)
+    await record(database, initial, old_id)
+    await finish(database, old_id)
+    (original,) = await claim(database)
+    async with database.immediate_session() as writer:
+        await writer.execute(
+            update(MemorySelfReflectionRunModel)
+            .where(MemorySelfReflectionRunModel.id == original.run_id)
+            .values(status="failed", retry_state="isolated")
+        )
+        templates = {
+            model: dict((await writer.execute(select(model.__table__))).mappings().one())
+            for model in (InitiativeRunModel, MemoryToolReceiptModel, MemorySelfReflectionRunModel)
+        }
+        for index in range(100):
+            run_id = str(uuid4())
+            await writer.execute(
+                insert(InitiativeRunModel).values(
+                    **{**templates[InitiativeRunModel], "id": run_id, "proposal_id": run_id}
+                )
+            )
+            receipt = {
+                key: value
+                for key, value in templates[MemoryToolReceiptModel].items()
+                if key != "id"
+            }
+            receipt.update(
+                initiative_run_id=run_id,
+                execution_id=run_id,
+                source_call_key=f"isolated-{index}",
+                tool_call_id=f"call-{index}",
+            )
+            receipt_id = await writer.scalar(
+                insert(MemoryToolReceiptModel)
+                .values(**receipt)
+                .returning(MemoryToolReceiptModel.id)
+            )
+            if index < 99:
+                reflection = {
+                    key: value
+                    for key, value in templates[MemorySelfReflectionRunModel].items()
+                    if key != "id"
+                }
+                reflection["scheduled_slot"] = f"isolated-{index}"
+                reflection_id = await writer.scalar(
+                    insert(MemorySelfReflectionRunModel)
+                    .values(**reflection)
+                    .returning(MemorySelfReflectionRunModel.id)
+                )
+                writer.add(
+                    InitiativeReflectionWindowModel(
+                        reflection_run_id=reflection_id,
+                        initiative_run_id=run_id,
+                        first_receipt_id=receipt_id,
+                        last_receipt_id=receipt_id,
+                    )
+                )
+            else:
+                new_id = run_id
+    (selected,) = await claim(database, "next-eligible")
+    assert selected.initiative_run_id == new_id
+    async with database.sessions() as reader:
+        isolated = await reader.scalar(
+            select(func.count())
+            .select_from(MemorySelfReflectionRunModel)
+            .where(MemorySelfReflectionRunModel.retry_state == "isolated")
+        )
+        assert isolated == 100
+        assert await reader.get(InitiativeReflectionCursorModel, old_id) is None

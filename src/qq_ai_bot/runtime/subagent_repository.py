@@ -166,7 +166,12 @@ class SubagentRepository:
                 await session.scalars(
                     select(children.c.work_id)
                     .join(work, work.c.id == children.c.work_id)
+                    .join(
+                        CanonicalConversationModel,
+                        CanonicalConversationModel.id == work.c.conversation_id,
+                    )
                     .where(
+                        work.c.generation == CanonicalConversationModel.generation,
                         work.c.state.in_(
                             ("completed", "failed", "cancelled", "suspended", "waiting_user")
                         ),
@@ -565,21 +570,11 @@ class SubagentRepository:
                 "state": row["state"],
                 "text": str(result or ""),
             }
-            saved = await session.scalar(
-                select(journal.c.payload_json).where(journal.c.work_id == lease.work_id)
-            )
-            private_receipt = {
-                **receipt,
-                "cache_samples": json.loads(saved or "{}")
-                .get("metadata", {})
-                .get("progress", {})
-                .get("cache_samples", []),
-            }
             await session.execute(
                 update(children)
                 .where(children.c.work_id == lease.work_id)
                 .values(
-                    result_json=encode_json(private_receipt),
+                    result_json=encode_json(receipt),
                     notified_revision=row["revision"],
                 )
             )
