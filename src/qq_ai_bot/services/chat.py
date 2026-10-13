@@ -754,7 +754,6 @@ class ChatService:
         content: str,
         sender: OutboundSender,
         *,
-        autonomous: bool = False,
         runtime_snapshot: RuntimeConfigSnapshot | None = None,
         visual_input_present: bool = False,
         native_images: tuple[ChatImage, ...] = (),
@@ -771,7 +770,6 @@ class ChatService:
             from qq_ai_bot.services.turn_coordinator import HistorySourceChangedError
 
             arguments: dict[str, Any] = dict(
-                autonomous=autonomous,
                 runtime_snapshot=runtime_snapshot,
                 visual_input_present=visual_input_present,
                 native_images=native_images,
@@ -852,7 +850,6 @@ class ChatService:
         content: str,
         sender: OutboundSender,
         *,
-        autonomous: bool = False,
         runtime_snapshot: RuntimeConfigSnapshot | None = None,
         visual_input_present: bool = False,
         native_images: tuple[ChatImage, ...] = (),
@@ -865,7 +862,7 @@ class ChatService:
         with self.runtime.executions.track():
             if turn_snapshot is not None:
                 inbound = replace(inbound, source_event_id=turn_snapshot.trigger_event_id)
-            turn_origin = TurnOrigin.AUTONOMOUS_GROUP if autonomous else TurnOrigin.USER_MESSAGE
+            turn_origin = TurnOrigin.USER_MESSAGE
             conversation_key = runtime_conversation_key(
                 identity=identity,
                 turn=turn_snapshot,
@@ -1001,7 +998,7 @@ class ChatService:
                 preparation.advance("memory_and_repair")
                 memory_session = self.open_memory_session(
                     inbound,
-                    autonomous=autonomous,
+                    autonomous=False,
                 )
                 if memory_session is not None:
                     memory_cleanup.push_async_callback(memory_session.close)
