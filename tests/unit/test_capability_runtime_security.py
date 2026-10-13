@@ -327,7 +327,7 @@ async def test_admin_failure_can_continue_correct_and_reuse_original_effect(
             owner = WorkSession(control, contract)
             control.session = owner
             await owner.restore(TurnTranscript((ChatMessage("user", "retained work"),)))
-            declared = backend.definitions(context, web_was_used=False)
+            declared = backend.definitions(context)
             for name, arguments in (
                 ("get_my_capabilities", {}),
                 (
@@ -359,9 +359,9 @@ async def test_admin_failure_can_continue_correct_and_reuse_original_effect(
                     reports.append(result)
                 else:
                     writes.append(result)
-            assert backend.definitions(context, web_was_used=False) == declared
+            assert backend.definitions(context) == declared
             await control.complete_final("directory read", "directory-final")
-            return AgentRunResult("", 0, 0, False, suppress_delivery=True)
+            return AgentRunResult("", 0, 0, suppress_delivery=True)
 
         resumer = make_work_resumer(
             repository,
@@ -451,7 +451,7 @@ async def test_admin_failure_can_continue_correct_and_reuse_original_effect(
         max_model_requests=1,
         work_control=work.control,
     )
-    declared = backend.definitions(context, web_was_used=False)
+    declared = backend.definitions(context)
     calls = []
 
     async def execute(name, arguments):
@@ -466,11 +466,11 @@ async def test_admin_failure_can_continue_correct_and_reuse_original_effect(
 
     _, unavailable = await execute("admin_memory_rebuild_start", {"run_id": "unconfigured"})
     assert json.loads(unavailable)["error_code"] == "RuntimeError"
-    assert backend.definitions(context, web_was_used=False) == declared
+    assert backend.definitions(context) == declared
     values = {"key": "agent.max_tool_calls", "scope_type": "global", "scope_id": ""}
     _, failed = await execute("admin_set_config", {**values, "value": "not-an-integer"})
     assert json.loads(failed)["error_code"] == "validation_error"
-    assert backend.definitions(context, web_was_used=False) == declared
+    assert backend.definitions(context) == declared
     _, read = await execute(
         "admin_get_config", {"keys": [values["key"]], "scope_type": "global", "scope_id": ""}
     )

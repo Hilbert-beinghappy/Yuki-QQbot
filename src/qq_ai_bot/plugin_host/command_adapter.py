@@ -218,7 +218,7 @@ class PluginCommandAdapter:
         if self._invocation_scope is None:
             yield
             return
-        scope = self._invocation_scope(plugin_id, runtime, web_was_used=False)
+        scope = self._invocation_scope(plugin_id, runtime)
         enter = getattr(scope, "__aenter__", None)
         leave = getattr(scope, "__aexit__", None)
         if not callable(enter) or not callable(leave):

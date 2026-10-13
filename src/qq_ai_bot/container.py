@@ -784,20 +784,13 @@ class ApplicationContainer:
         self.plugin_notification_outbox.wake()
         self.plugin_background_turns.wake()
 
-    def _plugin_invocation_scope(
-        self,
-        plugin_id: str,
-        runtime: ToolRuntimeProjection,
-        *,
-        web_was_used: bool,
-    ) -> object:
+    def _plugin_invocation_scope(self, plugin_id: str, runtime: ToolRuntimeProjection) -> object:
         context = self._plugin_contexts.get(plugin_id)
         if context is None:
             raise RuntimeError("plugin is not running")
         return context.invocation_scope(
             plugin_id,
             runtime,
-            web_was_used=web_was_used,
         )
 
     def _plugin_signal_scope(

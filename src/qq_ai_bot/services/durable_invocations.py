@@ -176,7 +176,6 @@ class DurableInvocations:
                 text="",
                 tool_calls_used=0,
                 model_requests=0,
-                web_was_used=False,
                 suppress_delivery=True,
                 work_state="cancelled"
                 if previous["generation"] != generation
@@ -190,7 +189,6 @@ class DurableInvocations:
                     text="",
                     tool_calls_used=0,
                     model_requests=0,
-                    web_was_used=False,
                     work_id=previous["id"],
                     work_state="archived",
                     suppress_delivery=True,
@@ -200,7 +198,6 @@ class DurableInvocations:
                 suppress_delivery=False,
                 tool_calls_used=0,
                 model_requests=0,
-                web_was_used=False,
                 work_state="completed",
                 work_id=previous["id"],
             )
@@ -257,7 +254,6 @@ class DurableInvocations:
                 text="",
                 tool_calls_used=0,
                 model_requests=0,
-                web_was_used=False,
                 suppress_delivery=True,
                 work_state=previous["state"]
                 if previous["generation"] == requested.get("generation")
