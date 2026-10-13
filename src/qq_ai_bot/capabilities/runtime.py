@@ -26,7 +26,7 @@ from qq_ai_bot.runtime.contracts import MemoryCapabilityView
 
 
 class TurnCapabilityRuntime:
-    """Owns one turn's authorized catalog revision, exposure and callable set."""
+    """Owns one turn's authorized catalog, exposure and callable set."""
 
     def __init__(
         self,
@@ -48,10 +48,6 @@ class TurnCapabilityRuntime:
                 self._authorized,
                 requestable_ids=self._authorized.requestable_ids - self._quarantined,
             )
-
-    @property
-    def registry_revision(self) -> str:
-        return self._registry.revision
 
     @property
     def authorized_catalog(self) -> UnifiedToolCatalog:
@@ -120,11 +116,8 @@ class TurnCapabilityRuntime:
         visible_names = frozenset(item.model_name for item in visible) - self._quarantined
         catalog = UnifiedToolCatalog(
             entries=entries,
-            scopes=self._registry.catalog.scopes,
-            revision=self._registry.revision,
         )
         return AuthorizedCatalogSnapshot(
-            registry_revision=self._registry.revision,
             catalog=catalog,
             requestable_ids=visible_names,
         )
