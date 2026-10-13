@@ -354,7 +354,8 @@ export function SettingsPage({ allowed, act, refresh }: PageProps) {
                 : savedScope.space_id
                   ? "group"
                   : "global",
-              id = savedScope.person_id || savedScope.space_id || "";
+              id = savedScope.person_id || savedScope.space_id || "",
+              local = row.version != null && row.scope_type === kind;
             return (
               <>
                 <button
@@ -366,7 +367,7 @@ export function SettingsPage({ allowed, act, refresh }: PageProps) {
                     act({
                       method: "set_config",
                       label: `修改 ${row.key}`,
-                      revision: Number(row.version || 0),
+                      revision: local ? Number(row.version) : 0,
                       payload: {
                         key: row.key,
                         scope_type: kind,
@@ -396,13 +397,13 @@ export function SettingsPage({ allowed, act, refresh }: PageProps) {
                   disabled={
                     !allowed("unset_config") ||
                     row.apply_mode === "immutable" ||
-                    row.version === null
+                    !local
                   }
                   onClick={() =>
                     act({
                       method: "unset_config",
                       label: `删除 ${row.key} 的覆盖`,
-                      revision: Number(row.version || 0),
+                      revision: local ? Number(row.version) : 0,
                       payload: { key: row.key, scope_type: kind, scope_id: id },
                     })
                   }
