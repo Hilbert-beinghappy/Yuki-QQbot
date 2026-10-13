@@ -353,7 +353,6 @@ class ApplicationContainer:
             chat_admission_enabled=self.settings.runtime_work_enabled,
         )
         self.database.subagents_enabled = self.settings.subagents_enabled
-        self.database.subagent_concurrency = self.settings.subagent_concurrency
         children = SubagentRepository(works)
         self.subagent_execution = SubagentExecution(
             works,

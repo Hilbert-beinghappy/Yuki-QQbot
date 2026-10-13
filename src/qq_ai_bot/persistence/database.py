@@ -36,7 +36,6 @@ class Database:
         self.protocol_storage_policy: Callable[[], Awaitable[WorkStorageRuntimeConfig]] | None = (
             None
         )
-        self.subagent_concurrency = 2
         self._protocol_store_path: Path | None = None
         self._protocol_storage_lock: asyncio.Lock | None = None
         self._protocol_gc_iterator: Iterator[Path] | None = None
