@@ -529,19 +529,6 @@ class AgentRunner:
                             original = original.exceptions[0]
                         raise original from exc
                 raise
-        except (WorkBudgetExceeded, WorkCapacityError) as exc:
-            if control is None or control.current is None:
-                raise
-            outcome = await control.recover_failure(exc)
-            return AgentRunResult(
-                text="",
-                tool_calls_used=control.tools_started,
-                model_requests=control.requests_started,
-                web_was_used=False,
-                suppress_delivery=True,
-                work_state=control.ending,
-                outcome=outcome,
-            )
         except Exception as exc:
             if control is None or control.current is None:
                 raise
