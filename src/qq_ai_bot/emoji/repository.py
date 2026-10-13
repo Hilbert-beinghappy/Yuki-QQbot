@@ -896,11 +896,12 @@ class EmojiRepository:
         source: str,
     ) -> None:
         now = datetime.now(UTC)
-        async with self._database.immediate_session() as session:
+        async with self._database.sessions() as session:
             person_id = (
                 await resolve_live_person_id(session, actor_user_id) if actor_user_id else None
             )
             space_id = await resolve_live_space_id(session, group_id) if group_id else None
+        async with self._database.immediate_session() as session:
             await session.execute(
                 update(EmojiAssetModel)
                 .where(EmojiAssetModel.id == emoji_id)

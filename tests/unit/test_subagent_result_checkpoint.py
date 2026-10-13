@@ -1329,3 +1329,36 @@ async def test_child_cancellation_retires_accepted_control_and_retains_real_rece
         ]
     assert after == before and before[0]["state"] == "accepted"
     await repo.release(parent_lease)
+
+
+async def test_retired_generation_notification_maintenance_stays_read_only(
+    database, tmp_path, monkeypatch
+):
+    from contextlib import asynccontextmanager
+
+    from qq_ai_bot.conversation.canonical_db_models import CanonicalConversationModel
+
+    repository, workers, parent, lease, identity, _ = await _completed_child(database, tmp_path)
+    await repository.release(lease)
+    await repository.release(parent.lease)
+    original = await repository.get(identity)
+    async with database.immediate_session() as writer:
+        await writer.execute(
+            update(children).where(children.c.work_id == identity).values(notified_revision=0)
+        )
+        await writer.execute(
+            update(CanonicalConversationModel)
+            .where(CanonicalConversationModel.id == original["conversation_id"])
+            .values(generation=CanonicalConversationModel.generation + 1)
+        )
+
+    @asynccontextmanager
+    async def unexpected_writer():
+        raise AssertionError("retired generation must not acquire an empty writer")
+        yield
+
+    monkeypatch.setattr(database, "immediate_session", unexpected_writer)
+    await workers.maintain()
+    await workers.maintain()
+    assert await repository.get(identity) == original
+    assert (await workers.related(parent.current["id"], identity))["archived_at"] is None

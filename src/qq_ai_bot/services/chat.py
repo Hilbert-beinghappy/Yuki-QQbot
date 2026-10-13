@@ -151,24 +151,6 @@ class OutboundSender(Protocol):
         """Send one message and return proof of platform acceptance."""
 
 
-class AdminToolService(Protocol):
-    """Backend-verified administrator tools used by the single chat Agent."""
-
-    def definitions(self) -> tuple[ChatTool, ...]:
-        """Return reviewed administrator tool schemas."""
-
-    def is_mutating_call(self, name: str, arguments_json: str) -> bool:
-        """Return whether this exact registered operation changes backend state."""
-
-    async def execute(
-        self,
-        name: str,
-        arguments_json: str,
-        runtime: ToolRuntime,
-    ) -> ToolExecutionResult:
-        """Execute against authority derived from the current real event."""
-
-
 class AutomationToolProvider(Protocol):
     """Safe directory reads and authorized automation mutations for real user turns."""
 
@@ -296,7 +278,6 @@ class ChatService:
         self._web_sources = web_sources
         self._runtime_config = runtime_config
         runner = AgentRunner(models, concurrency)
-        self._admin_tools: AdminToolService | None = None
         self._automation_tools: AutomationToolProvider | None = None
         self._plugin_tools: PluginToolProvider | None = None
         self._tool_artifacts = tool_artifacts
@@ -356,11 +337,6 @@ class ChatService:
         )
         self._event_publisher = event_publisher
         self.observe_main_response: Callable[..., Awaitable[None]] | None = None
-
-    def set_admin_tools(self, service: AdminToolService) -> None:
-        """Attach privileged tools to this same Agent loop without a second router."""
-
-        self._admin_tools = service
 
     def set_automation_tools(self, service: AutomationToolProvider) -> None:
         """Attach scheduling tools without introducing a second Agent."""
@@ -618,26 +594,6 @@ class ChatService:
                     source=CapabilityTrustSource.AUTOMATION,
                     definitions=lambda _context: automation.definitions(),
                     execute=automation_execute,
-                )
-            )
-        if (
-            runtime.declaration_only or runtime.allow_admin_actions
-        ) and self._admin_tools is not None:
-            admin = self._admin_tools
-
-            async def admin_execute(
-                name: str,
-                arguments: str,
-                context: ToolRuntime,
-            ) -> ToolExecutionResult:
-                return await admin.execute(name, arguments, context)
-
-            registry.register(
-                InProcessToolProvider(
-                    provider_id="admin",
-                    source=CapabilityTrustSource.ADMIN,
-                    definitions=lambda _context: admin.definitions(),
-                    execute=admin_execute,
                 )
             )
         if self._plugin_tools is not None:
@@ -990,7 +946,6 @@ class ChatService:
                         "bot_user_id": inbound.bot_user_id,
                         "generation": turn_snapshot.generation,
                         "conversation_id": inbound.conversation_id,
-                        "allow_admin_actions": inbound.sender.user_id in self._settings.superusers,
                         "actor_is_superuser": inbound.sender.user_id in self._settings.superusers,
                         "presence_id": inbound.presence_id,
                     }
@@ -1109,7 +1064,6 @@ class ChatService:
                     inbound=inbound,
                     gateway=gateway,
                     allow_generic_onebot=inbound.sender.user_id in self._settings.superusers,
-                    allow_admin_actions=inbound.sender.user_id in self._settings.superusers,
                     conversation_key=conversation_key,
                     trigger_message_id=inbound.message_id,
                     actor_is_superuser=inbound.sender.user_id in self._settings.superusers,
@@ -1669,7 +1623,6 @@ class ChatService:
                     else None
                 ),
                 allow_generic_onebot=False,
-                allow_admin_actions=False,
                 conversation_key=conversation_key,
                 trigger_message_id=event.platform_message_id,
                 actor_is_superuser=False,

@@ -93,7 +93,6 @@ async def claim_initiative(
                 )
                 .group_by(InitiativeRunModel.id)
                 .order_by(func.min(MemoryToolReceiptModel.id))
-                .limit(100)
             )
         )
         run_ids = tuple(initiative.id for initiative in runs)
