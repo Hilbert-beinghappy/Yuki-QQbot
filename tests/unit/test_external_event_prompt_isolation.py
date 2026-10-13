@@ -622,7 +622,6 @@ async def test_external_wakeup_and_ordinary_turn_send_the_same_provider_shape(
         "actor_is_superuser": False,
         "runtime_config": runtime_config,
         "tools_closed": False,
-        "read_only": False,
         "visible_event_ids": frozenset({1, 2}),
         "selection_query": "same capability-neutral query",
         "scope_type": ScopeType.PRIVATE,

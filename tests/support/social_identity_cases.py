@@ -309,7 +309,6 @@ async def current_speaker_mention(env):
     runtime = SimpleNamespace(
         require_actor=lambda: actor,
         origin=TurnOrigin.USER_MESSAGE,
-        read_only=False,
         tools_closed=False,
         inbound=SimpleNamespace(
             sender=SimpleNamespace(user_id="10001"),

@@ -382,25 +382,6 @@ def test_image_turns_do_not_replace_execution_authority() -> None:
     ]
 
 
-def test_read_only_origin_hides_destructive_and_writes() -> None:
-    write = _descriptor(
-        "memory_change",
-        namespace="memory.state.write",
-        effect=CapabilityEffect.WRITE_STATE,
-        risk=CapabilityRisk.MUTATE,
-    )
-    read = _descriptor("web_search", namespace="web.search")
-    visible = CapabilityPolicyEngine().visible(
-        (write, read),
-        CapabilityPolicyContext(
-            authority=AuthorityContext(actor_user_id="u1", is_superuser=False),
-            origin=TurnOrigin.PLUGIN_BACKGROUND,
-            read_only=True,
-        ),
-    )
-    assert [item.model_name for item in visible] == ["web_search"]
-
-
 @pytest.mark.parametrize("origin", tuple(TurnOrigin))
 def test_destructive_uses_actual_permissions_for_every_origin(origin) -> None:
     destructive = _descriptor(

@@ -306,8 +306,6 @@ class PluginCapabilityAdapter:
             return False
         if runtime.tools_closed:
             return False
-        if runtime.read_only and metadata.risk is not RiskClass.READ:
-            return False
         return True
 
     @asynccontextmanager

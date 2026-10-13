@@ -249,7 +249,6 @@ async def test_plugin_background_media_uses_only_real_target_without_actor(datab
             effective_trigger_event_id=event.event.id,
             effective_conversation_id=conversation_id,
             inbound=None,
-            read_only=False,
             tools_closed=False,
             space_id=env.space if scope.group_id else None,
             person_id=None if scope.group_id else env.person,
