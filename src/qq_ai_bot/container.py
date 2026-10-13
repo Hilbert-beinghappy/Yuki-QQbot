@@ -173,7 +173,6 @@ class ApplicationContainer:
         self.model_profiles = model_runtime.profiles
         self.model_clients = model_runtime.clients
         self.model_invocations = model_runtime.invocations
-        self.model_router = model_runtime.router
         self.models = model_runtime.executor
         self.provider = model_runtime.chat_provider
         self.web_module = WebModule(
@@ -498,10 +497,8 @@ class ApplicationContainer:
         )
         plugins = self.plugin_module.build()
         self.plugins = plugins
-        self.plugin_installations = plugins.installations
         self.plugin_config_values = plugins.config_values
         self.plugin_state = plugins.state
-        self.plugin_audit_repository = plugins.audit_repository
         self.plugin_audit = plugins.audit
         self.plugin_session_repository = plugins.session_repository
         self.plugin_sessions = plugins.sessions

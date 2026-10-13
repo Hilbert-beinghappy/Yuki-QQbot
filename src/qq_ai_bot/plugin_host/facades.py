@@ -30,7 +30,6 @@ from qq_ai_bot.admin.models import ControlAuditRef, RuntimeConfigSnapshot
 from qq_ai_bot.automation.authority import DelegatedAuthority
 from qq_ai_bot.automation.models import AutomationRecord, TurnOrigin
 from qq_ai_bot.automation.service import AutomationService
-from qq_ai_bot.control_plane.principal import ControlPrincipal
 from qq_ai_bot.conversation.scope import runtime_conversation_key
 from qq_ai_bot.domain.conversations import ConversationScope, ScopeType
 from qq_ai_bot.domain.messages import ChatImage, InboundMessage
@@ -801,14 +800,6 @@ class HostPluginContext:
         if people is None:
             raise PluginPermissionError("control principal cannot be resolved")
         return ControlAccess(people._database, superuser_ids=self._superuser_ids)
-
-    async def _control_principal(
-        self, invocation: PluginInvocation
-    ) -> tuple[ControlPrincipal, ControlAuditRef]:
-        return (
-            await self._control_access().principal_for_qq(invocation.actor_user_id),
-            _control_audit_ref(invocation),
-        )
 
     def _require_user_scope(
         self,
