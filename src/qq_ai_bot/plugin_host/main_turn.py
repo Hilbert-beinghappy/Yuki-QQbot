@@ -21,6 +21,7 @@ from qq_ai_bot.runtime.activation_outcome import ContextBoundaryChanged
 from qq_ai_bot.runtime.context_preparation import prepare_context
 from qq_ai_bot.services.agent_runner import AgentRunResult, AgentRuntime, AgentToolBackend
 from qq_ai_bot.services.agent_tools import OneBotToolGateway, ToolRuntime
+from qq_ai_bot.services.durable_invocations import project_committed_result
 from qq_ai_bot.services.invocation_context import InvocationContextFactory
 from qq_ai_bot.services.main_agent_backend import MainAgentBackend
 from qq_ai_bot.services.main_agent_turns import MainAgentTurnService
@@ -496,15 +497,7 @@ async def _execute_plugin_main_turn(
         if owned is not None and result.work_id is not None:
             settled = await repository.get(result.work_id)
             if settled is not None:
-                stored = json.loads(settled["checkpoint_json"]).get("sync_result")
-                result = replace(
-                    result,
-                    work_state=settled["state"],
-                    text=stored
-                    if settled["state"] == "completed" and isinstance(stored, str)
-                    else "",
-                    suppress_delivery=settled["state"] != "completed",
-                )
+                result = project_committed_result(result, settled)
             result = replace(result, outcome=owned.outcome)
         return result
 
