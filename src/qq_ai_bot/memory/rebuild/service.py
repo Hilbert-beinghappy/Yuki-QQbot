@@ -30,6 +30,7 @@ from qq_ai_bot.memory.enums import (
     MemoryRebuildThirdPartyMode,
     MemoryResolutionAction,
     MemorySourceType,
+    MemoryStatus,
 )
 from qq_ai_bot.memory.event_extractor import MemoryEventExtractor
 from qq_ai_bot.memory.extraction import (
@@ -858,6 +859,10 @@ class MemoryRebuildService:
                 )
                 self.metrics.increment("rebuild_proposals_failed")
                 continue
+            if result.fact_id is not None:
+                fact = await self.processor._facts.get_fact(result.fact_id)
+                if fact is not None and fact.status is MemoryStatus.ACTIVE:
+                    await self.processor._facts.schedule_embedding(fact.id)
             self.metrics.increment("rebuild_proposals_committed")
             if result.action.value == "create":
                 self.metrics.increment("rebuild_facts_created")
