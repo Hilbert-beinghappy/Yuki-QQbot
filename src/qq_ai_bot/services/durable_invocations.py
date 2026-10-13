@@ -52,23 +52,27 @@ class DurableInvocations:
             boundary = invocation_boundary(runtime)
             requested = dict(runtime.invocation_source or {})
             # Host-only admission facts of the plugin Job; never persisted.
-            plugin_turn = requested.pop("_plugin_turn")
+            plugin_turn = requested.pop("_plugin_turn", None)
 
             async def validate() -> None:
                 if runtime.before_model_request is not None:
                     await runtime.before_model_request()
 
             repository = WorkRepository(database)
-            bound_id = plugin_turn["work_id"]
+            bound_id = plugin_turn.get("work_id") if isinstance(plugin_turn, dict) else None
             if bound_id is not None:
                 return await self._resume_bound_plugin_work(
                     repository, messages, runtime, backend, bound_id, requested, validate
                 )
             previous = await repository.by_source(f"invocation:{boundary}")
-            if previous is not None:
+            if previous is not None and isinstance(plugin_turn, dict):
                 # Admission and binding commit together, so an unbound Job never
                 # owns an existing Work; historical rows are resolved by 0100.
                 raise WorkConflict("plugin_turn_work_unbound")
+            if previous is not None:
+                result = await self.read_result(runtime, previous, generation)
+                if result is not None:
+                    return result
 
             source = {
                 **requested,
@@ -87,7 +91,11 @@ class DurableInvocations:
                 source,
                 validate,
             ) as bounded:
-                if bounded.current is None and runtime.invocation_goal:
+                if (
+                    bounded.current is None
+                    and runtime.invocation_goal
+                    and isinstance(plugin_turn, dict)
+                ):
                     from qq_ai_bot.plugin_host.notification_repository import (
                         admit_background_turn_work,
                     )
@@ -103,6 +111,15 @@ class DurableInvocations:
                         source_key=f"invocation:{boundary}",
                         source=source,
                         goal=runtime.invocation_goal,
+                    )
+                elif bounded.current is None and runtime.invocation_goal:
+                    await bounded.execute(
+                        "task_control",
+                        {
+                            "action": "accept",
+                            "goal": runtime.invocation_goal,
+                        },
+                        "host-invocation-admission",
                     )
                 result = await self._execute(
                     messages, replace(runtime, work_control=bounded), backend
