@@ -1,10 +1,10 @@
-# 从内部扩展迁移到 Plugin API 3.4
+# 从内部扩展迁移到 Plugin API 3.5
 
 Yuki 不会把记忆、权限、视觉、联网、自动化核心或 AgentRunner 改成插件。只迁移真正可选、边界清晰的本地扩展。从 Plugin API 2.x 升级见 [API 3.0 迁移](api-3.0-migration.md)。
 
 ## 映射
 
-| 旧做法 | Plugin API 3.4 |
+| 旧做法 | Plugin API 3.5 |
 |---|---|
 | 直接注册 NoneBot matcher | 确定性 `CommandRegistration` 或 Agent `ToolRegistration` |
 | 导入 `ApplicationContainer` | `PluginContext` 的最小 Facade |
@@ -34,3 +34,5 @@ Yuki 不会把记忆、权限、视觉、联网、自动化核心或 AgentRunner
 升级前按[当前升级指南](../upgrade-3.9.0.md)暂停实际 Bot 写入，保存同一时点的数据库、配置、插件、工作区及原执行回执。沿用原项目名和全部 Compose 覆盖文件，只更新相关服务；Manager 有写入时按其独立流程暂停，不用整个 Compose down 代替一致性备份。
 
 首次升级可设置 `PLUGIN_SYSTEM_ENABLED=false`，先检查数据库和普通聊天，再逐项启用插件。主聊天由 Conversation Runtime 准入后进入单一 Main Agent，不再提供旧 Planner 流程回退开关。
+
+3.5 的 `ctx.automation.create_task(task, request_id="...")` 需要穩定操作 ID，同一 callback 可建立多個任務；重試原任務保持原 ID。

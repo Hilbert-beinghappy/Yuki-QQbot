@@ -13,7 +13,7 @@
 | 项目 | 3.8.4 正式包 | 当前 3.9.0 源码 |
 | --- | --- | --- |
 | 数据库 head | `0072` | 当前开发单一 head `0118` |
-| Plugin API | 3.0 | 3.4，需适配并重新批准 |
+| Plugin API | 3.0 | 3.5，需适配并重新批准 |
 | 管理 WebUI | 不包含 | 默认关闭，共用控制面 |
 | MCP / Genie 输出 | 旧实现 / 可选组件 | 专属入口、配置和服务退役；共享回执、媒体与 ASR 保留 |
 | 长期记忆 | 旧策略 | fact ID 为身份，同 key 独立事实可共存 |
@@ -95,9 +95,9 @@ token、用户配置与插件，不能默认删除；Git/镜像 ignore 暂时保
 
 停写冷备需包含 `speech_generations` 真实执行事实、通用回执和被引用 WAV，保留原路径、内部 ID 与校验和。专属表终态不等于 QQ 已送达。服务器文件按实际归属和引用清理，不直接删除整个 data、共享 artifact 或有效备份。范围见[Work 证据备份](operations/work-evidence-backup.md)。
 
-### Plugin API 3.4
+### Plugin API 3.5
 
-更新插件 manifest 与代码，移除 `ctx.mcp`、`ctx.speech` 和专属权限/事件/TTS 注册，通过现有批准流程重新核对权限，保持原启用意图。迁移范围见 [API 3.1](plugin-development/api-3.1-migration.md)、[API 3.2](plugin-development/api-3.2-migration.md) 和 [API 3.4](plugin-development/api-3.4-migration.md)。宿主挂载的插件代码不会随镜像自动更新。
+更新插件 manifest 与代码，移除 `ctx.mcp`、`ctx.speech` 和专属权限/事件/TTS 注册，通过现有批准流程重新核对权限，保持原启用意图。迁移范围见 [API 3.1](plugin-development/api-3.1-migration.md)、[API 3.2](plugin-development/api-3.2-migration.md)、[API 3.4](plugin-development/api-3.4-migration.md) 和 [API 3.5](plugin-development/api-3.5-migration.md)。宿主挂载的插件代码不会随镜像自动更新。
 
 本轮资料删减同时移除 `limits.prompt_characters`、`PromptFragment.max_characters/cache_key`、
 无人消费的 `PromptTarget.PLUGIN_SESSION`，以及恒空的 `get_current_observation` 与

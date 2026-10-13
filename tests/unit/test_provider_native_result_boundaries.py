@@ -21,7 +21,6 @@ from tests.support.work_compaction_capacity_helpers import _runtime
 from tests.support.work_session import WorkSession
 from tests.unit.test_runtime_recovery import setup
 
-from qq_ai_bot.agent_core import Continue
 from qq_ai_bot.automation.models import RunStatus
 from qq_ai_bot.domain.conversations import ScopeType
 from qq_ai_bot.domain.messages import (
@@ -101,12 +100,25 @@ async def test_ordinary_truncation_retains_native_declarations_before_settlement
         (NativeToolDefinition(NativeToolType.WEB_SEARCH),) if native else (),
         compacting=False,
     )
-    if native:
-        with pytest.raises(LLMIncompleteResponseError):
-            await execution.settle_truncated(0, response, ())
-    else:
-        assert isinstance(await execution.settle_truncated(0, response, ()), Continue)
+    with pytest.raises(LLMIncompleteResponseError):
+        await execution.settle_truncated(0, response, ())
     assert provider.requests == []
+
+
+async def test_text_only_truncation_spends_no_correction_request(database, tmp_path):
+    provider = FakeLLMProvider(
+        lambda request: ChatResponse(
+            "paid partial answer",
+            0,
+            status=ModelResponseStatus.INCOMPLETE,
+            incomplete_reason="max_output_tokens",
+        )
+    )
+    initial = (ChatMessage("system", "fixed contract"), ChatMessage("user", "answer"))
+    runner, runtime = await _runtime(database, None, initial, provider)
+    with pytest.raises(LLMIncompleteResponseError):
+        await runner.run(initial, replace(runtime, max_model_requests=2), None)
+    assert len(provider.requests) == 1
 
 
 @pytest.mark.parametrize("segment_requests", [1, 2])
@@ -134,12 +146,13 @@ async def test_local_truncation_pairs_unexecuted_call_and_continues_original_wor
     provider = FakeLLMProvider(respond)
     initial = (ChatMessage("system", "fixed contract"), ChatMessage("user", "finish the work"))
     runner, runtime = await _runtime(database, control, initial, provider)
-    runtime = replace(runtime, max_model_requests=segment_requests)
+    runtime = replace(
+        runtime,
+        max_model_requests=segment_requests,
+        fixed_tools=(ChatTool("fixture_mutation", "mutate", {"type": "object"}),),
+    )
     execute = AsyncMock(side_effect=AssertionError("truncated arguments must not execute"))
     backend = StubAgentBackend(
-        definitions=lambda *_args, **_kwargs: (
-            ChatTool("fixture_mutation", "mutate", {"type": "object"}),
-        ),
         execute_call=execute,
         finalize=lambda content, _runtime: content,
     )
@@ -939,7 +952,6 @@ async def test_runner_preserves_paid_native_boundary_without_requeue_or_local_ex
         # Retain native guard assertions with the experiment's typed Invocations.
         # with a complete inert backend instead of main's legacy execute fixture.
         backend = StubAgentBackend()
-        backend.definitions = lambda *args, **kwargs: fixed
         backend.execute_call = AsyncMock(
             side_effect=AssertionError("ambiguous calls must not execute")
         )
@@ -1129,7 +1141,6 @@ async def test_native_transport_unknown_fails_original_activation_without_automa
         # Retain native guard assertions with the experiment's typed Invocations.
         # with a complete inert backend instead of main's legacy execute fixture.
         backend = StubAgentBackend()
-        backend.definitions = lambda *_args, **_kwargs: fixed
         backend.execute_call = AsyncMock(side_effect=AssertionError("no tool execution"))
         before = (
             AsyncMock(
