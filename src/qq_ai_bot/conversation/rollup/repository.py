@@ -567,8 +567,6 @@ class ConversationRollupRepository:
         return await self._policy_for_scope(scope) if self._policy_for_scope else self._config
 
     async def _claim_policy(self, claim: RollupJobClaim) -> RollupPolicyConfig:
-        if claim.conversation_id is None:
-            raise RollupLeaseLostError("canonical rollup claim has no conversation")
         from qq_ai_bot.runtime.work_schema_v1 import work
 
         policy = self._config
@@ -734,8 +732,6 @@ class ConversationRollupRepository:
             )
 
     async def heartbeat(self, claim: RollupJobClaim, *, lease_seconds: int) -> RollupJobClaim:
-        if not claim.conversation_id:
-            raise RollupLeaseLostError("canonical rollup claim has no conversation")
         async with self._database.immediate_session() as session:
             now = _utcnow()
             renewed = now + timedelta(seconds=lease_seconds)
@@ -760,8 +756,6 @@ class ConversationRollupRepository:
         self, claim: RollupJobClaim, *, emergency: bool = False, token_budget: int | None = None
     ) -> RollupCandidate | None:
         now = _utcnow()
-        if not claim.conversation_id:
-            raise RollupLeaseLostError("canonical rollup claim has no conversation")
         policy = await self._claim_policy(claim)
         if token_budget is not None:
             policy = replace(policy, context_token_budget=max(1, token_budget))
@@ -779,8 +773,6 @@ class ConversationRollupRepository:
         """Delete only an unchanged job; otherwise restore it to pending."""
 
         now = _utcnow()
-        if not claim.conversation_id:
-            raise RollupLeaseLostError("canonical rollup claim has no conversation")
         async with self._database.sessions() as session, session.begin():
             coverage_hold = await self._coverage_holds.earliest_source_event_id(
                 session,
@@ -848,8 +840,6 @@ class ConversationRollupRepository:
             if summary_kind is RollupKind.MODEL
             else set()
         )
-        if not claim.conversation_id:
-            raise RollupLeaseLostError("canonical rollup claim has no conversation")
 
         async def commit(session: AsyncSession) -> RollupCommitResult:
             return await self._commit_canonical_candidate(
@@ -881,8 +871,6 @@ class ConversationRollupRepository:
         normalized = summary_text.strip()
         if not normalized:
             raise ValueError("summary violates configured output bounds")
-        if not claim.conversation_id:
-            raise RollupLeaseLostError("canonical rollup claim has no conversation")
 
         async def commit(session: AsyncSession) -> RollupCommitResult:
             return await self._commit_canonical_emergency_overlay(
@@ -921,8 +909,6 @@ class ConversationRollupRepository:
         error_category: str,
         retry_max_seconds: int,
     ) -> None:
-        if not claim.conversation_id:
-            raise RollupLeaseLostError("canonical rollup claim has no conversation")
         async with self._database.immediate_session() as session:
             now = _utcnow()
             job = await session.scalar(

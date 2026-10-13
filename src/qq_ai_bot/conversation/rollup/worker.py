@@ -194,7 +194,7 @@ class ConversationRollupWorker:
                 await asyncio.gather(heartbeat, return_exceptions=True)
                 self._service._settlements.pop(settlement_key, None)
                 settled.set()
-                if self.on_finished is not None and claim.conversation_id is not None:
+                if self.on_finished is not None:
                     self.on_finished(claim.conversation_id)
 
     async def _summarize_or_emergency_overlay(
