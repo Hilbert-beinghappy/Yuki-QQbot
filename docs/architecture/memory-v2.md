@@ -131,3 +131,5 @@ Control Plane 仍要求 capability。
 - [第三方事实写入](memory-v2-third-party-facts.md)、
   [质量架构](memory-v2-quality.md)仍是对应领域合同。
   历史验收记录不覆盖本页。
+
+Hygiene 因缺少有效來源失效的 fact 使用 `invalid_provenance`，與狀態事件相同；不記成 `administrator_invalidated`。原歷史原因仍可讀，不回寫舊事件。
