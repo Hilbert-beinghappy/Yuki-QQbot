@@ -158,7 +158,6 @@ class ToolRuntime:
     gateway: OneBotToolGateway | None
     allow_generic_onebot: bool
     declaration_only: bool = False
-    allow_admin_actions: bool = False
     conversation_key: str = ""
     trigger_message_id: str = ""
     trigger_event_id: int | None = None
@@ -896,7 +895,6 @@ class AgentToolService:
                             **self._work_source(),
                             "conversation_id": runtime.effective_conversation_id,
                             "origin": runtime.origin.value,
-                            "allow_admin_actions": runtime.allow_admin_actions,
                             "actor_is_superuser": runtime.actor_is_superuser,
                             "actor_user_id": runtime.actor_user_id,
                             "bot_user_id": runtime.effective_bot_user_id,
