@@ -1152,10 +1152,25 @@ class MessageProcessor:
             except (TurnInterruptedError, TurnSupersededError, WorkConflict):
                 return ProcessResult(True, reason="turn_interrupted")
 
+        visual_question = sanitize_input(decision.content or message.text)
+        content = sanitize_input(decision.content or message.text)
+        if message.reply_text:
+            quoted = sanitize_input(message.reply_text)
+            if quoted:
+                content = f"[回复的消息]\n{quoted}\n\n{content}".strip()
+        if (
+            not content
+            and message.scope_type is ScopeType.GROUP
+            and message.mentions_bot
+            and not message.attachments
+            and not message.reply_attachments
+        ):
+            content = MENTION_ONLY_CONTEXT
+        is_overlong = len(content) > self._settings.max_input_characters
         record = await self._ledger.get_event(record.id) or record
         audio: AudioInput | None = None
         work_input_id: int | None = None
-        prepared: PreparedOrdinaryAdmission
+        prepared: PreparedOrdinaryAdmission | None
 
         async def prepare_source(*, existing_work: bool) -> PreparedOrdinaryAdmission | None:
             nonlocal record, audio, prepared
@@ -1180,6 +1195,9 @@ class MessageProcessor:
                 return None
             if created and (direct_turn or existing_work):
                 await self._enqueue_memory(record)
+            if is_overlong:
+                prepared = None
+                return None
             prepared = self.ordinary_admissions.prepare(
                 record, turn_snapshot.generation, turn_token.version
             )
@@ -1189,15 +1207,18 @@ class MessageProcessor:
             prepared = self.ordinary_admissions.prepare(
                 record, turn_snapshot.generation, turn_token.version
             )
-            work_input_id = await self._chat.stage_work_input(
-                coordinator_key,
-                message,
-                record.id,
-                admission=prepared,
-                prepare_source=lambda: prepare_source(existing_work=True),
-            )
-            if audio is None and (work_input_id is not None or not defer_new_main):
-                await prepare_source(existing_work=work_input_id is not None or defer_new_main)
+            if is_overlong and (not defer_new_main or input_only):
+                await prepare_source(existing_work=input_only)
+            else:
+                work_input_id = await self._chat.stage_work_input(
+                    coordinator_key,
+                    message,
+                    record.id,
+                    admission=prepared,
+                    prepare_source=lambda: prepare_source(existing_work=True),
+                )
+                if audio is None and (work_input_id is not None or not defer_new_main):
+                    await prepare_source(existing_work=work_input_id is not None or defer_new_main)
         except OrdinaryAdmissionDuplicate:
             return ProcessResult(False, reason="ordinary_already_admitted")
         except OrdinaryAdmissionConflict:
@@ -1221,12 +1242,22 @@ class MessageProcessor:
             )
             await self._chat.discard_work_input(work_input_id)
             return ProcessResult(True, int(sent), "asr_" + audio.error)
+        if is_overlong and (not defer_new_main or input_only or prepared is None):
+            sent = await self._send_text(
+                message,
+                sender,
+                f"消息过长，请控制在 {self._settings.max_input_characters} 个字符以内。",
+                turn_snapshot=turn_snapshot,
+            )
+            await self._chat.discard_work_input(work_input_id)
+            return ProcessResult(True, int(sent), "input_too_long")
         if work_input_id == 0:
             if defer_new_main:
                 return ProcessResult(True, reason="work_wait_partial")
             work_input_id = None
         if defer_new_main and work_input_id is None:
             return ProcessResult(False, reason="ordinary_deferred")
+        assert prepared is not None
         accepted = await self.ordinary_admissions.get(record.id)
         if accepted is not None:
             if accepted.activation_id != prepared.admission.activation_id:
@@ -1236,23 +1267,6 @@ class MessageProcessor:
         if work_input_id is not None:
             binding = None
         assert audio is not None
-        visual_question = sanitize_input(decision.content or message.text)
-        content = sanitize_input(decision.content or message.text)
-        if message.reply_text:
-            quoted = sanitize_input(message.reply_text)
-            if quoted:
-                content = f"[回复的消息]\n{quoted}\n\n{content}".strip()
-        if (
-            not content
-            and message.scope_type is ScopeType.GROUP
-            and message.mentions_bot
-            and not message.attachments
-            and not message.reply_attachments
-        ):
-            content = MENTION_ONLY_CONTEXT
-        if len(content) > self._settings.max_input_characters:
-            await self._chat.discard_work_input(work_input_id)
-            return ProcessResult(False, reason="input_too_long")
         try:
             visual = await self._analyze_visual_input(
                 message=message,
@@ -1295,16 +1309,6 @@ class MessageProcessor:
                     )
                     await self._chat.discard_work_input(work_input_id)
                     return ProcessResult(True, int(sent), "empty")
-        if len(content) > self._settings.max_input_characters:
-            sent = await self._send_text(
-                message,
-                sender,
-                f"消息过长，请控制在 {self._settings.max_input_characters} 个字符以内。",
-                turn_snapshot=turn_snapshot,
-            )
-            await self._chat.discard_work_input(work_input_id)
-            return ProcessResult(True, int(sent), "input_too_long")
-
         record = await self._ledger.get_event(record.id) or record
         if binding is not None and binding.source_revision != str(source_revision(record)):
             if decision.reason == "semantic_invitation":
