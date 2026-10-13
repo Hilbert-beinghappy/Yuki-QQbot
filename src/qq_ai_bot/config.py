@@ -148,7 +148,7 @@ class Settings(BaseSettings):
     llm_temperature: float = 0.7
     llm_max_output_tokens: int = 8192
     llm_thinking_enabled: bool | None = True
-    llm_reasoning_effort: ReasoningEffort | None = ReasoningEffort.LOW
+    llm_reasoning_effort: ReasoningEffort | None = None
 
     llm_flash_base_url: str = ""
     llm_flash_api_key: str = Field(default="", repr=False)

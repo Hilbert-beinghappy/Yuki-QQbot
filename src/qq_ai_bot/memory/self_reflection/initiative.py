@@ -61,7 +61,6 @@ async def claim_initiative(
     database: Database,
     *,
     max_characters: int,
-    excluded_conversation_keys: frozenset[str],
     cycle_id: str | None,
 ) -> tuple[SelfReflectionBatch, ...]:
     now = datetime.now(UTC)
@@ -93,7 +92,6 @@ async def claim_initiative(
                 )
                 .group_by(InitiativeRunModel.id)
                 .order_by(func.min(MemoryToolReceiptModel.id))
-                .limit(100)
             )
         )
         run_ids = tuple(initiative.id for initiative in runs)
@@ -141,8 +139,6 @@ async def claim_initiative(
             except MemoryPartitionResolutionError:
                 continue
             partition_hash = hashlib.sha256(source.partition.encode()).hexdigest()
-            if partition_hash in excluded_conversation_keys:
-                continue
             cursor = cursors.get(initiative.id)
             last = cursor.last_receipt_id if cursor else 0
             window = windows.get(initiative.id)
@@ -265,9 +261,6 @@ async def claim_initiative(
                 pending_events=0,
                 pending_characters=characters,
                 pending_since=source.occurred_at,
-                has_yuki_reply=False,
-                has_tool_result=True,
-                high_value_signal=False,
             )
             return (
                 SelfReflectionBatch(

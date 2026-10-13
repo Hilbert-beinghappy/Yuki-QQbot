@@ -587,16 +587,6 @@ class PromptProjectionRepository:
         )
         return stamp, prefix == old_payload, keys
 
-    async def invalidate(self, conversation_id: str) -> None:
-        """Remove model-input copies when a source is deleted/reset; leave the ledger intact."""
-        async with self.database.sessions() as session:
-            await session.execute(
-                delete(PromptProjectionModel).where(
-                    PromptProjectionModel.conversation_id == conversation_id,
-                )
-            )
-            await session.commit()
-
     async def invalidate_view(self, view_key: str, *, reason: str) -> None:
         """Retire an input representation while keeping its next-epoch reason."""
         if reason not in REBUILD_REASONS:

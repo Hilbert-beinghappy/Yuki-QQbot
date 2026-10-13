@@ -32,7 +32,6 @@ from qq_ai_bot.control_plane.command_types import (
     failure_audit_target_type,
     parse_attach_binding,
     parse_attach_space_binding,
-    parse_config_rollback,
     parse_config_write,
     parse_management_action,
     parse_register_presence,
@@ -602,30 +601,6 @@ class ControlCommandAdapter:
             ),
         )
 
-    async def rollback_config(
-        self,
-        principal: ControlPrincipal,
-        target: object,
-        command: ControlCommand,
-    ) -> ControlResult:
-        parsed, material, parse_problem = _try_parse(command, parse_config_rollback)
-        return await self._execute(
-            principal,
-            command,
-            operation=CommandOperation.CONFIG_ROLLBACK.value,
-            capability="control.config.mutate",
-            target_id=str(parsed.change_id) if parsed is not None else _canonical_text(target),
-            material=material,
-            parse_problem=parse_problem,
-            target_problem=None,
-            mutate=lambda session: self._run_management(
-                CommandOperation.CONFIG_ROLLBACK.value,
-                lambda: self._management.rollback_config(
-                    session, principal, command, _require_parsed(parsed)
-                ),
-            ),
-        )
-
     async def mutate_memory(
         self,
         principal: ControlPrincipal,
@@ -790,21 +765,6 @@ class ControlCommandAdapter:
             invoke=lambda session, principal, command, parsed: self._management.mutate_emoji(
                 session, command, parsed
             ),
-        )
-
-    async def cancel_operation(
-        self,
-        principal: ControlPrincipal,
-        target: object,
-        command: ControlCommand,
-    ) -> ControlResult:
-        return await self._management_action(
-            principal,
-            target,
-            command,
-            operation=CommandOperation.OPERATION_CANCEL.value,
-            capability="control.operation.cancel",
-            invoke=self._management.cancel_operation,
         )
 
     async def retry_operation(
