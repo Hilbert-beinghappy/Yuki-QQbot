@@ -33,7 +33,7 @@ async def test_one_plugin_invocation_creates_two_tasks_and_replays_original_requ
         else None
     )
     try:
-        with host.invocation_scope(host.plugin_id, source, web_was_used=False):
+        with host.invocation_scope(host.plugin_id, source):
             first = await host.automation.create_task(first_task, request_id="first")
             second = await host.automation.create_task(second_task, request_id="second")
             assert first.data["automation"]["task_id"] != second.data["automation"]["task_id"]
@@ -41,7 +41,7 @@ async def test_one_plugin_invocation_creates_two_tasks_and_replays_original_requ
             with pytest.raises(ValueError, match="automation_creation_key_conflict"):
                 await host.automation.create_task(second_task, request_id="first")
         # Restoring the same real source in another Host binding reuses the receipt.
-        with host.invocation_scope(host.plugin_id, source, web_was_used=False):
+        with host.invocation_scope(host.plugin_id, source):
             assert await host.automation.create_task(first_task, request_id="first") == first
         rows = await case.service.list_for_actor(case.actor)
         assert len(rows) == 3
