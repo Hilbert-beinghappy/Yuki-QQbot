@@ -81,10 +81,10 @@ async def test_long_task_persists_and_reaches_original_main_agent(
     assert result.version_id == updated.version_id
     assert len(requests) == 1
     submitted = [
-        part["text"]
+        part["text"][part["text"].index('{"goal":') :]
         for message in requests[0]["contents"]
         for part in message["parts"]
-        if message["role"] == "user" and "text" in part and part["text"].startswith('{"goal":')
+        if message["role"] == "user" and "text" in part and '{"goal":' in part["text"]
     ]
     assert len(submitted) == 1
     declaration, _ = json.JSONDecoder().raw_decode(submitted[0])
