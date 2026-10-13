@@ -140,7 +140,6 @@ class ConversationSettings(DomainSettings):
     conversation_rollup_lease_heartbeat_seconds: float = Field(gt=0)
     conversation_rollup_llm_origins: str
     conversation_rollup_prompt_version: str
-    conversation_rollup_foreground_max_batches: int = Field(ge=1)
     conversation_effect_gate_timeout_seconds: float = Field(gt=0)
     conversation_history_around_before: int = Field(ge=0)
     conversation_history_around_after: int = Field(ge=0)
