@@ -231,7 +231,7 @@ async def test_reclaim_during_extraction_discards_all_old_worker_results(
         facts=MemoryFactService(MemoryFactRepository(database)),
         ledger=ledger,
         model_executor=InjectedModelExecutor(Provider()),
-        concurrency=ConcurrencyManager(1),
+        concurrency=ConcurrencyManager(),
     )
     assert await worker.enqueue(event.id, "private:1001")
     running = asyncio.create_task(worker.process_once())
@@ -271,7 +271,7 @@ async def test_reclaim_during_resolution_blocks_fact_and_receipt_without_writer_
         facts=MemoryFactService(MemoryFactRepository(database)),
         ledger=ledger,
         model_executor=InjectedModelExecutor(Provider()),
-        concurrency=ConcurrencyManager(1),
+        concurrency=ConcurrencyManager(),
     )
     original_resolve = worker.processor.resolve
     current: MemoryJob | None = None

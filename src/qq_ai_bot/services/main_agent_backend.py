@@ -30,7 +30,6 @@ from qq_ai_bot.capabilities.runtime import TurnCapabilityRuntime
 from qq_ai_bot.capabilities.validation import UNDECLARED_TOOL
 from qq_ai_bot.domain.messages import ChatImage, ChatTool, ToolCall, ToolFunction
 from qq_ai_bot.llm.base import LLMError
-from qq_ai_bot.memory.runtime.contract import MemoryReadPolicy
 from qq_ai_bot.runtime.observability import identifier_hash
 from qq_ai_bot.runtime.origin import TurnOrigin as RuntimeTurnOrigin
 from qq_ai_bot.runtime.work_budget import WorkBudgetExceeded
@@ -113,7 +112,6 @@ class MainAgentBackend(AgentToolBackend):
         self._provider_registry: ToolProviderRegistry | None = None
         self._capability_runtime: TurnCapabilityRuntime | None = None
         self._callable_tool_names: set[str] = set()
-        self._tool_turn_recorded = False
         self._response_sequence = 0
 
     def record_failure_usage(self, *, tool_calls: int, model_requests: int) -> None:
@@ -132,14 +130,6 @@ class MainAgentBackend(AgentToolBackend):
 
     def _memory(self) -> Any:
         return self._memory_session
-
-    def _eager_memory_read(self) -> bool:
-        session = self._memory()
-        if session is None:
-            return False
-        return session.contract.read_policy in {
-            MemoryReadPolicy.EAGER,
-        }
 
     def mark_native_web_used(self) -> None:
         """Apply post-Web isolation before same-response local calls execute."""
@@ -217,9 +207,6 @@ class MainAgentBackend(AgentToolBackend):
             )
         definitions = tuple(sorted(definitions, key=lambda tool: tool.name))
         self._callable_tool_names = set(capability_runtime.callable_capability_ids())
-        if not self._tool_turn_recorded and definitions:
-            self._service._tool_metrics.record_tool_enabled_turn()
-            self._tool_turn_recorded = True
         self._log_tool_exposure(definitions, reason="ready")
         return definitions
 
@@ -235,9 +222,6 @@ class MainAgentBackend(AgentToolBackend):
         if session is not None:
             capability_runtime.sync_memory_view(session.capability_view())
         self._callable_tool_names = set(capability_runtime.callable_capability_ids())
-        if not self._tool_turn_recorded and self._callable_tool_names:
-            self._service._tool_metrics.record_tool_enabled_turn()
-            self._tool_turn_recorded = True
 
     def _ensure_capability_runtime(self) -> TurnCapabilityRuntime:
         if self._capability_runtime is not None:
@@ -276,8 +260,6 @@ class MainAgentBackend(AgentToolBackend):
                     else "person"
                 ),
             ),
-            origin=self._runtime.origin,
-            contains_images=self._runtime.image_present,
             web_was_used=self._web_was_used,
             tools_closed=self._runtime.tools_closed,
             read_only=self._runtime.read_only,
@@ -404,14 +386,6 @@ class MainAgentBackend(AgentToolBackend):
         binding = descriptor.binding
         effective_descriptor = self._effective_descriptor(call, descriptor)
         is_web_tool = effective_descriptor.namespace_id.startswith("web.")
-        is_memory_read_tool = (
-            effective_descriptor.namespace_id.startswith("memory.")
-            and effective_descriptor.effect is CapabilityEffect.READ_STATE
-        )
-        if is_memory_read_tool and not self._eager_memory_read():
-            self._service._tool_metrics.record_automatic_memory_read_tool_call(
-                locator_fallback=False
-            )
         config = self._runtime.runtime_config
         assert config is not None
         mutating = self._is_mutating_call(call)
@@ -595,11 +569,6 @@ class MainAgentBackend(AgentToolBackend):
                 else None,
             ).render(outcome)
             result = budgeted.text
-            self._service._tool_metrics.record_invocation(
-                descriptor.provider_id,
-                descriptor.provider_tool_name or descriptor.model_name,
-                outcome.ok,
-            )
             if self._service._tool_invocations is not None:
                 await self._service._record_tool_invocation(
                     runtime=execution_runtime,

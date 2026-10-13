@@ -533,13 +533,12 @@ def test_namespace_is_not_a_permission() -> None:
         (plugin,),
         CapabilityPolicyContext(
             authority=AuthorityContext(actor_user_id="u1", is_superuser=False),
-            origin=TurnOrigin.USER_MESSAGE,
         ),
     )
     assert visible == ()
 
 
-def test_image_turns_do_not_replace_execution_authority() -> None:
+def test_write_and_read_capabilities_use_actual_execution_authority() -> None:
     write = _descriptor(
         "memory_change",
         namespace="memory.state.write",
@@ -566,8 +565,6 @@ def test_image_turns_do_not_replace_execution_authority() -> None:
         (write, mutate, read, *environment),
         CapabilityPolicyContext(
             authority=AuthorityContext(actor_user_id="u1", is_superuser=False),
-            origin=TurnOrigin.USER_MESSAGE,
-            contains_images=True,
         ),
     )
     assert [item.model_name for item in visible] == [
@@ -592,15 +589,13 @@ def test_read_only_origin_hides_destructive_and_writes() -> None:
         (write, read),
         CapabilityPolicyContext(
             authority=AuthorityContext(actor_user_id="u1", is_superuser=False),
-            origin=TurnOrigin.PLUGIN_BACKGROUND,
             read_only=True,
         ),
     )
     assert [item.model_name for item in visible] == ["web_search"]
 
 
-@pytest.mark.parametrize("origin", tuple(TurnOrigin))
-def test_destructive_uses_actual_permissions_for_every_origin(origin) -> None:
+def test_destructive_uses_actual_permissions() -> None:
     destructive = _descriptor(
         "admin_execute_action",
         namespace="admin.action.write",
@@ -618,13 +613,11 @@ def test_destructive_uses_actual_permissions_for_every_origin(origin) -> None:
     }
     allowed = engine.visible(
         (destructive,),
-        CapabilityPolicyContext(**context, origin=origin),
+        CapabilityPolicyContext(**context),
     )
     refused = engine.visible(
         (destructive,),
-        CapabilityPolicyContext(
-            authority=AuthorityContext(actor_user_id="u1", is_superuser=False), origin=origin
-        ),
+        CapabilityPolicyContext(authority=AuthorityContext(actor_user_id="u1", is_superuser=False)),
     )
     assert [item.model_name for item in allowed] == ["admin_execute_action"]
     assert refused == ()
@@ -651,7 +644,6 @@ def _runtime(
         registry=snapshot,
         policy_context=CapabilityPolicyContext(
             authority=AuthorityContext(actor_user_id="1001", is_superuser=False),
-            origin=TurnOrigin.USER_MESSAGE,
             memory_view=memory_view,
         ),
     )

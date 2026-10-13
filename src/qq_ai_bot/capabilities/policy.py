@@ -9,7 +9,6 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 
-from qq_ai_bot.automation.models import TurnOrigin
 from qq_ai_bot.capabilities.models import (
     AuthorityContext,
     CapabilityDescriptor,
@@ -28,8 +27,6 @@ _READ_EFFECTS = frozenset(
 @dataclass(frozen=True, slots=True)
 class CapabilityPolicyContext:
     authority: AuthorityContext
-    origin: TurnOrigin
-    contains_images: bool = False
     web_was_used: bool = False
     conversation_open: bool = True
     tools_closed: bool = False
