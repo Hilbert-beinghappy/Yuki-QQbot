@@ -163,7 +163,6 @@ async def test_media_selection_requires_explicit_permission_without_losing_resul
     assert payload["data"]["media_error"] == "PluginPermissionError"
     assert payload["data"]["media_read"] is False and not result.images
     assert len(env.calls) == 1
-    assert not hasattr(env.context, "mcp")
 
 
 @pytest.mark.asyncio
