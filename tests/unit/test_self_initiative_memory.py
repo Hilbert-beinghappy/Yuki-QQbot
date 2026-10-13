@@ -1569,3 +1569,16 @@ async def test_reflection_only_live_source_ranges_block_claim_and_cursor(databas
             assert state.last_event_id == initial.id
         else:
             assert state.last_event_id == current.id and state.pending_events == 0
+
+
+async def test_silent_receipt_window_uses_character_budget_without_eight_row_cap(database):
+    _mutations, _facts, event, run_id = await seed(database)
+    excerpts = tuple(f"真实工具结果 {i}" for i in range(13))
+    for index, excerpt in enumerate(excerpts):
+        await record(database, event, run_id, f"many-{index}", result_excerpt=excerpt)
+    await finish(database, run_id)
+    repository = SelfReflectionRepository(database)
+    (batch,) = await claim(database, "all-small-receipts", max_characters=10000)
+    assert tuple(item.result_excerpt for item in await repository.tool_receipts(batch)) == excerpts
+    await repository.complete(batch, proposals=0, committed=0)
+    assert await claim(database, "all-small-receipts-finished", max_characters=10000) == ()
