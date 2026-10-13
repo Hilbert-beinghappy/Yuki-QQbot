@@ -1209,7 +1209,6 @@ class SocialService:
         caption: str = "",
         caption_segments: list[dict[str, Any]] | None = None,
     ) -> dict[str, Any]:
-        await self._validate_self_context(context)
         from qq_ai_bot.runtime.effect_outcomes import current_result_capture
 
         capture = current_result_capture.get()
@@ -1231,7 +1230,6 @@ class SocialService:
                 if caption or caption_segments
                 else await self._receipt_result(receipt, context)
             )
-        await self._validate_self_context(context)
         known_event_id = await self.check_target(target)
         route_known_event_id = None
         if route_target is not None and route_target != target:

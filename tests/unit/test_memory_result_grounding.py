@@ -12,7 +12,7 @@ from qq_ai_bot.memory.enums import MemoryEvidenceRelation, MemoryScopeType, Memo
 from qq_ai_bot.memory.models import MemoryEvidenceCreate, MemoryFactCreate
 from qq_ai_bot.memory.repository import MemoryFactRepository
 from qq_ai_bot.memory.service import MemoryFactService
-from qq_ai_bot.persistence.repositories import AgentActionRepository, EventLedgerRepository
+from qq_ai_bot.persistence.repositories import EventLedgerRepository
 from qq_ai_bot.runtime.subagent_tools import worker_prompt
 from qq_ai_bot.services.agent_tools import AgentToolService, ToolRuntime
 
@@ -51,7 +51,6 @@ async def test_memory_read_result_keeps_complete_fact_and_evidence_without_polic
         settings=settings,
         ledger=ledger,
         memories=facts,
-        actions=AgentActionRepository(database),
     )
     runtime = ToolRuntime(
         inbound=InboundMessage(

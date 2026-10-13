@@ -30,7 +30,6 @@ from qq_ai_bot.memory.service import MemoryFactService
 from qq_ai_bot.memory.targets import MemoryTargetResolver
 from qq_ai_bot.persistence.database import Database
 from qq_ai_bot.persistence.repositories import (
-    AgentActionRepository,
     EmojiDescriptionRepository,
     EventLedgerRepository,
     GroupSettingsRepository,
@@ -62,7 +61,6 @@ class PersistenceBundle:
     memory_audit: MemoryAuditService
     memory_metrics: MemoryLifecycleMetrics
     memory_rebuilds: MemoryRebuildRepository
-    agent_actions: AgentActionRepository
     web_sources: WebSearchSourceRepository
     media_analyses: MediaAnalysisRepository
     emoji_descriptions: EmojiDescriptionRepository
@@ -175,7 +173,6 @@ class PersistenceModule:
             memory_audit=MemoryAuditService(memory_repository, metrics=memory_metrics),
             memory_metrics=memory_metrics,
             memory_rebuilds=memory_rebuilds,
-            agent_actions=AgentActionRepository(database),
             web_sources=WebSearchSourceRepository(database),
             media_analyses=MediaAnalysisRepository(database),
             emoji_descriptions=EmojiDescriptionRepository(database),

@@ -609,6 +609,8 @@ WorkScheduler 沿原循环尝试 repair_inputs/wake_rollups/reclaim/protocol_cle
 尚未接纳工作的普通聊天，Provider、配置、空响应、容量、校验和内部异常保留原日志、
 ProcessResult 原失败原因及 TURN_CLOSED，不因异常自动向 QQ 插入固定报错。
 工具失败仍按原工具结果交回模型；模型请求失败不另外购买一次请求来解释错误。
+旧 detached sandbox continuation 的 claimed 状态由 0116 一次性迁移为 blocked；
+保留原 request/run ID、次数和执行回执，启动不再重复清理。
 没有持久恢复所有者时不自动重放；有 Work 时由原 supervisor 保存真实状态和恢复事实。
 发送或存储未知仍保持未知，不因删除通知改成成功。
 

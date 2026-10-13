@@ -45,17 +45,15 @@ async def case(database, tmp_path, responses, *, reporting="interactive", send_s
     harness = build_harness(database, make_settings(database.url), provider)
     chat = harness.processor._chat
     observed = []
+    fixed_tools = (
+        *work_control_tools(),
+        *subagent_tools(),
+        ChatTool("send_message", "send", {"type": "object"}),
+        ChatTool("read_fixture", "read", {"type": "object"}),
+        ChatTool("write_fixture", "write", {"type": "object"}),
+    )
 
     class Backend(StubAgentBackend):
-        def definitions(self, runtime, **kwargs):
-            return (
-                *work_control_tools(),
-                *subagent_tools(),
-                ChatTool("send_message", "send", {"type": "object"}),
-                ChatTool("read_fixture", "read", {"type": "object"}),
-                ChatTool("write_fixture", "write", {"type": "object"}),
-            )
-
         def parallel_safe(self, name, runtime):
             return name == "read_fixture"
 
@@ -97,6 +95,7 @@ async def case(database, tmp_path, responses, *, reporting="interactive", send_s
         max_tool_calls=12,
         max_model_requests=12,
         work_control=control,
+        fixed_tools=fixed_tools,
     )
     return SimpleNamespace(
         env=env,
