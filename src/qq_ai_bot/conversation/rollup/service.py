@@ -6,7 +6,6 @@ import asyncio
 import json
 import logging
 import uuid
-from dataclasses import replace
 
 from qq_ai_bot.conversation.rollup.errors import (
     ConversationCoverageError,
@@ -58,13 +57,6 @@ def _allowed_source_ids(candidate: RollupCandidate) -> set[int]:
     return allowed
 
 
-def rollup_max_output_tokens(summary_max_characters: int, generation_budget: int = 32768) -> int:
-    """Validate independent limits; characters never enlarge generation allowance."""
-    if generation_budget < 1 or summary_max_characters < 1:
-        raise ValueError("invalid_rollup_output_budget")
-    return generation_budget
-
-
 class ConversationRollupService:
     """Summarize one locked candidate without holding a database transaction."""
 
@@ -74,17 +66,11 @@ class ConversationRollupService:
         models: ModelExecutor | None,
         config: RollupPolicyConfig,
         timeout_seconds: float,
-        max_output_tokens: int | None = None,
         metrics: ConversationRollupMetrics | None = None,
     ) -> None:
         self._models = models
-        self._config = (
-            replace(config, max_output_tokens=max_output_tokens)
-            if max_output_tokens is not None
-            else config
-        )
+        self._config = config
         self._timeout_seconds = timeout_seconds
-        rollup_max_output_tokens(config.summary_max_characters, self._config.max_output_tokens)
         self._active: dict[tuple[str, int], asyncio.Task[str]] = {}
         self._settlements: dict[tuple[str, int], asyncio.Event] = {}
         self.metrics = metrics or ConversationRollupMetrics()
