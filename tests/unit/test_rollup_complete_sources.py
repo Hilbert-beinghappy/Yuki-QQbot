@@ -379,6 +379,64 @@ async def test_foreground_rollup_can_finish_more_than_five_batches(database) -> 
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("failure", ["policy", "model_failure"])
+async def test_worker_retains_policy_and_model_failure_overlays(database, failure):
+    from sqlalchemy import select
+
+    from qq_ai_bot.conversation.canonical_db_models import (
+        CanonicalConversationRollupEmergencyOverlayModel,
+        CanonicalConversationRollupModel,
+    )
+    from qq_ai_bot.conversation.rollup.repository import ConversationRollupRepository
+    from qq_ai_bot.conversation.rollup.worker import ConversationRollupWorker
+
+    policy = RollupPolicyConfig(
+        context_token_budget=512,
+        batch_max_events=1,
+        llm_origins=frozenset({"scheduled_automation"})
+        if failure == "policy"
+        else frozenset({"user_message"}),
+    )
+    scope = await _seed_private(
+        database, peer="1015", count=20, policy=policy, content="source event " * 80
+    )
+    repository = ConversationRollupRepository(database, policy)
+    model = RecordingModel(fail_at=1)
+    service = ConversationRollupService(models=model, config=policy, timeout_seconds=2)
+    worker = ConversationRollupWorker(
+        repository=repository,
+        service=service,
+        enabled=True,
+        concurrency=1,
+        poll_seconds=60,
+        lease_seconds=30,
+        heartbeat_seconds=5,
+        retry_max_seconds=30,
+        max_batches_per_claim=1,
+    )
+    finished = asyncio.Event()
+    worker.on_finished = lambda _: finished.set()
+    await worker.start()
+    try:
+        await asyncio.wait_for(finished.wait(), timeout=10)
+    finally:
+        await worker.close()
+    state, effective, job = await repository.status(scope)
+    assert effective.summary_kind.value == "emergency" and state.uncovered_event_count == 20
+    assert job["last_error_category"] == (
+        "llm_origin_ineligible" if failure == "policy" else "RuntimeError"
+    )
+    assert job["status"] == "pending"
+    assert len(model.sources) == (0 if failure == "policy" else 1)
+    async with database.sessions() as reader:
+        assert await reader.scalar(select(CanonicalConversationRollupModel)) is None
+        overlay = await reader.scalar(select(CanonicalConversationRollupEmergencyOverlayModel))
+        assert overlay.conversation_id == state.id
+        assert overlay.covered_through_event_id > state.starts_after_event_id
+        assert overlay.summary_text
+
+
+@pytest.mark.asyncio
 async def test_activity_window_keeps_more_than_512_small_events_without_compaction(
     database,
 ) -> None:
