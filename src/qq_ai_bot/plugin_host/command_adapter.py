@@ -187,7 +187,6 @@ class PluginCommandAdapter:
             inbound=message,
             gateway=None,
             allow_generic_onebot=False,
-            allow_admin_actions=False,
             conversation_key=plugin_conversation_key(message, identity),
             trigger_message_id=message.message_id,
             trigger_event_id=message.source_event_id,

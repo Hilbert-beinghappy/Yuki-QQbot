@@ -158,7 +158,6 @@ class ToolRuntime:
     gateway: OneBotToolGateway | None
     allow_generic_onebot: bool
     declaration_only: bool = False
-    allow_admin_actions: bool = False
     conversation_key: str = ""
     trigger_message_id: str = ""
     trigger_event_id: int | None = None
@@ -865,10 +864,7 @@ class AgentToolService:
                     from qq_ai_bot.capabilities.invocation import current_invocation
 
                     invocation = current_invocation.get()
-                    if (
-                        runtime.tools_closed
-                        or (runtime.read_only and name not in READ_TOOLS)
-                    ):
+                    if runtime.tools_closed or (runtime.read_only and name not in READ_TOOLS):
                         return self._result(error="permission_denied", detail="本轮未授权沙箱操作")
                     if self.sandbox_client is None or invocation is None:
                         return self._result(error="sandbox_unavailable", detail="沙箱未连接")
@@ -896,7 +892,6 @@ class AgentToolService:
                             **self._work_source(),
                             "conversation_id": runtime.effective_conversation_id,
                             "origin": runtime.origin.value,
-                            "allow_admin_actions": runtime.allow_admin_actions,
                             "actor_is_superuser": runtime.actor_is_superuser,
                             "actor_user_id": runtime.actor_user_id,
                             "bot_user_id": runtime.effective_bot_user_id,
@@ -910,12 +905,14 @@ class AgentToolService:
                         if name in EXECUTION_TOOLS
                         else None,
                     )
-                    if result.get("error") == "sandbox_submission_unknown":
+                    if result.get("error"):
                         return self._result(
                             data=result,
-                            error="sandbox_submission_unknown",
-                            detail="沙箱提交结果未确认；核对原执行回执，不能重新提交。",
-                            uncertain=True,
+                            error=str(result["error"]),
+                            detail="沙箱提交结果未确认；核对原执行回执，不能重新提交。"
+                            if result.get("uncertain")
+                            else "沙箱操作未完成",
+                            uncertain=bool(result.get("uncertain")),
                         )
                     return self._result(data=result)
 
@@ -923,9 +920,8 @@ class AgentToolService:
                     from qq_ai_bot.workspace.store import WorkspaceError
 
                     if (
-                        (runtime.read_only and name not in WORKSPACE_READ_TOOLS)
-                        or runtime.tools_closed
-                    ):
+                        runtime.read_only and name not in WORKSPACE_READ_TOOLS
+                    ) or runtime.tools_closed:
                         return self._result(
                             error="permission_denied", detail="本轮未授权工作区操作"
                         )
@@ -941,7 +937,13 @@ class AgentToolService:
                             runtime=runtime,
                             request_id=invocation.call_id if invocation is not None else None,
                         )
-                        return self._result(data=workspace_result)
+                        return self._result(
+                            data=workspace_result,
+                            error=str(workspace_result["error"])
+                            if workspace_result.get("error")
+                            else None,
+                            uncertain=bool(workspace_result.get("uncertain")),
+                        )
                     except (WorkspaceError, ValueError, OSError) as exc:
                         category = (
                             str(exc) if isinstance(exc, WorkspaceError) else type(exc).__name__

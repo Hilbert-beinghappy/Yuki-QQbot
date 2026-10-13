@@ -360,7 +360,7 @@ class ScopedEventLedgerUnitOfWork:
         from qq_ai_bot.conversation.canonical_rollup import signal_canonical_rollup_if_needed
         from qq_ai_bot.conversation.hydrate import delete_canonical_rollup_projections
 
-        for _attempt in range(3):
+        while True:
             prepared = await self._prepare_derived_text(
                 event_id, normalized, audio=audio, generation=generation
             )
@@ -424,7 +424,6 @@ class ScopedEventLedgerUnitOfWork:
                 self.metrics.counter_repairs += 1
             self._notify_after_commit(signalled)
             return True
-        raise RuntimeError("derived text source changed during preparation")
 
     async def _find_existing_live(
         self,

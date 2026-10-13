@@ -16,7 +16,6 @@ from weakref import WeakValueDictionary
 from pydantic import ValidationError
 from sqlalchemy.exc import SQLAlchemyError
 
-from qq_ai_bot.admin.action_service import ActionRegistry
 from qq_ai_bot.admin.audit import AdminAuditService
 from qq_ai_bot.admin.config_service import RuntimeConfigService
 from qq_ai_bot.admin.models import (
@@ -414,7 +413,6 @@ class MessageProcessor:
         self._permission_catalog = permission_catalog or PermissionCatalogService(
             settings=settings,
             config_registry=self._runtime_config.registry,
-            action_registry=ActionRegistry(),
         )
         self._vision = vision_service
         self._native_images = attachment_inputs
@@ -1121,7 +1119,13 @@ class MessageProcessor:
         ):
             content = MENTION_ONLY_CONTEXT
         if len(content) > self._settings.max_input_characters:
-            return ProcessResult(False, reason="input_too_long")
+            sent = await self._send_text(
+                message,
+                sender,
+                f"消息过长，请控制在 {self._settings.max_input_characters} 个字符以内。",
+                turn_snapshot=turn_snapshot,
+            )
+            return ProcessResult(True, int(sent), "input_too_long")
         record = await self._ledger.get_event(record.id) or record
         if binding is not None and binding.source_revision != str(source_revision(record)):
             if decision.reason == "semantic_invitation":
@@ -1201,16 +1205,6 @@ class MessageProcessor:
                     )
                     await self._chat.discard_work_input(work_input_id)
                     return ProcessResult(True, int(sent), "empty")
-        if len(content) > self._settings.max_input_characters:
-            sent = await self._send_text(
-                message,
-                sender,
-                f"消息过长，请控制在 {self._settings.max_input_characters} 个字符以内。",
-                turn_snapshot=turn_snapshot,
-            )
-            await self._chat.discard_work_input(work_input_id)
-            return ProcessResult(True, int(sent), "input_too_long")
-
         record = await self._ledger.get_event(record.id) or record
         if binding is not None and binding.source_revision != str(source_revision(record)):
             if decision.reason == "semantic_invitation":
