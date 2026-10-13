@@ -163,7 +163,6 @@ class DreamWorker:
             return
 
     async def _drain_active(self) -> None:
-        await self._repository.reset_processing_after_restart()
         run = await self._repository.active_run()
         if run is None:
             return

@@ -107,13 +107,8 @@ class _Session:
     observation: ObservationSession | None
     revision: int
     saved: str
-    last_seen: float
     seed_checked_at: float = 0
     pins: int = 0
-
-
-class _ScopeCapacityBusy(RuntimeError):
-    """All bounded controller slots are currently held by real work."""
 
 
 class SemanticParticipationService:
@@ -194,8 +189,6 @@ class SemanticParticipationService:
         if key:
             self._observer = JevObserver(key, model=self.app.settings.semantic_participation_model)
         for conversation_id, generation in await self.repository.list_current_autonomous_scopes():
-            if len(self._sessions) >= 32:
-                break
             scene = await self._scene(conversation_id)
             if scene is not None and scene.generation == generation:
                 await self._session(scene)
@@ -386,7 +379,6 @@ class SemanticParticipationService:
         if key in self._sessions:
             item = self._sessions[key]
             item.scene = scene
-            item.last_seen = time.time()
             return item
         if self._store is None:
             raise RuntimeError("participation_not_started")
@@ -394,13 +386,6 @@ class SemanticParticipationService:
             if old_key[0] == scene.conversation_id and old_key != key and not self._held(old):
                 await self._save(old)
                 self._sessions.pop(old_key)
-        if len(self._sessions) >= 32:
-            idle = [k for k, value in self._sessions.items() if not self._held(value)]
-            if not idle:
-                raise _ScopeCapacityBusy("participation_scope_capacity_busy")
-            oldest = min(idle, key=lambda k: self._sessions[k].last_seen)
-            await self._save(self._sessions[oldest])
-            self._sessions.pop(oldest)
         loaded = await self._store.load(scene.scope)
         controller = (
             Controller.restore(
@@ -422,7 +407,6 @@ class SemanticParticipationService:
             observation,
             loaded[0] if loaded else 0,
             loaded[1] if loaded else "",
-            time.time(),
         )
         self._sessions[key] = item
         return item
@@ -1045,11 +1029,7 @@ class SemanticParticipationService:
             scene = await self._scene(message.conversation_id)
             if scene is None:
                 return False
-            try:
-                item = await self._session(scene)
-            except _ScopeCapacityBusy:
-                self.observe_context(message, direct=False)
-                return False
+            item = await self._session(scene)
             item.pins += 1
             try:
                 from qq_ai_bot.services.participation_feedback import sync_scope_effects
@@ -1071,11 +1051,7 @@ class SemanticParticipationService:
             scene = await self._scene(message.conversation_id)
             if scene is None:
                 return False
-            try:
-                item = await self._session(scene)
-            except _ScopeCapacityBusy:
-                self.observe_context(message, direct=False)
-                return False
+            item = await self._session(scene)
             item.pins += 1
             try:
                 from qq_ai_bot.services.participation_feedback import sync_scope_effects
@@ -1190,7 +1166,7 @@ class SemanticParticipationService:
             + "可以主动开启话题、接续讨论、提出问题、分享有根据的想法，"
             "也可以查询或推进自己的工作。想发言就用 send_message；"
             "确实没有自然的切入点时才用 NO_REPLY。"
-            "来源编号如下，详情可按需查询："
+            "来源引用如下，详情可按需查询："
             + json.dumps(packet, ensure_ascii=False, separators=(",", ":"))
         )
         source = {
@@ -1261,10 +1237,7 @@ class SemanticParticipationService:
             if unseen is not None:
                 scene = await self._scene(unseen[0])
                 if scene is not None and scene.generation == unseen[1]:
-                    try:
-                        await self._session(scene)
-                    except _ScopeCapacityBusy:
-                        pass
+                    await self._session(scene)
         pinned: dict[tuple[str, int], _Session] = {}
         direct_by_scope = {}
 
@@ -1281,13 +1254,10 @@ class SemanticParticipationService:
                 if scene is None:
                     self._dirty.pop(conversation_id, None)
                     continue
-                try:
-                    item = await self._session(scene)
-                except _ScopeCapacityBusy:
-                    continue  # Keep this scope's dirty signal for the next available slot.
+                item = await self._session(scene)
                 retain(item)
                 direct_by_scope[(scene.conversation_id, scene.generation)] = direct
-            # Eviction owns this same lock through checkpoint commit. Acquire it
+            # Generation retirement owns this same lock through checkpoint commit. Acquire it
             # only for the synchronous pin batch, never while advancing a scope.
             async with self._session_lock:
                 for item in tuple(self._sessions.values()):

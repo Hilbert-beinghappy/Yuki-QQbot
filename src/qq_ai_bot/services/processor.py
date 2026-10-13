@@ -402,7 +402,6 @@ class MessageProcessor:
         )
         self._group_admin = group_admin or GroupAdminService(
             groups=self._groups,
-            runtime_config=self._runtime_config,
             audit=audit,
         )
         self._private_access_admin = private_access_admin or PrivateAccessAdminService(
@@ -894,7 +893,7 @@ class MessageProcessor:
                 and group_policy.autonomous_enabled
             ):
                 if self._autonomous is not None:
-                    self._autonomous.observe(message, profile, sender, turn_token)
+                    self._autonomous.observe(message)
             return ProcessResult(False, reason="group_observed")
 
         binding = None
