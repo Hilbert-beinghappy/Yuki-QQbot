@@ -370,6 +370,7 @@ async def test_admin_failure_can_continue_correct_and_reuse_original_effect(
             turns=chat._turn_coordinator,
             router=env.router,
             config=chat._runtime_config,
+            settings=harness.settings,
             generate_self=chat.generate_self_initiative,
             generate_wakeup=resumed,
         )
@@ -385,10 +386,10 @@ async def test_admin_failure_can_continue_correct_and_reuse_original_effect(
             assert writes[0]["ok"], writes[0]
         else:
             assert writes[0]["error_code"] == (
-                "permission_denied" if granted else "capability_not_allowed"
+                NO_LONGER_AUTHORIZED if granted else "capability_not_allowed"
             ), writes[0]
         assert bindings == [granted]
-        assert captured[0].actor_is_superuser is source["actor_is_superuser"]
+        assert captured[0].actor_is_superuser is superuser
         assert captured[0].allow_admin_actions is source["allow_admin_actions"]
         assert (await chat._runtime_config.get_effective("agent.max_tool_calls")).value == (
             17 if granted and superuser else 32
