@@ -1613,3 +1613,16 @@ async def test_isolated_receipt_windows_do_not_starve_later_initiatives(database
         )
         assert isolated == 100
         assert await reader.get(InitiativeReflectionCursorModel, old_id) is None
+
+
+async def test_silent_receipt_window_uses_character_budget_without_eight_row_cap(database):
+    _mutations, _facts, event, run_id = await seed(database)
+    excerpts = tuple(f"真实工具结果 {i}" for i in range(13))
+    for index, excerpt in enumerate(excerpts):
+        await record(database, event, run_id, f"many-{index}", result_excerpt=excerpt)
+    await finish(database, run_id)
+    repository = SelfReflectionRepository(database)
+    (batch,) = await claim(database, "all-small-receipts", max_characters=10000)
+    assert tuple(item.result_excerpt for item in await repository.tool_receipts(batch)) == excerpts
+    await repository.complete(batch, proposals=0, committed=0)
+    assert await claim(database, "all-small-receipts-finished", max_characters=10000) == ()

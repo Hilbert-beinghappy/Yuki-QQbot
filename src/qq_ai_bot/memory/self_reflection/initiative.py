@@ -168,17 +168,18 @@ async def claim_initiative(
             else:
                 query = query.where(MemoryToolReceiptModel.expires_at > now)
             query = query.order_by(MemoryToolReceiptModel.id)
-            if window is None:
-                query = query.limit(8)
-            rows = list(await session.scalars(query))
+            rows = await session.stream_scalars(query)
             selected: list[MemoryToolReceiptModel] = []
             characters = 0
-            for receipt in rows:
-                size = len(receipt.result_excerpt)
-                if window is None and selected and characters + size > max_characters:
-                    break
-                selected.append(receipt)
-                characters += size
+            try:
+                async for receipt in rows:
+                    size = len(receipt.result_excerpt)
+                    if window is None and selected and characters + size > max_characters:
+                        break
+                    selected.append(receipt)
+                    characters += size
+            finally:
+                await rows.close()
             if not selected:
                 continue
             fingerprint = hashlib.sha256(
