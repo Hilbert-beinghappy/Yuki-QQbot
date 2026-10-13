@@ -1,6 +1,6 @@
 # Yuki 3.9.0 配置与升级草案（未发布）
 
-<!-- release-baseline: version=3.9.0 schema=0114 -->
+<!-- release-baseline: version=3.9.0 schema=0115 -->
 
 本指南随当前开发源码更新；PR列表的历史截止基线为 main `0ddd7eee`（2026-10-09）。**3.9.0 尚未正式发布**，正式下载仍为 [3.8.4 Release](https://github.com/YuanYeYouTao/Yuki/releases/tag/v3.8.4)。源码版本号不代表已有 `:3.9.0` 正式镜像；历史109个已合并PR、后续修改及各自交付状态见[发布说明](releases/v3.9.0.md)。
 
@@ -12,7 +12,7 @@
 
 | 项目 | 3.8.4 正式包 | 当前 3.9.0 源码 |
 | --- | --- | --- |
-| 数据库 head | `0072` | 当前开发单一 head `0114` |
+| 数据库 head | `0072` | 当前开发单一 head `0115` |
 | Plugin API | 3.0 | 3.5，需适配并重新批准 |
 | 管理 WebUI | 不包含 | 默认关闭，共用控制面 |
 | MCP / Genie 输出 | 旧实现 / 可选组件 | 专属入口、配置和服务退役；共享回执、媒体与 ASR 保留 |
@@ -45,6 +45,7 @@
 | `0112` | 一个 Conversation 共用公共原事件历史；清退旧 projections/selections，删除公共个人范围、自动观察来源与请求合同列，并退役个人/SELF时区表；原 Work、版本/hash、ContextObservation/DAG、协议和 artifact 引用保全 |
 | `0113` | 删除 generation/reset 时清除原 ContextObservation/DAG 的旧触发器；清公共历史和取消旧 Work 继续沿既有语义，原来源、私有回执与文件不删 |
 | `0114` | 退役管理员聊天工具；旧群自主参与停用标记转入 `conversation.autonomous_enabled=false` 群配置并重置旧列，原覆写历史、审计和工具回执保留 |
+| `0115` | 删除 SELF state 未使用的回复/工具/价值信号与旧策略诊断列；原 owner、水位、run、请求和 mutation 回执保留 |
 
 历史主线的 `0096` 曾删除 MCP 派生表；当前同号保存调用索引，`0098` 按实际形状汇合。编号相同不能证明 schema 相同。其他旧实验数据库需先核生产者与完整形状，不能强行 stamp 或重建数据绕过冲突。
 
@@ -107,7 +108,7 @@ token、用户配置与插件，不能默认删除；Git/镜像 ignore 暂时保
 1. 固定目标提交和镜像，核随包 head、配置与插件版本；正式发行时再核 `v3.9.0` 资产。
 2. 在独立数据库和文件副本演练迁移及启动，核原身份、Work、预算、协议和发送回执；不启动第二个主动 Bot 写生产库或向 QQ 发消息。
 3. 停止旧 Bot 及需停写的相关 Manager，保存一致数据库、配置、插件、媒体、工具正文、协议对象和持久环境回执。QQ 网关可保持运行。
-4. 完成配置、授权和语音保全后，沿原 Compose 参数用目标镜像执行 `qq-ai-bot-cli init-db`，核 head `0114`。来自正式 3.8.3/3.8.4 的旧投递计划先在停写副本运行 `work import-legacy-deliveries --dry-run` 再导入；原计划、未知效果和预算保留。
+4. 完成配置、授权和语音保全后，沿原 Compose 参数用目标镜像执行 `qq-ai-bot-cli init-db`，核 head `0115`。来自正式 3.8.3/3.8.4 的旧投递计划先在停写副本运行 `work import-legacy-deliveries --dry-run` 再导入；原计划、未知效果和预算保留。
 5. 启动一个 Bot，核真实 revision、数据库、QQ 连接、工具合同、模型路由与 worker。启动健康、真实 API、自然聊天和长任务交付分别验收。
 
 ## 回退与已知问题
