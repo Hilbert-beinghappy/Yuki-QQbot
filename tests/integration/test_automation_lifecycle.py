@@ -26,7 +26,7 @@ from qq_ai_bot.identity.db_models import SpaceBindingModel
 from qq_ai_bot.persistence.models import AutomationModel, AutomationRunModel, AutomationVersionModel
 from qq_ai_bot.runtime.origin import TurnOrigin
 from qq_ai_bot.runtime.work_activation import bind_work_activation
-from qq_ai_bot.runtime.work_budget_schema import automation_budgets, budgets
+from qq_ai_bot.runtime.work_budget_schema import budgets
 from qq_ai_bot.runtime.work_control import WorkControl
 from qq_ai_bot.runtime.work_recovery_schema import invocations
 from qq_ai_bot.runtime.work_scheduler import WorkScheduler
@@ -524,7 +524,6 @@ async def test_waiting_occurrence_keeps_original_version_and_current_work_recove
     assert first.status is RunStatus.RUNNING
     async with database.sessions() as reader:
         original = dict((await reader.execute(select(work))).mappings().one())
-        assert not list(await reader.execute(select(automation_budgets)))
     source = json.loads(original["source_json"])
     assert source["automation_run_id"] == first.id
     assert "step_id" not in source and source["script_hash"] == case.row.script_hash
