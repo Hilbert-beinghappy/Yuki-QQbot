@@ -187,7 +187,7 @@ class PromptProjectionRepository:
         if rebuild_reason is not None and rebuild_reason not in REBUILD_REASONS:
             raise ValueError("invalid projection rebuild reason")
         items = deepcopy(items)
-        if len(items) > 262_144 or not all(isinstance(item, dict) for item in items):
+        if not all(isinstance(item, dict) for item in items):
             raise ProjectionCapacityError("projection item limit exceeded")
         payload = json.dumps(items, ensure_ascii=False, separators=(",", ":"), allow_nan=False)
         size = len(payload.encode("utf-8"))
