@@ -207,11 +207,7 @@ class ConversationRollupService:
             else ""
         )
         return ChatRequest(
-            provider_session_id=(
-                f"yuki:{candidate.conversation_id}:g{candidate.generation}:main"
-                if candidate.conversation_id is not None
-                else None
-            ),
+            provider_session_id=f"yuki:{candidate.conversation_id}:g{candidate.generation}:main",
             messages=(
                 ChatMessage(
                     role="system",
@@ -263,23 +259,14 @@ class ConversationRollupService:
             output_tokens=policy.max_output_tokens
         ):
             raise ValueError("rollup_source_exceeds_input_capacity")
-        if candidate.conversation_id is None:
-            response = await self._models.execute(
-                ModelTask.CONVERSATION_COMPACTION,
-                request,
-                priority=ModelExecutionPriority.REQUIRED
-                if required
-                else ModelExecutionPriority.MAINTENANCE,
-            )
-        else:
-            response = await self._models.execute(
-                ModelTask.CONVERSATION_COMPACTION,
-                request,
-                priority=ModelExecutionPriority.REQUIRED
-                if required
-                else ModelExecutionPriority.MAINTENANCE,
-                canonical_conversation_id=candidate.conversation_id,
-            )
+        response = await self._models.execute(
+            ModelTask.CONVERSATION_COMPACTION,
+            request,
+            priority=ModelExecutionPriority.REQUIRED
+            if required
+            else ModelExecutionPriority.MAINTENANCE,
+            canonical_conversation_id=candidate.conversation_id,
+        )
         if response.tool_calls:
             raise ValueError("rollup_summary_unexpected_tool_calls")
         text = response.content.strip()
