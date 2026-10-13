@@ -896,7 +896,7 @@ class MessageProcessor:
                 and group_policy.autonomous_enabled
             ):
                 if self._autonomous is not None:
-                    self._autonomous.observe(message, profile, sender, turn_token)
+                    self._autonomous.observe(message)
             return ProcessResult(False, reason="group_observed")
 
         binding = None
