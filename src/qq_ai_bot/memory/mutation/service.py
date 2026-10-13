@@ -2795,21 +2795,8 @@ class MemoryMutationService:
         )
 
     async def _schedule_embedding_after_commit(self, fact_id: int | None) -> None:
-        if fact_id is None:
-            return
-        try:
-            fact = await self._facts.get_fact(fact_id)
-            if fact is None or fact.status is not MemoryStatus.ACTIVE:
-                return
+        if fact_id is not None:
             await self._facts.schedule_embedding(fact_id)
-        except asyncio.CancelledError:
-            raise
-        except Exception as exc:
-            logger.warning(
-                "memory_mutation_embedding_schedule_failed fact_id=%d category=%s",
-                fact_id,
-                type(exc).__name__,
-            )
 
     @staticmethod
     def _rejected(

@@ -379,7 +379,7 @@ async def test_foreground_rollup_can_finish_more_than_five_batches(database) -> 
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("failure", ["policy", "model_failure"])
+@pytest.mark.parametrize("failure", ["policy", "empty_policy", "unknown_policy", "model_failure"])
 async def test_worker_retains_policy_and_model_failure_overlays(database, failure):
     from sqlalchemy import select
 
@@ -387,15 +387,21 @@ async def test_worker_retains_policy_and_model_failure_overlays(database, failur
         CanonicalConversationRollupEmergencyOverlayModel,
         CanonicalConversationRollupModel,
     )
+    from qq_ai_bot.conversation.rollup.origins import parse_rollup_llm_origins
     from qq_ai_bot.conversation.rollup.repository import ConversationRollupRepository
     from qq_ai_bot.conversation.rollup.worker import ConversationRollupWorker
 
     policy = RollupPolicyConfig(
         context_token_budget=512,
         batch_max_events=1,
-        llm_origins=frozenset({"scheduled_automation"})
-        if failure == "policy"
-        else frozenset({"user_message"}),
+        llm_origins=parse_rollup_llm_origins(
+            {
+                "policy": "scheduled_automation",
+                "empty_policy": "",
+                "unknown_policy": "future_origin",
+                "model_failure": "user_message",
+            }[failure]
+        ),
     )
     scope = await _seed_private(
         database, peer="1015", count=20, policy=policy, content="source event " * 80
@@ -424,10 +430,10 @@ async def test_worker_retains_policy_and_model_failure_overlays(database, failur
     state, effective, job = await repository.status(scope)
     assert effective.summary_kind.value == "emergency" and state.uncovered_event_count == 20
     assert job["last_error_category"] == (
-        "llm_origin_ineligible" if failure == "policy" else "RuntimeError"
+        "RuntimeError" if failure == "model_failure" else "llm_origin_ineligible"
     )
     assert job["status"] == "pending"
-    assert len(model.sources) == (0 if failure == "policy" else 1)
+    assert len(model.sources) == (1 if failure == "model_failure" else 0)
     async with database.sessions() as reader:
         assert await reader.scalar(select(CanonicalConversationRollupModel)) is None
         overlay = await reader.scalar(select(CanonicalConversationRollupEmergencyOverlayModel))

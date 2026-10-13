@@ -151,7 +151,6 @@ class ApplicationContainer:
             facts=self.memories,
             retriever=self.memory_context.retriever,
         )
-        self.agent_actions = persistence.agent_actions
         self.web_sources = persistence.web_sources
         self.media_analyses = persistence.media_analyses
         self.emoji_descriptions = persistence.emoji_descriptions
@@ -353,7 +352,6 @@ class ApplicationContainer:
             chat_admission_enabled=self.settings.runtime_work_enabled,
         )
         self.database.subagents_enabled = self.settings.subagents_enabled
-        self.database.subagent_concurrency = self.settings.subagent_concurrency
         children = SubagentRepository(works)
         self.subagent_execution = SubagentExecution(
             works,

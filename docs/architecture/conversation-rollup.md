@@ -50,6 +50,8 @@ checkpoint 与 raw tail 不能重叠或留洞。当前触发事件只在 current
 后台模型返回版本化 JSON 摘要，不开放工具。旧摘要、新事件、外部事件和 visual observation 都放在明确的
 不可信 input envelope。模型 timeout、空响应或质量失败可以写 emergency overlay；overlay
 不能覆盖或伪装语义 checkpoint。
+`CONVERSATION_ROLLUP_LLM_ORIGINS` 默认是 `user_message`；显式空值不允许任何来源调用
+摘要模型。配置值按原样解析为集合，未知来源不匹配当前事件，也不会隐式启用真人消息来源。
 
 ## 活动窗口与压缩容量
 

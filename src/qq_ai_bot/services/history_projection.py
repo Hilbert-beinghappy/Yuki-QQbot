@@ -14,7 +14,6 @@ from qq_ai_bot.conversation.projections import (
     ProjectionSnapshot,
     PromptProjectionRepository,
 )
-from qq_ai_bot.domain.messages import ChatMessage
 from qq_ai_bot.event_prompt import ChatEventPromptRenderer
 from qq_ai_bot.execution_trace.phases import collect_phase_metrics
 from qq_ai_bot.persistence.event_repository import EventLedgerRepository
@@ -74,9 +73,8 @@ async def prepare_history(
     *,
     view_key: str,
     context_key: str,
-    history_fits: Callable[[tuple[ChatMessage, ...]], bool],
-    context_fits: Callable[[AssembledContext], bool] | None = None,
-    context_hard_fits: Callable[[AssembledContext], bool] | None = None,
+    context_fits: Callable[[AssembledContext], bool],
+    context_hard_fits: Callable[[AssembledContext], bool],
 ) -> PreparedHistory:
     """Append canonical public history in the Conversation's existing epoch."""
     if context.read_version is None or context.read_version.conversation_id is None:
@@ -200,16 +198,8 @@ async def prepare_history(
     selected_context = replace(selected_context, history_messages=extended.messages())
     collect_phase_metrics(candidate_count=1)
     extended_messages = extended.messages()
-    fits = (
-        context_fits(replace(selected_context, history_messages=extended_messages))
-        if context_fits is not None
-        else history_fits(extended_messages)
-    )
-    hard_fits = (
-        context_hard_fits(replace(selected_context, history_messages=extended_messages))
-        if context_hard_fits is not None
-        else fits
-    )
+    fits = context_fits(replace(selected_context, history_messages=extended_messages))
+    hard_fits = context_hard_fits(replace(selected_context, history_messages=extended_messages))
     ready_rollup = (
         previous is not None
         and context.prompt_effective_coverage > previous.selected_summary_coverage
@@ -234,15 +224,9 @@ async def prepare_history(
             extended = fresh
             selected_context = replace(context, history_messages=fresh.messages())
             extended_messages = extended.messages()
-            fits = (
-                context_fits(replace(selected_context, history_messages=extended_messages))
-                if context_fits is not None
-                else history_fits(extended_messages)
-            )
-            hard_fits = (
-                context_hard_fits(replace(selected_context, history_messages=extended_messages))
-                if context_hard_fits is not None
-                else fits
+            fits = context_fits(replace(selected_context, history_messages=extended_messages))
+            hard_fits = context_hard_fits(
+                replace(selected_context, history_messages=extended_messages)
             )
     # The original assembler has already selected a bounded history. Its rollup
     # is compiled separately, before these event fragments, in every epoch.

@@ -161,7 +161,7 @@ async def test_full_prepare_equivalence_and_only_missing_body_reads(database, mo
     frozen = FrozenFragments.load([]).extend_history(old_parts, context.history_event_fragments)
     repository = PromptProjectionRepository(database)
     version = context.read_version
-    saved = await repository.commit(
+    publication = await repository.prepare_commit(
         view_key="a" * 64,
         context_key="b" * 64,
         conversation_id=version.conversation_id,
@@ -177,6 +177,8 @@ async def test_full_prepare_equivalence_and_only_missing_body_reads(database, mo
         selected_summary_text="selected summary" if case == "summary" else "",
         selected_summary_coverage=5 if case == "summary" else 0,
     )
+    async with database.immediate_session() as writer:
+        saved = await publication(writer)
     if case == "coverage":
         suffix = context.history_fragments[400:]
         context = replace(
@@ -191,7 +193,8 @@ async def test_full_prepare_equivalence_and_only_missing_body_reads(database, mo
     args = dict(
         view_key="a" * 64,
         context_key="b" * 64,
-        history_fits=lambda _: True,
+        context_fits=lambda _: True,
+        context_hard_fits=lambda _: True,
     )
     with monkeypatch.context() as patch:
         patch.setattr(EventLedgerRepository, "read_scope_missing_history", legacy_missing)
@@ -361,7 +364,7 @@ async def test_history_preparation_version_change_is_source_error(database, monk
     frozen = FrozenFragments.load([]).extend_history(
         context.history_fragments, context.history_event_fragments
     )
-    await repository.commit(
+    publication = await repository.prepare_commit(
         view_key="a" * 64,
         context_key="b" * 64,
         conversation_id=version.conversation_id,
@@ -373,6 +376,8 @@ async def test_history_preparation_version_change_is_source_error(database, monk
         selected_summary_text="",
         selected_summary_coverage=0,
     )
+    async with database.immediate_session() as writer:
+        await publication(writer)
     original = EventLedgerRepository.read_scope_missing_history
 
     async def changed(*args, **kwargs):
@@ -391,7 +396,8 @@ async def test_history_preparation_version_change_is_source_error(database, monk
             context,
             view_key="a" * 64,
             context_key="b" * 64,
-            history_fits=lambda _: True,
+            context_fits=lambda _: True,
+            context_hard_fits=lambda _: True,
         )
 
 
@@ -490,7 +496,7 @@ async def test_publication_still_rejects_change_after_missing_history_prepare(da
     frozen = FrozenFragments.load([]).extend_history(
         context.history_fragments, context.history_event_fragments
     )
-    await repository.commit(
+    publication = await repository.prepare_commit(
         view_key="a" * 64,
         context_key="b" * 64,
         conversation_id=version.conversation_id,
@@ -502,12 +508,15 @@ async def test_publication_still_rejects_change_after_missing_history_prepare(da
         selected_summary_text="",
         selected_summary_coverage=0,
     )
+    async with database.immediate_session() as writer:
+        await publication(writer)
     prepared = await prepare_history(
         repository,
         context,
         view_key="a" * 64,
         context_key="b" * 64,
-        history_fits=lambda _: True,
+        context_fits=lambda _: True,
+        context_hard_fits=lambda _: True,
     )
     publication = await prepared.prepare_commit(
         prepared.fragments.append_current(context.current_event_id, context.current_message)
