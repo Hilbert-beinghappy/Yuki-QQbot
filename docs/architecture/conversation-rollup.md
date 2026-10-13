@@ -147,7 +147,8 @@ Rollup 模型调用期间不持有 SQLite 事务；候选、计数差额和 prot
 Work compaction 使用原任务 Profile 的超时，没有独立 Rollup 超时覆盖；需在该 Profile
 明确配置足够的时间，不另建摘要路由。更大的输出预算仍会占用联合窗口中的预留输出容量。
 
-前台超过容量时，所有批次共用一次有界等待期限。优先等待同 Conversation/generation 的现有
+前台超过容量时，按真实请求容量继续压缩，所有批次共用一次有界等待期限，不另设批次数上限。
+优先等待同 Conversation/generation 的现有
 claim；没有活动 claim 才执行 required 语义压缩并保持 heartbeat。失败、已有失败退避或超时
 才写应急 overlay。超时先取消本地请求，并最多等 5 秒确认原 worker 持久提交；无法确认释放
 时失败关闭。普通聊天不抢占语义 Rollup 租约；维护请求仍共享全局模型容量。

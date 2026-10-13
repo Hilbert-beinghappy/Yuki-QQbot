@@ -17,11 +17,6 @@ class RollupKind(StrEnum):
     EMERGENCY = "emergency"
 
 
-class RollupJobStatus(StrEnum):
-    PENDING = "pending"
-    PROCESSING = "processing"
-
-
 class EmergencyOverlayDisposition(StrEnum):
     """How to release the job after an overlay write. No schema change."""
 
@@ -108,8 +103,6 @@ class RollupCandidate:
     source_rollup_revision: int
     previous_summary: str
     events: tuple[EventRecord, ...]
-    event_count: int
-    projection_characters: int
     fingerprint: str
     policy: RollupPolicyConfig | None = None
 
