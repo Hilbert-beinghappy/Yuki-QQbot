@@ -271,16 +271,15 @@ async def test_recovery_origin_still_checks_source_authority(database, tmp_path,
     commit.assert_not_awaited()
 
 
-async def test_declared_public_suffix_must_exist_in_actual_dispatch(database, tmp_path):
+async def test_projection_rejects_changed_actual_dispatch(database, tmp_path):
     _, composition = await _pending_composition(database, tmp_path)
     async with database.sessions() as reader:
         before = (await reader.scalars(select(PromptProjectionModel))).one()
         original = (before.epoch_id, before.revision, before.payload_json)
     sequence = TranscriptRequest(
-        messages=composition.messages,
+        messages=(*composition.messages[:-1], ChatMessage(role="user", content="changed dispatch")),
         continuation=None,
         items=(),
-        public_initial_suffix=(ChatMessage(role="user", content="not actually dispatched"),),
     )
     with validating_request(sequence):
         await composition.commit_projection()
@@ -288,7 +287,7 @@ async def test_declared_public_suffix_must_exist_in_actual_dispatch(database, tm
         saved = (await session.scalars(select(PromptProjectionModel))).one()
         assert saved.invalidated_reason is None
         assert (saved.epoch_id, saved.revision, saved.payload_json) == original
-        assert "not actually dispatched" not in saved.payload_json
+        assert "changed dispatch" not in saved.payload_json
 
 
 @pytest.mark.parametrize("boundary", ["plugin_permission", "deleted", "profile", "contract"])

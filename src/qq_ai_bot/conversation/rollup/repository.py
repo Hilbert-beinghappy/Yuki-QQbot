@@ -58,7 +58,6 @@ from qq_ai_bot.conversation.rollup.prompt_accounting import (
     durable_uncovered_characters,
     prompt_accounting_characters,
     prompt_visible_event_count,
-    source_accounting_characters,
 )
 from qq_ai_bot.conversation.rollup.renderer import (
     serialize_compaction_source_events,
@@ -1327,10 +1326,6 @@ class ConversationRollupRepository:
         batch = take_batch(all_events, self.config)
         if not batch:
             return None
-        characters = source_accounting_characters(
-            batch,
-            timezone=self.config.timezone,
-        )
         fingerprint = source_fingerprint(
             conversation_id=claim.conversation_id,
             generation=claim.generation,
@@ -1346,8 +1341,6 @@ class ConversationRollupRepository:
             source_rollup_revision=revision,
             previous_summary=previous,
             events=batch,
-            event_count=len(batch),
-            projection_characters=characters,
             fingerprint=fingerprint,
         )
 

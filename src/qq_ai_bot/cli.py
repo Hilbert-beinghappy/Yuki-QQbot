@@ -265,7 +265,6 @@ def _prompt_diagnostic(settings: Settings, scenario: str) -> dict[str, object]:
             priority=100,
             stability=PromptStability.STATIC,
             content=settings.system_prompt,
-            required=True,
         ),
         PromptContribution(
             id="core.contract",
@@ -274,7 +273,6 @@ def _prompt_diagnostic(settings: Settings, scenario: str) -> dict[str, object]:
             priority=90,
             stability=PromptStability.STATIC,
             content=CORE_CONTRACT,
-            required=True,
         ),
     ]
     contributions.extend(
@@ -284,7 +282,6 @@ def _prompt_diagnostic(settings: Settings, scenario: str) -> dict[str, object]:
             trust=PromptTrust.TRUSTED,
             priority=50,
             payload=value,
-            required=key in {"time", "scene"},
         )
         for key, value in dynamic_payloads.items()
     )
