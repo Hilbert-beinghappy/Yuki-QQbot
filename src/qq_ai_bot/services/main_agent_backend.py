@@ -453,38 +453,10 @@ class MainAgentBackend(AgentToolBackend):
                     binding_started = True
                     if self.counts_toward_limit(name, runtime):
                         self.failed_tool_calls += 1
-                    from qq_ai_bot.model_runtime.dispatch_guard import model_dispatch_guard
-
-                    async def admit_auxiliary_request() -> None:
-                        if runtime.before_model_request is not None:
-                            await runtime.before_model_request()
-                        assert runtime.auxiliary_requests is not None
-                        if (
-                            runtime.max_model_requests is not None
-                            and invocation.identity.request_sequence + runtime.auxiliary_requests[0]
-                            >= runtime.max_model_requests
-                        ):
-                            raise WorkBudgetExceeded("agent_segment_budget_exhausted")
-                        assert runtime.admit_model_request is not None
-                        runtime.auxiliary_requests[0] += 1
-                        try:
-                            await runtime.admit_model_request()
-                        except BaseException:
-                            runtime.auxiliary_requests[0] -= 1
-                            raise
-                        self.failed_model_requests += 1
-
-                    with (
-                        model_dispatch_guard(admit_auxiliary_request)
-                        if work is None and runtime.admit_model_request is not None
-                        else nullcontext()
-                    ):
-                        return await binding.invoke(
-                            {str(key): value for key, value in parsed.items()},
-                            ToolInvocationContext(
-                                runtime=execution_runtime, call_id=receipt_call_id
-                            ),
-                        )
+                    return await binding.invoke(
+                        {str(key): value for key, value in parsed.items()},
+                        ToolInvocationContext(runtime=execution_runtime, call_id=receipt_call_id),
+                    )
 
                 outcome = await self._service.run_effect(
                     None if name == "send_message" else execution_runtime.turn_snapshot,
