@@ -207,7 +207,7 @@ def build_model_profiles(
         "default_temperature = 0.7",
         "default_max_output_tokens = 8192",
         'thinking_mode = "enabled"',
-        'reasoning_effort = "low"',
+        'reasoning_effort = "medium"',
         'reasoning_effort_env = "LLM_REASONING_EFFORT"',
         'structured_output_mode = "function_tool"',
         f"capabilities = {json.dumps(main_capabilities)}",
@@ -228,7 +228,7 @@ def build_model_profiles(
                 "default_temperature = 0.1",
                 "default_max_output_tokens = 4096",
                 'thinking_mode = "enabled"',
-                'reasoning_effort = "low"',
+                'reasoning_effort = "medium"',
                 'structured_output_mode = "function_tool"',
                 'capabilities = ["structured_output", "reasoning"]',
             )
