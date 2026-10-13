@@ -11,6 +11,8 @@ from dataclasses import dataclass, replace
 from functools import partial
 from typing import Any, Protocol, TypeVar, cast
 
+from sqlalchemy.ext.asyncio import AsyncSession
+
 from qq_ai_bot.admin.config_service import RuntimeConfigService
 from qq_ai_bot.admin.models import RuntimeConfigSnapshot
 from qq_ai_bot.automation.models import TurnOrigin
@@ -318,7 +320,6 @@ class ChatService:
             self._context_assembler = ContextAssembler(
                 settings=settings,
                 ledger=self._ledger,
-                people=self._people,
                 time_service=self._time,
                 rollup_repository=rollup_repository,
                 rollup_service=rollup_service,
@@ -701,19 +702,34 @@ class ChatService:
         event_id: int,
         *,
         admission: PreparedOrdinaryAdmission | None = None,
+        prepare_source: Callable[[], Awaitable[PreparedOrdinaryAdmission | None]] | None = None,
     ) -> int | None:
         from qq_ai_bot.runtime.work_wait import WorkWaitRepository
 
         explicit_reply = await WorkWaitRepository(self._work_repository).match_user_reply(event_id)
         if explicit_reply is not None:
             return explicit_reply
+
+        async def prepare() -> bool:
+            nonlocal admission
+            assert prepare_source is not None
+            admission = await prepare_source()
+            return admission is not None
+
+        async def publish(session: AsyncSession, input_id: int) -> None:
+            assert admission is not None
+            await OrdinaryAdmissionRepository(self._ledger._database).publisher(admission)(
+                session, input_id
+            )
+
         matched = await WorkWaitRepository(self._work_repository).match_event(
             event_id=event_id,
             kind="conversation",
-            on_delivery=OrdinaryAdmissionRepository(self._ledger._database).publisher(admission)
-            if admission
-            else None,
+            on_delivery=publish if admission else None,
+            prepare_source=prepare if prepare_source is not None else None,
         )
+        if prepare_source is not None and admission is None:
+            return None
         if matched is not None and matched > 0:
             return matched
         control = self.runtime.bindings.get(conversation_key)
@@ -1377,11 +1393,7 @@ class ChatService:
         current_time = (
             self._time.current_in_timezone(runtime.prepared_timezone)
             if runtime.prepared_timezone is not None
-            else (
-                await self._time.current(runtime.inbound.sender.user_id)
-                if runtime.inbound is not None
-                else self._time.current_default()
-            )
+            else self._time.current_default()
         )
         backend = MainAgentBackend(self, runtime)
         active_control = current_work_control.get()

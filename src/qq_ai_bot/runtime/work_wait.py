@@ -427,6 +427,7 @@ class WorkWaitRepository:
         kind: str,
         session: AsyncSession | None = None,
         on_delivery: Callable[[AsyncSession, int], Awaitable[None]] | None = None,
+        prepare_source: Callable[[], Awaitable[bool]] | None = None,
     ) -> int | None:
         if kind not in {"conversation", "plugin_event"}:
             raise ValueError("invalid_wait_event_kind")
@@ -435,15 +436,27 @@ class WorkWaitRepository:
                 event = await observer.get(ChatEventModel, event_id)
                 if event is None or event.canonical_conversation_id is None:
                     return None
-                active = await observer.scalar(
-                    select(waits.c.id)
-                    .where(
-                        waits.c.conversation_id == event.canonical_conversation_id,
-                        waits.c.status == "active",
+                active = list(
+                    await observer.scalars(
+                        select(waits.c.conditions_json).where(
+                            waits.c.conversation_id == event.canonical_conversation_id,
+                            waits.c.status == "active",
+                        )
                     )
-                    .limit(1)
                 )
-                if active is None:
+                if not active:
+                    return None
+            # Prepare media outside the writer, only for an actual wait source.
+            # The writer still rechecks the original wait and event before publishing.
+            if prepare_source is not None:
+                matching = any(
+                    condition["kind"] == kind
+                    and condition["matched"] is None
+                    and event_id > condition["after_event_id"]
+                    for encoded in active
+                    for condition in json.loads(encoded)
+                )
+                if not matching or not await prepare_source():
                     return None
             async with self.repository.database.immediate_session() as owned:
                 return await self.match_event(

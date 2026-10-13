@@ -363,13 +363,9 @@ async def test_optional_note_reporting_and_null_result_do_not_veto_completion(da
 
 
 @pytest.mark.asyncio
-async def test_optional_note_publication_conflict_keeps_saved_note_and_original_work(
-    database, tmp_path, monkeypatch
-):
+async def test_private_note_keeps_original_work_without_public_publication(database, tmp_path):
     from qq_ai_bot.conversation.observation_models import ContextObservationModel
-    from qq_ai_bot.conversation.observations import ContextObservationRepository
-    from qq_ai_bot.conversation.projections import ProjectionConflict
-    from qq_ai_bot.runtime.work_context_note import publish_pending_note
+    from qq_ai_bot.runtime.work_context_note import visible_context_note
     from qq_ai_bot.tool_results.access import access_from_source
 
     repository, lease, control = await _running_work(database, tmp_path)
@@ -381,14 +377,6 @@ async def test_optional_note_publication_conflict_keeps_saved_note_and_original_
             {**control.source, "read_scope": json.dumps({"memory": []})},
         )
     )
-    original_publish = ContextObservationRepository.publish_note
-    attempts = []
-
-    async def conflict(self, *args):
-        attempts.append(args)
-        raise ProjectionConflict("original note projection changed")
-
-    monkeypatch.setattr(ContextObservationRepository, "publish_note", conflict)
     result = json.loads(
         await control.execute(
             "task_control",
@@ -396,7 +384,7 @@ async def test_optional_note_publication_conflict_keeps_saved_note_and_original_
             "save-optional-note",
         )
     )
-    assert result["ok"] and len(attempts) == 1
+    assert result["ok"]
     saved = json.loads((await repository.get(identity))["checkpoint_json"])["context_note"]
     assert saved["payload"]["facts"][0]["text"] == "saved"
     async with database.sessions() as reader:
@@ -405,9 +393,7 @@ async def test_optional_note_publication_conflict_keeps_saved_note_and_original_
                 ContextObservationModel.source_work_id == identity
             )
         )
-    monkeypatch.setattr(ContextObservationRepository, "publish_note", original_publish)
-    published = await publish_pending_note(control)
-    assert published and await publish_pending_note(control) == published
+    assert await visible_context_note(control) == saved["payload"]
     assert json.loads((await repository.get(identity))["checkpoint_json"])["context_note"] == saved
     assert json.loads(
         await control.execute("task_control", {"action": "complete", "result": "done"}, "done")

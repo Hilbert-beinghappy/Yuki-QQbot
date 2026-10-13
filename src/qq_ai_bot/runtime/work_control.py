@@ -447,7 +447,16 @@ class WorkControl:
                             if scope and scope.generation == self.lease.generation
                             else []
                         )
-                    bodies = {event.id: event.content for event in events}
+                    from qq_ai_bot.domain.audio import transcript_context
+
+                    bodies = {
+                        event.id: (
+                            f"{event.content}\n{transcript_context(event.audio_transcript)}"
+                            if event.audio_transcript
+                            else event.content
+                        )
+                        for event in events
+                    }
                     signal["events"] = [
                         {"event_id": identity, "text": bodies.get(identity, "原事件正文不可读")}
                         for identity in ids
@@ -611,7 +620,7 @@ class WorkControl:
         call_key: str,
         prepared: tuple[dict[str, Any], tuple[str, ...], int, int] | None = None,
     ) -> None:
-        from qq_ai_bot.runtime.work_context_note import publish_pending_note, validate_note
+        from qq_ai_bot.runtime.work_context_note import validate_note
 
         if self.current is None:
             raise ValueError("no_active_work")
@@ -649,9 +658,6 @@ class WorkControl:
             self.current = await self.repository.patch_context_note(
                 self.lease, refreshed["id"], expected, note
             )
-        # Publication is independently retryable. Its failure does not erase a
-        # saved note or pretend the update/tool had no durable effect.
-        await publish_pending_note(self)
 
     async def _control(self, args: dict[str, Any], call_key: str) -> dict[str, Any]:
         action = args.get("action")
