@@ -95,7 +95,6 @@ class MainAgentTurnService:
         self._projections = (
             PromptProjectionRepository(
                 database,
-                reclaim=True,
             )
             if database is not None
             else None
@@ -237,9 +236,6 @@ class MainAgentTurnService:
                     estimated_request = deepcopy(request)
                 return estimated_tokens
 
-            def history_fits(history: tuple[ChatMessage, ...]) -> bool:
-                return context_hard_fits(replace(context, history_messages=history))
-
             def context_fits(candidate: AssembledContext) -> bool:
                 request = replace(
                     prepared_request,
@@ -259,7 +255,6 @@ class MainAgentTurnService:
                 context,
                 view_key=view_key,
                 context_key=_hash([version.conversation_id, version.generation]),
-                history_fits=history_fits,
                 context_fits=context_fits,
                 context_hard_fits=context_hard_fits,
             )
