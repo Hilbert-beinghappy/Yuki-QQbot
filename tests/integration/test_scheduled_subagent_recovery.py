@@ -552,7 +552,6 @@ async def test_actual_worker_tool_continues_after_nested_result_arrives(
     from qq_ai_bot.workspace.service import WorkspaceService
     from qq_ai_bot.workspace.store import WorkspaceStore
 
-    database.subagent_concurrency = 2
     source, _admissions, _binding = await self_source(database)
     repository = WorkRepository(database)
     workers = SubagentRepository(repository)

@@ -1,5 +1,6 @@
 """Completion summaries do not duplicate the original Work checkpoint."""
 
+import asyncio
 import json
 import time
 from types import SimpleNamespace
@@ -10,6 +11,7 @@ from sqlalchemy import select, update
 from tests.support.runtime_work_helpers import _persisted_tool_receipt
 from tests.support.subagents_helpers import stack
 
+from qq_ai_bot.runtime.subagent_scheduler import SubagentScheduler
 from qq_ai_bot.runtime.subagent_schema import children
 from qq_ai_bot.runtime.subagent_tools import execute_subagent, subagent_tools
 from qq_ai_bot.runtime.work_budget_schema import budgets
@@ -128,11 +130,14 @@ async def test_archive_rechecks_new_active_descendant_after_discovery(
     assert after["archived_at"] is None and after["result_json"] == original_receipt["result_json"]
     assert (await workers.related(identity, descendant))["archived_at"] is None
     async with database.sessions() as reader:
-        assert dict(
-            (await reader.execute(select(budgets).where(budgets.c.root_id == root["id"])))
-            .mappings()
-            .one()
-        ) == original_budget
+        assert (
+            dict(
+                (await reader.execute(select(budgets).where(budgets.c.root_id == root["id"])))
+                .mappings()
+                .one()
+            )
+            == original_budget
+        )
 
 
 async def test_large_note_completion_notifies_and_result_reads_original_checkpoint(
@@ -222,10 +227,7 @@ async def test_stale_child_owner_cannot_replace_completed_result(database, tmp_p
     await repo.release(parent.lease)
 
 
-async def test_children_queue_without_admission_quota_and_keep_execution_concurrency(
-    database, tmp_path
-):
-    database.subagent_concurrency = 1
+async def test_children_queue_without_admission_quota(database, tmp_path):
     database.subagents_enabled = True
     repo, workers, lease, parent, first = await stack(database, tmp_path)
     parent_control = SimpleNamespace(repository=repo, lease=lease, current=parent, source={})
@@ -261,7 +263,6 @@ async def test_children_queue_without_admission_quota_and_keep_execution_concurr
     await workers.message(lease, parent["id"], first, "detailed-message", text)
     pending = await repo.pending(first_lease, work_id=first)
     assert json.loads(json.loads(pending[0]["payload_json"])["text"])["text"] == text
-    assert await workers.acquire(identities[1]) is None
     assert (await repo.get(identities[1]))["state"] == "queued"
     await repo.release(first_lease)
     next_lease = await workers.acquire(identities[1])
@@ -270,11 +271,67 @@ async def test_children_queue_without_admission_quota_and_keep_execution_concurr
     await repo.release(lease)
 
 
-@pytest.mark.parametrize("repair_barrier", ["obsolete_generation", "execution_capacity"])
+async def test_scheduler_counts_execution_without_reconcile_lease(database, tmp_path):
+    repo, workers, parent_lease, parent, first = await stack(database, tmp_path)
+    second = await workers.start(parent_lease, parent["id"], "second", {"goal": "second"})
+    parked = await workers.start(parent_lease, parent["id"], "parked", {"goal": "parked"})
+    async with database.immediate_session() as session:
+        await session.execute(update(work).where(work.c.id == parked).values(state="waiting_user"))
+    reconcile = await workers.acquire(parked, reconcile=True)
+    assert reconcile is not None
+    started = asyncio.Queue()
+    release = asyncio.Event()
+
+    class Executor:
+        definitions = ()
+
+        async def prepare(self, *, admission_enabled):
+            pass
+
+        async def cancel_commands(self):
+            pass
+
+        async def run(self, identity):
+            lease = await workers.acquire(identity)
+            assert lease is not None
+            await started.put(identity)
+            try:
+                await release.wait()
+                await repo.accept_control(
+                    lease,
+                    identity,
+                    {
+                        "action": "complete",
+                        "call_key": identity,
+                        "result": "done",
+                    },
+                )
+                row = await repo.get(identity)
+                await repo.transition(lease, identity, row["revision"], "completed")
+            finally:
+                await repo.release(lease)
+
+    scheduler = SubagentScheduler(
+        repo, workers, Executor(), admission_enabled=True, max_concurrency=1
+    )
+    try:
+        await scheduler.start()
+        assert await asyncio.wait_for(started.get(), 3) == first
+        assert len(scheduler.running) == 1 and started.empty()
+        assert (await repo.get(second))["state"] == "queued"
+        release.set()
+        assert await asyncio.wait_for(started.get(), 3) == second
+        assert len(scheduler.running) == 1
+    finally:
+        await scheduler.close()
+        await repo.release(reconcile)
+        await repo.release(parent_lease)
+
+
+@pytest.mark.parametrize("repair_barrier", ["obsolete_generation", "active_worker"])
 async def test_verified_mutation_child_completes_without_extra_result_prose(
     database, tmp_path, repair_barrier
 ):
-    database.subagent_concurrency = 1
     repo, workers, parent_lease, parent, initial = await stack(database, tmp_path)
     obsolete = []
     if repair_barrier == "obsolete_generation":
@@ -349,7 +406,7 @@ async def test_verified_mutation_child_completes_without_extra_result_prose(
     original = await repo.get(identity)
     await repo.release(lease)
     active_lease = None
-    if repair_barrier == "execution_capacity":
+    if repair_barrier == "active_worker":
         unrelated = await repo.accept(
             parent_lease, source_key="unrelated-parent", source={}, goal="unrelated work"
         )
@@ -358,10 +415,6 @@ async def test_verified_mutation_child_completes_without_extra_result_prose(
         )
         active_lease = await workers.acquire(active)
         assert active_lease is not None
-        queued = await workers.start(
-            parent_lease, unrelated["id"], "queued-worker", {"goal": "unrelated queued work"}
-        )
-        assert await workers.acquire(queued) is None
     async with database.sessions() as reader:
         original_budget = dict(
             (await reader.execute(select(budgets).where(budgets.c.root_id == parent["id"])))
@@ -413,7 +466,6 @@ async def test_verified_mutation_child_completes_without_extra_result_prose(
     )
     if active_lease is not None:
         assert await repo.valid(active_lease)
-        assert await workers.acquire(queued) is None
         await repo.release(active_lease)
     await repo.release(parent_lease)
 

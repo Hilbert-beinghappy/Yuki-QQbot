@@ -30,7 +30,6 @@ class SubagentRepository:
     def __init__(self, repository: WorkRepository) -> None:
         self.repository = repository
         self.database = repository.database
-        self.max_concurrency = int(getattr(self.database, "subagent_concurrency", 1))
 
     async def start(self, lease: WorkLease, parent_id: str, key: str, brief: dict[str, Any]) -> str:
         if lease.work_id is not None and lease.work_id != parent_id:
@@ -122,12 +121,6 @@ class SubagentRepository:
                     )
                 )
                 return None
-            if not reconcile:
-                active = await session.scalar(
-                    select(func.count()).select_from(children).where(children.c.lease_until > now)
-                )
-                if int(active or 0) >= self.max_concurrency:
-                    return None
             claimed = (
                 (
                     await session.execute(
