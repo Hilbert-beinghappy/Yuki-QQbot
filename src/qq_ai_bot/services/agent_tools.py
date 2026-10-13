@@ -5,7 +5,6 @@ from __future__ import annotations
 import json
 import logging
 import re
-import time
 from collections.abc import Awaitable, Callable
 from contextlib import AbstractContextManager, nullcontext
 from contextvars import ContextVar
@@ -61,7 +60,6 @@ from qq_ai_bot.memory.targets import MemoryTargetResolver
 from qq_ai_bot.memory.tool_intent import effective_query_summary, parse_memory_tool_intent
 from qq_ai_bot.persistence.people_repository import PeopleRepository
 from qq_ai_bot.persistence.repositories import (
-    AgentActionRepository,
     EventLedgerRepository,
     WebSearchSourceRepository,
 )
@@ -401,7 +399,6 @@ class AgentToolService:
         memories: MemoryFactService,
         memory_context: MemoryContextService | None = None,
         memory_mutations: MemoryMutationService | None = None,
-        actions: AgentActionRepository,
         web_provider: WebSearchProvider | None = None,
         web_sources: WebSearchSourceRepository | None = None,
         runtime_config: RuntimeConfigService | None = None,
@@ -424,7 +421,6 @@ class AgentToolService:
             )
         self._memory_context = memory_context
         self._memory_mutations = memory_mutations
-        self._actions = actions
         self._web_provider = web_provider
         self._web_sources = web_sources
         self._runtime_config = runtime_config or RuntimeConfigService(
@@ -2396,24 +2392,7 @@ class AgentToolService:
             return self._result(
                 error="invalid_arguments", detail="action 必须是字符串且 params 必须是对象"
             )
-        started = time.perf_counter()
-        try:
-            result = await runtime.gateway.call_api(action, params)
-        except (OSError, RuntimeError) as exc:
-            await self._actions.record(
-                actor_user_id=runtime.actor_user_id,
-                action=action,
-                success=False,
-                duration_seconds=time.perf_counter() - started,
-                error_category=type(exc).__name__,
-            )
-            raise
-        await self._actions.record(
-            actor_user_id=runtime.actor_user_id,
-            action=action,
-            success=True,
-            duration_seconds=time.perf_counter() - started,
-        )
+        result = await runtime.gateway.call_api(action, params)
         await self._record_onebot_send(action, params, result, actor)
         return self._result(data={"action": action, "result": result})
 

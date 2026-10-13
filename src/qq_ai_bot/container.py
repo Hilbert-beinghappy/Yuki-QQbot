@@ -151,7 +151,6 @@ class ApplicationContainer:
             facts=self.memories,
             retriever=self.memory_context.retriever,
         )
-        self.agent_actions = persistence.agent_actions
         self.web_sources = persistence.web_sources
         self.media_analyses = persistence.media_analyses
         self.emoji_descriptions = persistence.emoji_descriptions
