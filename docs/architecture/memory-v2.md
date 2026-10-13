@@ -96,7 +96,7 @@ Control Plane 仍要求 capability。
   来源和目标归属，再升级为短写事务。SQLite WAL 快照是本次准备的完整依赖围栏；
   任何竞争提交都使旧快照的首次写入被拒绝，不能仅用 fact.updated_at 推断来源未改变。
   原生 SQLITE_BUSY（主码5，含517）仅在原操作整体回滚确认后，用新 session 重备同一计划，不设固定次数封口。
-  重备仅执行纯数据库单元，复用原 mutation/operation/request ID，不重跑模型或外部效果；提交后的 embedding 调度不在重试范围内。模型判断所引用的事实还须
+  重备仅执行纯数据库单元，复用原 mutation/operation/request ID，不重跑模型或外部效果；提交后的 embedding 调度不在重试范围内。Dream 模型判断所引用的事实还须
   在准备阶段比较原 fact signature 和 canonical target，拒绝已经改变的候选；请求目标与
   操作人的 canonical owner、原内部事件和 tool receipt／SELF 来源证明也必须与原计划一致。
   ORM flush属于该纯数据库单元；物理commit/rollback确认错误不能按BUSY授予重放资格。取消继续传播。

@@ -21,7 +21,6 @@ from qq_ai_bot.memory.claim_processor import (
 )
 from qq_ai_bot.memory.eligibility import MemoryEventEligibilityPolicy
 from qq_ai_bot.memory.enums import (
-    MemoryProcessingSource,
     MemoryRebuildCommitStatus,
     MemoryRebuildExpiredClaimPolicy,
     MemoryRebuildItemStatus,
@@ -777,13 +776,10 @@ class MemoryRebuildService:
                 processed += 1
                 continue
             try:
-                resolution = await self.processor.resolve(
+                resolution = self.processor.resolve(
                     validated,
                     MemoryProcessingContext(
-                        source=MemoryProcessingSource.REBUILD,
                         event=event,
-                        rebuild_run_id=run.public_id,
-                        proposal_id=proposal.id,
                         force_expired_invalidated=expired,
                     ),
                 )

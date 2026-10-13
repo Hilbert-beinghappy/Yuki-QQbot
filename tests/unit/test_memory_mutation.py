@@ -28,7 +28,6 @@ from qq_ai_bot.memory.enums import (
     MemoryConflictState,
     MemoryEvidenceRelation,
     MemoryKind,
-    MemoryProcessingSource,
     MemoryScopeType,
     MemorySourceType,
     MemoryStatus,
@@ -641,9 +640,7 @@ async def test_self_create_is_atomic_receipted_and_deduplicated(database: Databa
         content=group_event.content,
         evidence_quote=group_event.content,
     )
-    corrected = await _processor.process(
-        claim, MemoryProcessingContext(source=MemoryProcessingSource.LIVE, event=group_event)
-    )
+    corrected = await _processor.process(claim, MemoryProcessingContext(event=group_event))
     group_fact = await facts.get_fact(corrected.fact_id)
     group_evidence = (await facts.list_evidence(group_fact.id))[0]
     assert group_fact.scope_type is MemoryScopeType.GROUP and group_fact.group_id == "3001"
@@ -791,7 +788,7 @@ async def test_agent_tool_and_worker_share_one_claim_receipt(
     (job,) = await jobs.claim()
     worker_result = await service.mutate_validated_claim(
         validated,
-        MemoryProcessingContext(source=MemoryProcessingSource.LIVE, event=event),
+        MemoryProcessingContext(event=event),
         conversation_key="private:1001",
         job=job,
     )
