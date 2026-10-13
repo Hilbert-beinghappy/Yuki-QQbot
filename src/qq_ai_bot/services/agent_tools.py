@@ -66,7 +66,7 @@ from qq_ai_bot.persistence.repositories import (
     WebSearchSourceRepository,
 )
 from qq_ai_bot.runtime.errors import InvalidTurnContextError
-from qq_ai_bot.sandbox.environment_tools import EXECUTION_TOOLS, READ_TOOLS, SANDBOX_TOOLS
+from qq_ai_bot.sandbox.environment_tools import EXECUTION_TOOLS, SANDBOX_TOOLS
 from qq_ai_bot.services.context_boundary import ContextBoundaryReader
 from qq_ai_bot.services.evidence_state import evidence_state
 from qq_ai_bot.services.turn_coordinator import TurnToken
@@ -79,7 +79,7 @@ from qq_ai_bot.web.models import (
     WebSearchTimeRange,
     WebSearchTopic,
 )
-from qq_ai_bot.workspace.tools import WORKSPACE_READ_TOOLS, WORKSPACE_TOOLS
+from qq_ai_bot.workspace.tools import WORKSPACE_TOOLS
 
 _URL_IN_TEXT = re.compile(r"https?://[^\s<>'\"]+", re.IGNORECASE)
 _CQ_CODE = re.compile(r"\[CQ:([a-zA-Z0-9_-]+)(?:,[^\]]*)?\]", re.IGNORECASE)
@@ -166,10 +166,8 @@ class ToolRuntime:
     runtime_config: RuntimeConfigSnapshot | None = None
     origin: TurnOrigin = TurnOrigin.USER_MESSAGE
     tools_closed: bool = False
-    read_only: bool = False
     read_scope: ConversationScope | None = None
     read_target_id: str | None = None
-    history_limit: int | None = None
     turn_token: TurnToken | None = None
     turn_snapshot: ConversationTurnSnapshot | None = None
     visible_event_ids: frozenset[int] = frozenset()
@@ -271,12 +269,6 @@ class ToolRuntime:
     def effective_presence_id(self) -> str | None:
         return self.inbound.presence_id if self.inbound is not None else self.presence_id
 
-    @property
-    def image_present(self) -> bool:
-        return bool(
-            self.inbound is not None
-            and (self.inbound.attachments or self.inbound.reply_attachments)
-        )
 
     def require_actor(self) -> ToolActor:
         if self.inbound is not None:
@@ -864,7 +856,7 @@ class AgentToolService:
                     from qq_ai_bot.capabilities.invocation import current_invocation
 
                     invocation = current_invocation.get()
-                    if runtime.tools_closed or (runtime.read_only and name not in READ_TOOLS):
+                    if runtime.tools_closed:
                         return self._result(error="permission_denied", detail="本轮未授权沙箱操作")
                     if self.sandbox_client is None or invocation is None:
                         return self._result(error="sandbox_unavailable", detail="沙箱未连接")
@@ -919,9 +911,7 @@ class AgentToolService:
                 if name in WORKSPACE_TOOLS:
                     from qq_ai_bot.workspace.store import WorkspaceError
 
-                    if (
-                        runtime.read_only and name not in WORKSPACE_READ_TOOLS
-                    ) or runtime.tools_closed:
+                    if runtime.tools_closed:
                         return self._result(
                             error="permission_denied", detail="本轮未授权工作区操作"
                         )
@@ -1162,7 +1152,7 @@ class AgentToolService:
     async def _recent_history(self, runtime: ToolRuntime) -> ToolExecutionResult:
         rows = await self._ledger.list_scope_recent(
             runtime.conversation_scope(),
-            limit=min(runtime.history_limit or 20, self._settings.recent_history_tool_limit),
+            limit=self._settings.recent_history_tool_limit,
             message_only=True,
         )
         return self._result(
@@ -2399,7 +2389,6 @@ class AgentToolService:
             outcome,
             result_count,
         )
-        self._memory_context.metrics.record_read_outcome(outcome)
 
     async def _call_onebot(
         self, arguments: dict[str, Any], runtime: ToolRuntime

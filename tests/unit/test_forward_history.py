@@ -209,9 +209,7 @@ async def test_delegated_same_owner_reads_event_before_target_rewriting(database
         database, tmp_path, [{"type": "forward", "data": {"id": "outer"}}]
     )
     env.bot.call_api = AsyncMock(return_value=["delegated"])
-    allowed = replace(
-        runtime, read_target_id=env.space, read_scope=runtime.inbound.scope(), history_limit=1
-    )
+    allowed = replace(runtime, read_target_id=env.space, read_scope=runtime.inbound.scope())
     assert (
         await invoke(
             env, allowed, {"event_id": event_id, "kind": "person", "target_id": env.person}
