@@ -860,9 +860,6 @@ async def test_runner_resumes_gemini_work_on_deepseek_without_old_send_or_native
         reads = 0
 
         class Backend(StubAgentBackend):
-            def definitions(self, runtime, **kwargs):
-                return common_tools
-
             def parallel_safe(self, *args):
                 return False
 
@@ -1233,7 +1230,6 @@ async def test_journal_without_task_anchor_resumes_and_soft_compaction_does_not_
         initial,
         runtime,
         StubAgentBackend(
-            definitions=lambda *_args, **_kwargs: (),
             finalize=lambda content, _runtime: content,
         ),
     )

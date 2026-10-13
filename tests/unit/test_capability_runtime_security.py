@@ -172,7 +172,7 @@ async def test_compilable_schemas_execute_once_through_real_catalog_and_original
     )
     runtime = _runtime(_entry(descriptor))
     runtime.initial_exposure()
-    assert runtime.definitions()[0].parameters == schema
+    assert runtime.descriptor("schema_probe").input_schema == schema
     assert "schema_probe" in runtime.callable_capability_ids()
     assert runtime.validate_call("schema_probe", json.dumps(payload)) == (True, None)
     _, work, tool_runtime = await active_work(database, tmp_path)
@@ -227,7 +227,8 @@ async def test_memory_failure_can_continue_and_reuse_original_effect(database, t
 
     env, owner, tools = await active_work(database, tmp_path)
     mutations, facts, _, _ = _service(database)
-    chat = build_harness(database, make_settings(database.url)).processor._chat
+    harness = build_harness(database, make_settings(database.url))
+    chat = harness.processor._chat
     chat._tools._memory_mutations = mutations
     tools = replace(
         tools,
@@ -255,7 +256,12 @@ async def test_memory_failure_can_continue_and_reuse_original_effect(database, t
         max_model_requests=None,
         work_control=owner.control,
     )
-    declared = backend.definitions(context, web_was_used=False)
+    from tests.support.fixed_contract_fixture import bind_main_contract
+
+    bind_main_contract(harness, tmp_path)
+    contract = chat.runtime.runner.main_contract
+    declared = await contract.model_definitions()
+    backend.refresh_catalog(context, web_was_used=False)
     assert not any(tool.name.startswith("admin_") for tool in declared)
     calls = []
 
@@ -304,7 +310,8 @@ async def test_memory_failure_can_continue_and_reuse_original_effect(database, t
     assert await owner.journal.effect_state(original.identity.operation_id) == "accepted"
     fact = await facts.get_fact(replacement["data"]["new_fact_id"])
     assert fact.content == "现在住在北京"
-    assert backend.definitions(context, web_was_used=False) == declared
+    backend.refresh_catalog(context, web_was_used=False)
+    assert await contract.model_definitions() == declared
     assert (await owner.control.repository.get(owner.control.current["id"]))["tool_calls"] == 4
     await owner.control.repository.release(owner.control.lease)
 
@@ -459,7 +466,7 @@ def _runtime(
     )
 
 
-def test_stable_declarations_are_complete_while_execution_remains_authorized() -> None:
+def test_complete_catalog_keeps_execution_authorized() -> None:
     runtime = _runtime(
         _entry(_descriptor("web_search", namespace="web.search")),
         _entry(_descriptor("memory_change", namespace="memory.state.write")),
@@ -477,11 +484,11 @@ def test_stable_declarations_are_complete_while_execution_remains_authorized() -
             )
         ),
     )
-    # Freshly constructed: complete declaration, nothing executable yet.
+    # Freshly constructed: complete catalog, nothing executable yet.
     assert runtime.callable_capability_ids() == frozenset()
     assert runtime.validate_call("web_search", '{"query":"x"}') == (False, NO_LONGER_AUTHORIZED)
     runtime.initial_exposure()
-    assert {tool.name for tool in runtime.definitions()} == {
+    assert {entry.descriptor.capability_id for entry in runtime.authorized_catalog.entries} == {
         "web_search",
         "memory_change",
         "call_onebot_api",
@@ -514,11 +521,11 @@ def test_memory_revision_changes_only_execution_grants_and_denial_wins() -> None
     )
     runtime = _runtime(*entries, memory_view=_memory_view(1))
     runtime.initial_exposure()
-    declared = runtime.definitions()
+    catalog = runtime.authorized_catalog
     assert "memory_change" in runtime.callable_capability_ids()
     runtime.sync_memory_view(_memory_view(2, hidden=("memory.state.write",)))
-    # The declaration is fixed; the hidden namespace is denied at execution.
-    assert runtime.definitions() == declared
+    # Catalog contents stay fixed; the hidden namespace is denied at execution.
+    assert runtime.authorized_catalog == catalog
     assert runtime.callable_capability_ids() == {"web_search"}
     assert runtime.validate_call("memory_change", '{"query":"x"}') == (
         False,

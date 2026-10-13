@@ -21,7 +21,6 @@ from qq_ai_bot.capabilities.validation import (
     CapabilityValidationResult,
     JsonSchemaCapabilityValidator,
 )
-from qq_ai_bot.domain.messages import ChatTool
 from qq_ai_bot.runtime.contracts import MemoryCapabilityView
 
 
@@ -75,14 +74,6 @@ class TurnCapabilityRuntime:
 
     def callable_capability_ids(self) -> frozenset[str]:
         return self._authorized.requestable_ids if self._opened else frozenset()
-
-    def definitions(self) -> tuple[ChatTool, ...]:
-        return tuple(
-            sorted(
-                (entry.descriptor.as_chat_tool() for entry in self._authorized.catalog.entries),
-                key=lambda item: item.name,
-            )
-        )
 
     def initial_exposure(self) -> None:
         """Open the authorized grants of the complete stable catalog."""
