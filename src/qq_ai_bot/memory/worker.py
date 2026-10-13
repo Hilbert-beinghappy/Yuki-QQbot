@@ -12,7 +12,6 @@ from qq_ai_bot.config import Settings
 from qq_ai_bot.memory.claim_candidates import MemoryClaimCandidateRepository
 from qq_ai_bot.memory.claim_processor import MemoryClaimProcessor, MemoryProcessingContext
 from qq_ai_bot.memory.enums import (
-    MemoryProcessingSource,
     MemoryRebuildJobOutcome,
     MemorySourceType,
 )
@@ -339,7 +338,6 @@ class MemoryWorker:
             result = await self.mutations.mutate_validated_claim(
                 validated,
                 MemoryProcessingContext(
-                    source=MemoryProcessingSource.LIVE,
                     event=job.event,
                 ),
                 conversation_key=job.conversation_key,

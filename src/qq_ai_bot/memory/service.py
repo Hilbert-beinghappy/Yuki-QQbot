@@ -1295,45 +1295,6 @@ class MemoryFactService:
         )
         return changed
 
-    async def prune_person_memories(
-        self,
-        *,
-        user_id: str,
-        max_importance: int,
-        older_than: datetime,
-        session: AsyncSession,
-    ) -> int:
-        rows = await self._repository.list_facts(
-            MemoryFactQuery(
-                scope_type=MemoryScopeType.PERSON,
-                subject_user_id=user_id,
-            ),
-            limit=None,
-            session=session,
-        )
-        candidates = tuple(
-            row
-            for row in rows
-            if row.source_type is not MemorySourceType.EXPLICIT
-            and row.importance <= max_importance
-            and row.updated_at < older_than
-        )
-        changed = 0
-        for row in candidates:
-            if await self._repository.transition(
-                row.id,
-                status=MemoryStatus.INVALIDATED,
-                conflict_state=MemoryConflictState.CLEAR,
-                invalidated_reason=MemoryInvalidationReason.STALE,
-                action=MemoryStateAction.STALE_INVALIDATED,
-                reason_code="manual_prune",
-                source_event_id=None,
-                actor_user_id=user_id,
-                session=session,
-            ):
-                changed += 1
-        return changed
-
     async def list_evidence(self, fact_id: int, *, limit: int = 100) -> tuple[MemoryEvidence, ...]:
         return await self._repository.list_evidence(fact_id, limit=limit)
 

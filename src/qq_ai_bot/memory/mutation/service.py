@@ -22,7 +22,6 @@ from qq_ai_bot.memory.claim_processor import (
     MemoryClaimProcessor,
     MemoryClaimResolution,
     MemoryProcessingContext,
-    ResolvedMemoryClaim,
 )
 from qq_ai_bot.memory.dream.db_models import (
     MemoryDreamClusterModel,
@@ -44,7 +43,6 @@ from qq_ai_bot.memory.enums import (
     MemoryFactRelationType,
     MemoryInvalidationReason,
     MemoryKind,
-    MemoryProcessingSource,
     MemoryResolutionAction,
     MemoryReviewState,
     MemoryScopeType,
@@ -1208,10 +1206,9 @@ class MemoryMutationService:
             if request.operation is MemoryMutationOperation.CREATE:
                 if prepared.claim is None:
                     raise MemoryMutationRejected("validated_claim_required")
-                claim_resolution = await self._processor.resolve(
+                claim_resolution = self._processor.resolve(
                     prepared.claim,
                     MemoryProcessingContext(
-                        source=MemoryProcessingSource.LIVE,
                         event=context.event,
                         config_scope=context.config_scope,
                     ),
@@ -1264,8 +1261,6 @@ class MemoryMutationService:
                 facts = tuple(
                     fact for fact in (prepared.fact, prepared.merge_fact) if fact is not None
                 )
-                if isinstance(claim_resolution, ResolvedMemoryClaim):
-                    facts = (*facts, *(row.fact for row in claim_resolution.candidates))
                 targets: tuple[MemoryFact | MemoryFactCreate, ...] = facts
                 if prepared.claim is not None:
                     targets = (*targets, prepared.claim.fact)
@@ -1611,7 +1606,7 @@ class MemoryMutationService:
                     deduplicated=True,
                     requested_operation=operation,
                 )
-            claim_resolution = await self._processor.resolve(claim, processing_context)
+            claim_resolution = self._processor.resolve(claim, processing_context)
             mutation_id = str(uuid.uuid4())
 
             async def apply(session: AsyncSession) -> MemoryMutationResult:
@@ -1644,42 +1639,11 @@ class MemoryMutationService:
                     != source_snapshot
                 ):
                     raise MemoryMutationRejected("memory_resolution_snapshot_changed")
-                facts = (
-                    tuple(row.fact for row in claim_resolution.candidates)
-                    if isinstance(claim_resolution, ResolvedMemoryClaim)
-                    else ()
-                )
                 await self._facts.prepare_evidence_write(
-                    tuple(fact.id for fact in facts),
+                    (),
                     session=session,
-                    targets=(claim.fact, *facts),
+                    targets=(claim.fact,),
                 )
-                current_facts = {
-                    fact.id: fact
-                    for fact in await self._facts.repository.get_facts(
-                        tuple(fact.id for fact in facts),
-                        session=session,
-                    )
-                }
-                for snapshot in facts:
-                    current = current_facts.get(snapshot.id)
-                    if (
-                        current is None
-                        or fact_signature(current) != fact_signature(snapshot)
-                        or (
-                            self._facts.target_signature(
-                                scope_type=current.scope_type,
-                                visibility_type=current.visibility_type,
-                                owners=self._facts.persisted_target_owners(current),
-                            )
-                            != self._facts.target_signature(
-                                scope_type=snapshot.scope_type,
-                                visibility_type=snapshot.visibility_type,
-                                owners=self._facts.persisted_target_owners(snapshot),
-                            )
-                        )
-                    ):
-                        raise MemoryMutationRejected("memory_resolution_snapshot_changed")
                 await fence_memory_job_claim(session, job)
                 reserved = await self._receipts.reserve(
                     mutation_id=mutation_id,
@@ -2003,11 +1967,8 @@ class MemoryMutationService:
                     existing_fact_id=fact.id,
                     new_fact_status=MemoryStatus.CONTESTED,
                     new_conflict_state=MemoryConflictState.CONTESTED,
-                    existing_status=MemoryStatus.ACTIVE,
-                    existing_conflict_state=MemoryConflictState.CONTESTED,
                     relation_types=(MemoryFactRelationType.CONTRADICTS,),
                     reason_code="agent_requested_contest",
-                    append_evidence=True,
                     create_new_fact=True,
                 ),
                 session=session,

@@ -939,3 +939,57 @@ async def test_equivalent_directory_match_reaches_the_actual_tail(database, tmp_
         == ()
     )
     assert not case.provider.requests and not sent(case.env)
+
+
+@pytest.mark.parametrize("failure", ["binding", "authority", "conversation"])
+@pytest.mark.parametrize("max_runs", [None, 1])
+async def test_automation_preflight_failure_records_one_blocked_occurrence(
+    database, tmp_path, monkeypatch, failure, max_runs
+):
+    from unittest.mock import AsyncMock
+
+    from qq_ai_bot.automation.context import AutomationBindError
+
+    case = await setup_run(database, tmp_path, mode="silent", max_runs=max_runs)
+    category = {
+        "binding": "state_mismatch",
+        "authority": "automation_owner_unavailable",
+        "conversation": "automation_conversation_changed",
+    }[failure]
+    if failure == "binding":
+        monkeypatch.setattr(
+            "qq_ai_bot.automation.worker.bind_automation_conversation",
+            AsyncMock(side_effect=AutomationBindError(category)),
+        )
+    elif failure == "authority":
+        monkeypatch.setattr(
+            "qq_ai_bot.automation.worker.resolve_execution_identity",
+            AsyncMock(side_effect=PermissionError(category)),
+        )
+    else:
+        monkeypatch.setattr(case.worker._scopes, "get", AsyncMock(return_value=None))
+    case.clock.advance(2)
+    result = await case.dispatch()
+    assert result.status is RunStatus.BLOCKED and result.error_category == category
+    assert result.llm_calls == result.tool_calls == result.messages_sent == 0
+    assert (await case.repository.get(case.row.id)).status is AutomationStatus.BLOCKED
+    repeated = await case.dispatch()
+    assert repeated.id == result.id
+    assert len(await case.repository.run_history(case.row.id)) == 1
+    assert not case.provider.requests
+
+
+async def test_private_automation_uses_resolved_account_instead_of_frozen_creator(
+    database, tmp_path
+):
+    case = await setup_run(database, tmp_path, mode="silent", delivery="self_private")
+    async with database.immediate_session() as writer:
+        await writer.execute(
+            update(AutomationModel)
+            .where(AutomationModel.id == case.row.id)
+            .values(creator_user_id="retired-account")
+        )
+    case.clock.advance(2)
+    result = await case.dispatch()
+    assert result.status is RunStatus.SUCCEEDED
+    assert len(case.provider.requests) == 1
