@@ -1,6 +1,6 @@
 """Immutable identity/route/control capability descriptors and projection.
 
-Existing PermissionCatalog / ActionRegistry / ConfigRegistry remain the
+Existing PermissionCatalog / ConfigRegistry remain the
 catalog sources. This module is only a descriptor table plus a pure
 projection boundary. It is not a fourth registry.
 """
@@ -373,12 +373,6 @@ CONTROL_CAPABILITY_DESCRIPTORS: Final[tuple[ControlCapabilityDescriptor, ...]] =
     ),
     _descriptor(
         "identity.space.disable",
-        CapabilityFamily.IDENTITY,
-        CapabilitySensitivity.MUTATE,
-        mutating=True,
-    ),
-    _descriptor(
-        "identity.space.autonomous",
         CapabilityFamily.IDENTITY,
         CapabilitySensitivity.MUTATE,
         mutating=True,

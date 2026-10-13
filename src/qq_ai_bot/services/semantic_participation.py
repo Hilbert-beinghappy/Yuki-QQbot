@@ -1193,6 +1193,9 @@ class SemanticParticipationService:
                 )
             ).all()
         if presence is None or len(bindings) != 1:
+            await self.repository.record_feedback(
+                run.run_id, sequence=run.feedback_sequence + 1, outcome="interrupted"
+            )
             return
         group_id, bot_user_id = bindings[0].external_space_id, presence.external_account_id
         packet: list[dict[str, object]] = []

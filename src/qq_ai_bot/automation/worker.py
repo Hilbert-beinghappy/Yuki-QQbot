@@ -290,7 +290,6 @@ class AutomationWorker:
                             ),
                             actor_is_superuser=recovered.actor_is_superuser,
                             allow_generic_onebot=recovered.actor_is_superuser,
-                            allow_admin_actions=recovered.actor_is_superuser,
                             conversation_key=key,
                             execution_id=execution_id,
                             origin=TurnOrigin.SCHEDULED_AUTOMATION,
