@@ -136,8 +136,6 @@ async def invoke_social(
         selected.pop("subject_ref", None)
         selected.pop("display_name", None)
         selected.update(kind=kind, target_id=target_id)
-        if name == "read_conversation_history" and runtime.history_limit is not None:
-            selected["limit"] = min(int(selected.get("limit", 20)), runtime.history_limit)
         return await service.execute(name, selected, context)
     if (
         runtime.origin
