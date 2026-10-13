@@ -656,7 +656,7 @@ async def test_sdk_history_grant_uses_common_conversation_without_scope_fork(
         await chat.runtime.main_turns._projections.invalidate_view(
             message.conversation_id, reason="capacity"
         )
-    with host.invocation_scope(host.plugin_id, source, web_was_used=False):
+    with host.invocation_scope(host.plugin_id, source):
         result = await host.agent.run("当前插件实际要求")
     assert result.ok and result.data["state"] == "completed"
     actual = provider.requests[-1].messages

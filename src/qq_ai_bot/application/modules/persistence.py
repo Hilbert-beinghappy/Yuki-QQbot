@@ -106,13 +106,12 @@ class PersistenceModule:
         )
         memory_repository = MemoryFactRepository(database)
         memory_metrics = MemoryLifecycleMetrics()
-        memories = MemoryFactService(memory_repository, metrics=memory_metrics)
+        memories = MemoryFactService(memory_repository)
         memory_index = SQLiteMemoryFTSIndex(database)
         memory_context = MemoryContextService(
             query_builder=MemoryQueryBuilder(MemoryTargetResolver(people)),
             retriever=MemoryRetriever(repository=memory_repository, lexical_index=memory_index),
             facts=memories,
-            metrics=memory_metrics,
         )
         rollup_config = RollupPolicyConfig(
             context_token_budget=min(

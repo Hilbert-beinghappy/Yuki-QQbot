@@ -178,7 +178,7 @@ def build_harness(
     )
     llm = provider or FakeLLMProvider()
     models = require_model_executor(None, provider=llm, model=settings.llm_model or "fake")
-    concurrency = ConcurrencyManager(settings.global_llm_concurrency)
+    concurrency = ConcurrencyManager()
     runtime_config = RuntimeConfigService(settings=settings, database=database)
     time_service = TimeContextService(default_timezone=settings.default_timezone)
     rollup_service = ConversationRollupService(

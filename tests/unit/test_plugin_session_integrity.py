@@ -50,7 +50,7 @@ async def test_private_session_keeps_long_history_and_complete_sdk_result(
 
     service = PluginAgentSessionService(
         model_executor=Models(provider),
-        concurrency=ConcurrencyManager(1),
+        concurrency=ConcurrencyManager(),
         runtime_config=RuntimeConfigService(
             database=database, settings=make_settings(database.url)
         ),
