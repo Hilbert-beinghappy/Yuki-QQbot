@@ -38,6 +38,7 @@ from qq_ai_bot.conversation.ordinary_admission import (
     OrdinaryAdmissionDuplicate,
     OrdinaryAdmissionRepository,
     OrdinaryParticipationBinding,
+    PreparedOrdinaryAdmission,
 )
 from qq_ai_bot.conversation.rollup.repository import (
     ConversationRollupRepository,
@@ -928,6 +929,24 @@ class MessageProcessor:
 
         if not direct_turn:
             if record.author_is_human():
+                if deferred_open:
+                    try:
+                        record, audio = await self._prepare_audio_source(
+                            message, sender, record, turn_snapshot
+                        )
+                    except (TurnInterruptedError, TurnSupersededError, WorkConflict):
+                        return ProcessResult(True, reason="turn_interrupted")
+                    if (
+                        audio.error
+                        and not audio.transcript
+                        and not has_visual_input
+                        and not (decision.content or message.text).strip()
+                    ):
+                        sent = await self._send_text(
+                            message, sender, audio.failure_message, turn_snapshot=turn_snapshot
+                        )
+                        return ProcessResult(True, int(sent), "asr_" + audio.error)
+                    await self._enqueue_memory(record)
                 observed = _ObservedHumanTurn(
                     message,
                     sender,
@@ -952,9 +971,6 @@ class MessageProcessor:
                 if original.reason != "ordinary_deferred":
                     return original
                 if deferred_open:
-                    # Every open-floor message was a direct turn before; keep its
-                    # memory evidence even when a later fragment takes the reply.
-                    await self._enqueue_memory(record)
                     return await self._defer_ordinary(observed, None, "group_open")
                 if self._participation is not None:
                     found = await self._participation.continuation_for_event(record.id)
@@ -1137,17 +1153,74 @@ class MessageProcessor:
                 return ProcessResult(True, reason="turn_interrupted")
 
         record = await self._ledger.get_event(record.id) or record
+        audio: AudioInput | None = None
+        work_input_id: int | None = None
+        prepared: PreparedOrdinaryAdmission
+
+        async def prepare_source(*, existing_work: bool) -> PreparedOrdinaryAdmission | None:
+            nonlocal record, audio, prepared
+            async with (
+                nullcontext()
+                if existing_work
+                else self._turn_coordinator.track(turn_token, "admission")
+            ):
+                record, audio = await self._prepare_audio_source(
+                    message,
+                    sender,
+                    record,
+                    turn_snapshot,
+                    turn_token=None if existing_work else turn_token,
+                )
+            if (
+                audio.error
+                and not audio.transcript
+                and not has_visual_input
+                and not (decision.content or message.text).strip()
+            ):
+                return None
+            if created and (direct_turn or existing_work):
+                await self._enqueue_memory(record)
+            prepared = self.ordinary_admissions.prepare(
+                record, turn_snapshot.generation, turn_token.version
+            )
+            return prepared
+
         try:
             prepared = self.ordinary_admissions.prepare(
                 record, turn_snapshot.generation, turn_token.version
             )
             work_input_id = await self._chat.stage_work_input(
-                coordinator_key, message, record.id, admission=prepared
+                coordinator_key,
+                message,
+                record.id,
+                admission=prepared,
+                prepare_source=lambda: prepare_source(existing_work=True),
             )
+            if audio is None and (work_input_id is not None or not defer_new_main):
+                await prepare_source(existing_work=work_input_id is not None or defer_new_main)
         except OrdinaryAdmissionDuplicate:
             return ProcessResult(False, reason="ordinary_already_admitted")
         except OrdinaryAdmissionConflict:
+            await self._chat.discard_work_input(work_input_id)
             return ProcessResult(False, reason="ordinary_source_changed")
+        except (TurnInterruptedError, TurnSupersededError, WorkConflict):
+            await self._chat.discard_work_input(work_input_id)
+            return ProcessResult(True, reason="turn_interrupted")
+        except BaseException:
+            await self._chat.discard_work_input(work_input_id)
+            raise
+        if (
+            audio is not None
+            and audio.error
+            and not audio.transcript
+            and not has_visual_input
+            and not (decision.content or message.text).strip()
+        ):
+            sent = await self._send_text(
+                message, sender, audio.failure_message, turn_snapshot=turn_snapshot
+            )
+            await self._chat.discard_work_input(work_input_id)
+            return ProcessResult(True, int(sent), "asr_" + audio.error)
         if work_input_id == 0:
             if defer_new_main:
                 return ProcessResult(True, reason="work_wait_partial")
@@ -1162,66 +1235,7 @@ class MessageProcessor:
             return ProcessResult(True, reason="work_input_queued")
         if work_input_id is not None:
             binding = None
-
-        audio = AudioInput()
-        if ASRService.has_audio(message):
-            try:
-                async with (
-                    nullcontext()
-                    if work_input_id is not None or defer_new_main
-                    else self._turn_coordinator.track(turn_token, "admission")
-                ):
-                    if record.audio_transcript:
-                        audio = AudioInput(transcript=record.audio_transcript)
-                    elif self._asr is not None:
-                        gateway = (
-                            cast(OneBotMediaGateway, sender)
-                            if callable(getattr(sender, "call_api", None))
-                            else None
-                        )
-                        audio = await self._asr.prepare(message, gateway)
-                    else:
-                        audio = AudioInput(error="not_configured")
-                    if (
-                        work_input_id is None
-                        and not defer_new_main
-                        and not self._turn_coordinator.is_current(turn_token)
-                    ):
-                        await self._chat.discard_work_input(work_input_id)
-                        return ProcessResult(True, reason="turn_interrupted")
-                    if audio.transcript and not record.audio_transcript:
-                        stored = await self._ledger.set_audio_transcript(
-                            record.id,
-                            audio.transcript,
-                            generation=turn_snapshot.generation,
-                        )
-                        if not stored:
-                            await self._chat.discard_work_input(work_input_id)
-                            return ProcessResult(True, reason="turn_interrupted")
-                        record = await self._ledger.get_event(record.id) or record
-            except (TurnInterruptedError, TurnSupersededError, WorkConflict):
-                await self._chat.discard_work_input(work_input_id)
-                return ProcessResult(True, reason="turn_interrupted")
-            except BaseException:
-                await self._chat.discard_work_input(work_input_id)
-                raise
-            if (
-                audio.error
-                and not audio.transcript
-                and not has_visual_input
-                and not (decision.content or message.text).strip()
-            ):
-                sent = await self._send_text(
-                    message, sender, audio.failure_message, turn_snapshot=turn_snapshot
-                )
-                await self._chat.discard_work_input(work_input_id)
-                return ProcessResult(True, int(sent), "asr_" + audio.error)
-
-        # Deterministic native and direct-plugin commands execute their own reviewed
-        # mutation path. Feeding command syntax to the extraction Worker would create
-        # a second interpretation of the same write and may pollute long-term memory.
-        if created and decision.command is None and direct_match is None and direct_turn:
-            await self._enqueue_memory(record)
+        assert audio is not None
         visual_question = sanitize_input(decision.content or message.text)
         content = sanitize_input(decision.content or message.text)
         if message.reply_text:
@@ -1485,6 +1499,39 @@ class MessageProcessor:
             ),
         )
         return result
+
+    async def _prepare_audio_source(
+        self,
+        message: InboundMessage,
+        sender: OutboundSender,
+        record: EventRecord,
+        turn_snapshot: ConversationTurnSnapshot,
+        *,
+        turn_token: TurnToken | None = None,
+    ) -> tuple[EventRecord, AudioInput]:
+        if not ASRService.has_audio(message):
+            return record, AudioInput()
+        if record.audio_transcript:
+            return record, AudioInput(transcript=record.audio_transcript)
+        gateway = (
+            cast(OneBotMediaGateway, sender)
+            if callable(getattr(sender, "call_api", None))
+            else None
+        )
+        audio = (
+            await self._asr.prepare(message, gateway)
+            if self._asr is not None
+            else AudioInput(error="not_configured")
+        )
+        if turn_token is not None and not self._turn_coordinator.is_current(turn_token):
+            raise TurnInterruptedError("audio_source_superseded")
+        if audio.transcript:
+            if not await self._ledger.set_audio_transcript(
+                record.id, audio.transcript, generation=turn_snapshot.generation
+            ):
+                raise TurnInterruptedError("audio_source_changed")
+            record = await self._ledger.get_event(record.id) or record
+        return record, audio
 
     async def _enqueue_memory(self, record: EventRecord) -> None:
         memory_conversation_key = (

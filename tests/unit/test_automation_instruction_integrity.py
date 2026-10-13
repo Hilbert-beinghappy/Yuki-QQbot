@@ -66,7 +66,8 @@ async def test_long_task_persists_and_reaches_original_main_agent(
         database, tmp_path, provider=provider, delivery="none", goal=goal, constraints=constraints
     )
     expected = {"goal": goal, "constraints": constraints, "delivery": "none"}
-    assert json.loads(TaskSpec.model_validate(case.row.script).instruction()) == expected
+    instruction = TaskSpec.model_validate(case.row.script).instruction()
+    assert json.loads(instruction) == expected
     original_due = case.row.next_run_at
     updated = await case.service.update_task(
         case.row.id,
@@ -81,14 +82,15 @@ async def test_long_task_persists_and_reaches_original_main_agent(
     assert result.version_id == updated.version_id
     assert len(requests) == 1
     submitted = [
-        part["text"][part["text"].index('{"goal":') :]
+        part["text"]
         for message in requests[0]["contents"]
         for part in message["parts"]
-        if message["role"] == "user" and "text" in part and '{"goal":' in part["text"]
+        if message["role"] == "user" and "text" in part and instruction in part["text"]
     ]
     assert len(submitted) == 1
-    declaration, _ = json.JSONDecoder().raw_decode(submitted[0])
+    declaration, _ = json.JSONDecoder().raw_decode(submitted[0], submitted[0].index(instruction))
     assert declaration == expected
+    assert declaration["constraints"][0].endswith("\nTAIL_MARKER=YUKI_AUTO_TAIL_OK_731")
     async with database.sessions() as reader:
         stored = await reader.get(AutomationModel, case.row.id)
         saved = await reader.get(AutomationVersionModel, result.version_id)

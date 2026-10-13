@@ -2,20 +2,35 @@
 
 import asyncio
 import json
+from dataclasses import replace
 from types import SimpleNamespace
+from unittest.mock import AsyncMock
 
+import pytest
 from sqlalchemy import select, update
 from tests.conftest import MemorySender, build_harness, make_settings
 from tests.support.social_identity_cases import social_env
 
 from qq_ai_bot.admin.models import ConversationRuntimeConfig
+from qq_ai_bot.asr.service import AudioInput
+from qq_ai_bot.conversation.canonical_db_models import CanonicalConversationModel
 from qq_ai_bot.conversation.ordinary_admission_db_models import OrdinaryTurnAdmissionModel
 from qq_ai_bot.conversation.scope import runtime_conversation_key
+from qq_ai_bot.domain.audio import AudioTranscript, serialize_transcripts
 from qq_ai_bot.domain.conversations import ScopeType
-from qq_ai_bot.domain.messages import InboundMessage, SenderIdentity
+from qq_ai_bot.domain.messages import (
+    AttachmentKind,
+    InboundMessage,
+    MessageAttachment,
+    SenderIdentity,
+)
 from qq_ai_bot.identity.db_models import CanonicalSpaceModel
 from qq_ai_bot.llm.fake import FakeLLMProvider
+from qq_ai_bot.persistence.models import MemoryJobModel
 from qq_ai_bot.runtime.work_control import WorkControl
+from qq_ai_bot.runtime.work_repository import WorkRepository
+from qq_ai_bot.runtime.work_schema_v1 import inputs
+from qq_ai_bot.runtime.work_wait import WorkWaitRepository
 from qq_ai_bot.services.autonomous_groups import AutonomousGroupService
 from qq_ai_bot.services.turn_coordinator import ConversationTurnCoordinator
 
@@ -333,3 +348,258 @@ async def test_open_floor_input_reaches_original_wait_without_waiting_window(dat
     # Nothing was left for the quiet window to open as a second Main.
     assert autonomous._states == {} and provider.requests == []
     await autonomous.close()
+
+
+VOICE_REQUIREMENT = "本周改为周四提交，必须保留这一要求"
+
+
+def _voice(message):
+    return replace(
+        message,
+        text="",
+        attachments=(MessageAttachment(AttachmentKind.AUDIO, "voice", file="synthetic.amr"),),
+    )
+
+
+def _asr(processor, *, source="current"):
+    transcript = serialize_transcripts((AudioTranscript(source, 0, VOICE_REQUIREMENT),))
+    service = SimpleNamespace(prepare=AsyncMock(return_value=AudioInput(transcript=transcript)))
+    processor._asr = service
+    return service
+
+
+async def _original_wait(database, env, *, conditions=None, mode="any"):
+    repository = WorkRepository(database)
+    lease = await repository.acquire(env.context.conversation_id, 1)
+    assert lease
+
+    async def validate():
+        assert await repository.valid(lease)
+
+    control = WorkControl(
+        repository,
+        lease,
+        "voice-input-wait",
+        {"actor_person_id": env.person, "principal_kind": "person", "origin": "user_message"},
+        validate,
+    )
+    assert json.loads(
+        await control.execute("task_control", {"action": "accept", "goal": "等待原消息"}, "accept")
+    )["ok"]
+    registered = await WorkWaitRepository(repository).register(
+        lease,
+        work_id=control.current["id"],
+        source=control.source,
+        call_key="voice-input-wait",
+        mode=mode,
+        conditions=conditions or [{"kind": "conversation"}],
+        deadline_at=None,
+    )
+    return repository, control, registered
+
+
+@pytest.mark.parametrize("mention", [False, True])
+@pytest.mark.parametrize("source", ["current", "reply"])
+async def test_original_wait_prepares_voice_and_memory_before_publication(
+    database, tmp_path, mention, source
+):
+    provider = FakeLLMProvider()
+    env, harness, worker, message = await _open_group_scene(
+        database, tmp_path, provider, debounce=60
+    )
+    async with database.immediate_session() as writer:
+        await writer.execute(
+            update(CanonicalSpaceModel)
+            .where(CanonicalSpaceModel.id == env.space)
+            .values(require_mention=True)
+        )
+    service = _asr(harness.processor, source=source)
+    _repository, control, registered = await _original_wait(database, env)
+    try:
+        incoming = _voice(message(1, "", mention=mention))
+        if source == "reply":
+            incoming = replace(
+                incoming,
+                text="请阅读引用的语音",
+                attachments=(),
+                reply_attachments=tuple(
+                    replace(item, source="reply") for item in incoming.attachments
+                ),
+            )
+        result = await harness.processor.handle(incoming, MemorySender())
+        assert result.reason == "work_input_queued" and not provider.requests
+        admission = (await _admissions(database))[0]
+        assert admission.work_id == control.current["id"]
+        event = await harness.ledger.get_event(admission.event_id)
+        assert VOICE_REQUIREMENT in event.audio_transcript
+        current = await harness.processor.ordinary_admissions.current(event.id)
+        assert current is not None and current.activation_id == admission.activation_id
+        async with database.sessions() as reader:
+            assert await reader.scalar(
+                select(MemoryJobModel.id).where(MemoryJobModel.event_id == event.id)
+            )
+            payload = json.loads(
+                await reader.scalar(
+                    select(inputs.c.payload_json).where(inputs.c.id == admission.input_id)
+                )
+            )
+        assert json.loads(payload["text"])["wait_id"] == registered["id"]
+        selected = await control.take_inputs("voice-signal")
+        assert VOICE_REQUIREMENT in selected[0].content
+        if source == "reply":
+            assert "回复消息中的语音转写" in selected[0].content
+            assert VOICE_REQUIREMENT not in event.evidence_content
+        assert service.prepare.await_count == 1
+    finally:
+        await worker.close()
+
+
+async def test_open_floor_merge_keeps_prior_voice_in_actual_main_input(database, tmp_path):
+    provider = FakeLLMProvider(lambda _: "NO_REPLY")
+    _env, harness, worker, message = await _open_group_scene(
+        database, tmp_path, provider, debounce=0.2
+    )
+    service = _asr(harness.processor)
+    try:
+        assert (await harness.processor.handle(_voice(message(1, "")), MemorySender())).reason == (
+            "ordinary_deferred"
+        )
+        observed = next(iter(harness.processor._observed_human_turns.values()))
+        assert (
+            await harness.processor.handle(message(2, "请按刚才语音的要求处理"), MemorySender())
+        ).reason == "ordinary_deferred"
+        await worker.wait_until_idle(observed.snapshot.scope_key)
+        event = await harness.ledger.get_event(observed.record.id)
+        assert VOICE_REQUIREMENT in event.audio_transcript
+        assert len(await _admissions(database)) == 1
+        assert len(provider.requests) == 1
+        submitted = "\n".join(item.content or "" for item in provider.requests[0].messages)
+        assert VOICE_REQUIREMENT in submitted and "请按刚才语音的要求处理" in submitted
+        assert service.prepare.await_count == 1
+    finally:
+        await worker.close()
+
+
+async def test_unmatched_group_voice_does_not_buy_asr_or_enqueue_memory(database, tmp_path):
+    provider = FakeLLMProvider()
+    env, harness, worker, message = await _open_group_scene(
+        database, tmp_path, provider, debounce=0
+    )
+    async with database.immediate_session() as writer:
+        await writer.execute(
+            update(CanonicalSpaceModel)
+            .where(CanonicalSpaceModel.id == env.space)
+            .values(require_mention=True)
+        )
+    service = _asr(harness.processor)
+    try:
+        result = await harness.processor.handle(_voice(message(1, "")), MemorySender())
+        assert result.reason == "group_observed"
+        assert not provider.requests and not await _admissions(database)
+        service.prepare.assert_not_awaited()
+        async with database.sessions() as reader:
+            assert await reader.scalar(select(MemoryJobModel.id)) is None
+    finally:
+        await worker.close()
+
+
+async def test_wait_source_generation_change_during_asr_does_not_publish(database, tmp_path):
+    provider = FakeLLMProvider()
+    env, harness, worker, message = await _open_group_scene(
+        database, tmp_path, provider, debounce=60
+    )
+    await _original_wait(database, env)
+    service = _asr(harness.processor)
+    transcript = service.prepare.return_value
+
+    async def reset(*_args):
+        async with database.immediate_session() as writer:
+            await writer.execute(
+                update(CanonicalConversationModel)
+                .where(CanonicalConversationModel.id == env.context.conversation_id)
+                .values(generation=2)
+            )
+        return transcript
+
+    service.prepare.side_effect = reset
+    try:
+        result = await harness.processor.handle(
+            _voice(message(1, "", mention=True)), MemorySender()
+        )
+        assert result.reason == "turn_interrupted"
+        assert not await _admissions(database) and not provider.requests
+        async with database.sessions() as reader:
+            assert await reader.scalar(select(inputs.c.id)) is None
+    finally:
+        await worker.close()
+
+
+async def test_partial_wait_keeps_voice_before_later_time_signal(database, tmp_path):
+    provider = FakeLLMProvider()
+    env, harness, worker, message = await _open_group_scene(
+        database, tmp_path, provider, debounce=60
+    )
+    service = _asr(harness.processor)
+    repository, control, registered = await _original_wait(
+        database,
+        env,
+        mode="all",
+        conditions=[{"kind": "conversation"}, {"kind": "time_due", "after_seconds": 0}],
+    )
+    try:
+        result = await harness.processor.handle(_voice(message(1, "")), MemorySender())
+        assert result.reason == "work_wait_partial"
+        assert not await _admissions(database) and not provider.requests
+        described = await WorkWaitRepository(repository).describe(control.current["id"])
+        assert described["status"] == "active"
+        event_id = described["conditions"][0]["matched"]["event_id"]
+        assert VOICE_REQUIREMENT in (await harness.ledger.get_event(event_id)).audio_transcript
+        assert await WorkWaitRepository(repository).deliver_due() == 1
+        selected = await control.take_inputs("partial-voice-signal")
+        assert registered["id"] in selected[0].content and VOICE_REQUIREMENT in selected[0].content
+        assert service.prepare.await_count == 1
+    finally:
+        await worker.close()
+
+
+@pytest.mark.parametrize("cancel", [False, True])
+async def test_failed_or_cancelled_wait_voice_does_not_publish_unprepared_input(
+    database, tmp_path, cancel
+):
+    provider = FakeLLMProvider()
+    env, harness, worker, message = await _open_group_scene(
+        database, tmp_path, provider, debounce=60
+    )
+    repository, control, _registered = await _original_wait(database, env)
+    entered, release = asyncio.Event(), asyncio.Event()
+    service = _asr(harness.processor)
+
+    async def prepare(*_args):
+        entered.set()
+        if cancel:
+            await release.wait()
+        return AudioInput(error="no_speech")
+
+    service.prepare.side_effect = prepare
+    task = asyncio.create_task(
+        harness.processor.handle(_voice(message(1, "", mention=True)), MemorySender())
+    )
+    try:
+        await entered.wait()
+        if cancel:
+            task.cancel()
+            with pytest.raises(asyncio.CancelledError):
+                await task
+        else:
+            assert (await task).reason == "asr_no_speech"
+        assert not await _admissions(database) and not provider.requests
+        assert (await WorkWaitRepository(repository).describe(control.current["id"]))[
+            "status"
+        ] == "active"
+        async with database.sessions() as reader:
+            assert await reader.scalar(select(inputs.c.id)) is None
+            assert await reader.scalar(select(MemoryJobModel.id)) is None
+    finally:
+        release.set()
+        await asyncio.gather(task, return_exceptions=True)
+        await worker.close()
