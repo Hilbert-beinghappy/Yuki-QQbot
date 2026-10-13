@@ -123,7 +123,6 @@ class ConversationModule:
             memories=persistence.memories,
             memory_context=persistence.memory_context,
             memory_mutations=memory_mutations,
-            actions=persistence.agent_actions,
             web_provider=self._web_provider,
             web_sources=persistence.web_sources,
             runtime_config=self._runtime_config,

@@ -65,7 +65,6 @@ from qq_ai_bot.persistence.models import (
     MemoryToolReceiptModel,
 )
 from qq_ai_bot.persistence.repositories import (
-    AgentActionRepository,
     EventLedgerRepository,
     PeopleRepository,
 )
@@ -716,7 +715,6 @@ async def test_agent_tool_and_worker_share_one_claim_receipt(
         ledger=ledger,
         memories=facts,
         memory_mutations=service,
-        actions=AgentActionRepository(database),
     )
     inbound = InboundMessage(
         message_id=event.platform_message_id,
@@ -1413,7 +1411,6 @@ async def test_historical_social_read_policy_is_consistent_without_evidence_expa
         settings=make_settings("sqlite+aiosqlite:///:memory:"),
         ledger=ledger,
         memories=facts,
-        actions=AgentActionRepository(database),
     )
     runtime = ToolRuntime(
         inbound=inbound,

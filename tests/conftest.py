@@ -27,7 +27,6 @@ from qq_ai_bot.memory.runtime.partition_lookup import DatabaseMemoryPartitionLoo
 from qq_ai_bot.memory.service import MemoryFactService
 from qq_ai_bot.persistence.database import Database
 from qq_ai_bot.persistence.repositories import (
-    AgentActionRepository,
     EmojiDescriptionRepository,
     EventLedgerRepository,
     GroupSettingsRepository,
@@ -196,7 +195,6 @@ def build_harness(
         settings=settings,
         ledger=ledger,
         memories=memories,
-        actions=AgentActionRepository(database),
         web_provider=web_provider,
         web_sources=web_sources,
         runtime_config=runtime_config,
