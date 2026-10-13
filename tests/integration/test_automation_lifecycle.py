@@ -939,3 +939,57 @@ async def test_equivalent_directory_match_reaches_the_actual_tail(database, tmp_
         == ()
     )
     assert not case.provider.requests and not sent(case.env)
+
+
+async def test_terminal_work_survives_maintenance_before_late_occurrence_settlement(
+    database, tmp_path
+):
+    case = await setup_run(database, tmp_path, delivery="none", mode="silent")
+    case.clock.advance(2)
+    claimed = (
+        await case.repository.claim_due(
+            worker_id="late-settlement",
+            now=case.clock.now(),
+            lease_seconds=30,
+            clock=case.clock.now,
+        )
+    )[0]
+    run = await case.repository.create_run(
+        claimed.id,
+        scheduled_for=claimed.next_run_at,
+        actual_started_at=case.clock.now(),
+        worker_id=claimed.claimed_by,
+        version_id=claimed.version_id,
+    )
+    async with database.sessions() as reader:
+        version = await reader.get(AutomationVersionModel, run.version_id)
+        original_hash = version.script_hash
+    lease = await case.works.acquire(case.env.context.conversation_id, 1)
+    original = await case.works.accept(
+        lease,
+        source_key=f"automation:{run.id}:{original_hash}",
+        source={"owner": "automation", "automation_run_id": run.id},
+        goal="retain the original occurrence result",
+    )
+    await case.works.checkpoint(lease, original["id"], {"sync_result": "original result"}, models=1)
+    current = await case.works.get(original["id"])
+    await case.works.transition(lease, original["id"], current["revision"], "completed")
+    original = await case.works.get(original["id"])
+    for index in range(130):
+        newer = await case.works.accept(
+            lease, source_key=f"later-receipt:{index}", source={}, goal="another completed work"
+        )
+        await case.works.transition(lease, newer["id"], newer["revision"], "completed")
+    await case.works.release(lease)
+    await case.works.reclaim_unreferenced_media()
+    assert await case.works.get(original["id"]) == original
+    assert (await case.repository.run_history(claimed.id))[0].status is RunStatus.RUNNING
+    await case.repository.settle_work_occurrences()
+    settled = (await case.repository.run_history(claimed.id))[0]
+    assert settled.status is RunStatus.SUCCEEDED
+    assert settled.result_summary == {"work_id": original["id"], "work_state": "completed"}
+    assert settled.llm_calls == 1
+    await case.repository.settle_work_occurrences()
+    assert (await case.repository.run_history(claimed.id))[0] == settled
+    assert (await case.repository.get(claimed.id)).run_count == 1
+    assert not case.provider.requests

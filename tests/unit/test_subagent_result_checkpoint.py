@@ -966,6 +966,9 @@ async def test_paused_descendant_retains_terminal_ancestors_and_resumes_without_
     before = await repo.get(leaf_id)
     await workers.maintain()
     assert (await workers.related(archived_root["id"], archived_child))["archived_at"] is not None
+    original_roots = {
+        item["id"]: await repo.get(item["id"]) for item in (branch, root, archived_root)
+    }
     plugin_id = "test.legacy-background-gc"
     notifications = await approve_background_plugin(
         database,
@@ -1050,6 +1053,11 @@ async def test_paused_descendant_retains_terminal_ancestors_and_resumes_without_
             update(work).where(work.c.id == caller["id"]).values(updated=time.time() - 10 * 86400)
         )
     original_caller = await repo.get(caller["id"])
+    original_plain = await repo.get(plain["id"])
+    async with database.sessions() as reader:
+        original_legacy = list(
+            (await reader.execute(select(work).where(work.c.id.in_(legacy.values())))).mappings()
+        )
     for index in range(130):
         newer = await repo.accept(
             parent_lease, source_key=f"newer-terminal:{index}", source={}, goal="finished receipt"
@@ -1058,9 +1066,9 @@ async def test_paused_descendant_retains_terminal_ancestors_and_resumes_without_
             parent_lease, newer["id"], {"action": "complete", "call_key": f"newer-done:{index}"}
         )
         await repo.transition(parent_lease, newer["id"], newer["revision"], "completed")
-    await repo.reclaim_terminal()
-    await repo.reclaim_terminal()
-    assert await repo.get(plain["id"]) is None
+    await repo.reclaim_unreferenced_media()
+    await repo.reclaim_unreferenced_media()
+    assert await repo.get(plain["id"]) == original_plain
     assert await repo.get(caller["id"]) == original_caller
     assert (
         json.loads(original_caller["checkpoint_json"])["sync_result"]
@@ -1071,24 +1079,18 @@ async def test_paused_descendant_retains_terminal_ancestors_and_resumes_without_
             list((await reader.execute(select(PluginBackgroundTurnJobModel.__table__))).mappings())
             == jobs_before
         )
-        archived_legacy = (
+        retained_legacy = (
             (await reader.execute(select(work).where(work.c.id.in_(legacy.values()))))
             .mappings()
             .all()
         )
-    assert {item["id"] for item in archived_legacy} == set(legacy.values())
-    for item in archived_legacy:
-        assert json.loads(item["checkpoint_json"]) == {"archived": True}
-        source = json.loads(item["source_json"])
-        assert source["owner"] == "plugin_background" and source["plugin_id"] == plugin_id
-        assert legacy[source["trigger_event_id"]] == item["id"]
-        assert "instruction" not in source and "context_data" not in source
+    assert retained_legacy == original_legacy
     retained = await workers.related(branch["id"], leaf_id)
     assert retained["archived_at"] is None
     assert (await repo.get(leaf_id))["checkpoint_json"] == before["checkpoint_json"]
     assert (await repo.get(leaf_id))["source_json"] == before["source_json"]
-    for item in (branch, root, archived_root):
-        assert json.loads((await repo.get(item["id"]))["checkpoint_json"]) == {"archived": True}
+    for identity, original in original_roots.items():
+        assert await repo.get(identity) == original
     from qq_ai_bot.runtime.work_tree import ancestor_work_ids, budget_root_id
 
     async with database.sessions() as reader:
