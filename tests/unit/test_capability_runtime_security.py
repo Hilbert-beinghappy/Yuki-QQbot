@@ -7,7 +7,6 @@ from dataclasses import replace
 
 import pytest
 
-from qq_ai_bot.automation.models import TurnOrigin
 from qq_ai_bot.capabilities.catalog import (
     DescriptorRegistrySnapshot,
     UnifiedToolCatalog,
@@ -70,17 +69,7 @@ def _descriptor(
 
 
 def _entry(descriptor: CapabilityDescriptor) -> UnifiedToolCatalogEntry:
-    return UnifiedToolCatalogEntry(
-        descriptor=descriptor,
-        provider_id="core",
-        scope_ids=descriptor.scope_ids,
-        compact_description=descriptor.description or descriptor.model_name,
-        tags=descriptor.tags,
-        searchable_text=descriptor.model_name,
-        estimated_schema_tokens=12,
-        available=True,
-        revision=descriptor.schema_version,
-    )
+    return UnifiedToolCatalogEntry(descriptor=descriptor)
 
 
 def test_schema_validation_rejects_invalid_arguments() -> None:
@@ -261,7 +250,7 @@ async def test_memory_failure_can_continue_and_reuse_original_effect(database, t
     bind_main_contract(harness, tmp_path)
     contract = chat.runtime.runner.main_contract
     declared = await contract.model_definitions()
-    backend.refresh_catalog(context, web_was_used=False)
+    backend.refresh_catalog(context)
     assert not any(tool.name.startswith("admin_") for tool in declared)
     calls = []
 
@@ -310,7 +299,7 @@ async def test_memory_failure_can_continue_and_reuse_original_effect(database, t
     assert await owner.journal.effect_state(original.identity.operation_id) == "accepted"
     fact = await facts.get_fact(replacement["data"]["new_fact_id"])
     assert fact.content == "现在住在北京"
-    backend.refresh_catalog(context, web_was_used=False)
+    backend.refresh_catalog(context)
     assert await contract.model_definitions() == declared
     assert (await owner.control.repository.get(owner.control.current["id"]))["tool_calls"] == 4
     await owner.control.repository.release(owner.control.lease)
@@ -342,13 +331,12 @@ def test_namespace_is_not_a_permission() -> None:
         (plugin,),
         CapabilityPolicyContext(
             authority=AuthorityContext(actor_user_id="u1", is_superuser=False),
-            origin=TurnOrigin.USER_MESSAGE,
         ),
     )
     assert visible == ()
 
 
-def test_image_turns_do_not_replace_execution_authority() -> None:
+def test_write_and_read_capabilities_use_actual_execution_authority() -> None:
     write = _descriptor(
         "memory_change",
         namespace="memory.state.write",
@@ -375,8 +363,6 @@ def test_image_turns_do_not_replace_execution_authority() -> None:
         (write, mutate, read, *environment),
         CapabilityPolicyContext(
             authority=AuthorityContext(actor_user_id="u1", is_superuser=False),
-            origin=TurnOrigin.USER_MESSAGE,
-            contains_images=True,
         ),
     )
     assert [item.model_name for item in visible] == [
@@ -389,27 +375,7 @@ def test_image_turns_do_not_replace_execution_authority() -> None:
     ]
 
 
-def test_read_only_origin_hides_destructive_and_writes() -> None:
-    write = _descriptor(
-        "memory_change",
-        namespace="memory.state.write",
-        effect=CapabilityEffect.WRITE_STATE,
-        risk=CapabilityRisk.MUTATE,
-    )
-    read = _descriptor("web_search", namespace="web.search")
-    visible = CapabilityPolicyEngine().visible(
-        (write, read),
-        CapabilityPolicyContext(
-            authority=AuthorityContext(actor_user_id="u1", is_superuser=False),
-            origin=TurnOrigin.PLUGIN_BACKGROUND,
-            read_only=True,
-        ),
-    )
-    assert [item.model_name for item in visible] == ["web_search"]
-
-
-@pytest.mark.parametrize("origin", tuple(TurnOrigin))
-def test_destructive_uses_actual_permissions_for_every_origin(origin) -> None:
+def test_destructive_uses_actual_permissions() -> None:
     destructive = _descriptor(
         "call_onebot_api",
         namespace="qq.api",
@@ -427,13 +393,11 @@ def test_destructive_uses_actual_permissions_for_every_origin(origin) -> None:
     }
     allowed = engine.visible(
         (destructive,),
-        CapabilityPolicyContext(**context, origin=origin),
+        CapabilityPolicyContext(**context),
     )
     refused = engine.visible(
         (destructive,),
-        CapabilityPolicyContext(
-            authority=AuthorityContext(actor_user_id="u1", is_superuser=False), origin=origin
-        ),
+        CapabilityPolicyContext(authority=AuthorityContext(actor_user_id="u1", is_superuser=False)),
     )
     assert [item.model_name for item in allowed] == ["call_onebot_api"]
     assert refused == ()
@@ -442,8 +406,6 @@ def test_destructive_uses_actual_permissions_for_every_origin(origin) -> None:
 def test_catalog_entry_round_trip_for_security_fixtures() -> None:
     catalog = UnifiedToolCatalog(
         entries=(_entry(_descriptor("web_search", namespace="web.search")),),
-        scopes=(),
-        revision="rev",
     )
     assert catalog.by_model_name("web_search") is not None
     assert catalog.by_model_name("missing") is None
@@ -454,13 +416,12 @@ def _runtime(
     append_only: bool = True,
     memory_view: MemoryCapabilityView | None = None,
 ) -> TurnCapabilityRuntime:
-    catalog = UnifiedToolCatalog(entries=entries, scopes=(), revision="abcd1234")
+    catalog = UnifiedToolCatalog(entries=entries)
     snapshot = DescriptorRegistrySnapshot(catalog)
     return TurnCapabilityRuntime(
         registry=snapshot,
         policy_context=CapabilityPolicyContext(
             authority=AuthorityContext(actor_user_id="1001", is_superuser=False),
-            origin=TurnOrigin.USER_MESSAGE,
             memory_view=memory_view,
         ),
     )

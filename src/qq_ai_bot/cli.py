@@ -167,9 +167,6 @@ def _add_diagnostics_parsers(
     runtime = subparsers.add_parser("runtime", help="只读 Runtime / Capability / Memory 诊断")
     runtime_commands = runtime.add_subparsers(dest="runtime_command", required=True)
     runtime_commands.add_parser("snapshot")
-    search = runtime_commands.add_parser("capability-search")
-    search.add_argument("query")
-    search.add_argument("--limit", type=int, default=8)
     runtime_commands.add_parser("memory-session")
 
 
@@ -268,7 +265,6 @@ def _prompt_diagnostic(settings: Settings, scenario: str) -> dict[str, object]:
             priority=100,
             stability=PromptStability.STATIC,
             content=settings.system_prompt,
-            required=True,
         ),
         PromptContribution(
             id="core.contract",
@@ -277,7 +273,6 @@ def _prompt_diagnostic(settings: Settings, scenario: str) -> dict[str, object]:
             priority=90,
             stability=PromptStability.STATIC,
             content=CORE_CONTRACT,
-            required=True,
         ),
     ]
     contributions.extend(
@@ -287,7 +282,6 @@ def _prompt_diagnostic(settings: Settings, scenario: str) -> dict[str, object]:
             trust=PromptTrust.TRUSTED,
             priority=50,
             payload=value,
-            required=key in {"time", "scene"},
         )
         for key, value in dynamic_payloads.items()
     )
@@ -404,39 +398,6 @@ def _prompt_comparison(settings: Settings) -> dict[str, object]:
     }
 
 
-def _capability_search_hits(query: str, *, limit: int) -> list[dict[str, object]]:
-    from qq_ai_bot.capabilities.models import CapabilityTrustSource
-    from qq_ai_bot.capabilities.provider import _CORE_METADATA, _CORE_SEARCH_TAGS, _CORE_USE_WHEN
-    from qq_ai_bot.capabilities.search_document import CapabilitySearchDocument
-    from qq_ai_bot.capabilities.search_index import FtsCapabilitySearchIndex
-
-    documents = tuple(
-        CapabilitySearchDocument(
-            capability_id=name,
-            model_name=name,
-            canonical_name=name,
-            namespace_id=namespace,
-            description=(_CORE_USE_WHEN.get(name) or (name,))[0],
-            aliases=_CORE_SEARCH_TAGS.get(name, ()),
-            use_when=_CORE_USE_WHEN.get(name, ()),
-            trust_source=CapabilityTrustSource.CORE,
-            effect=effect,
-            risk=risk,
-        )
-        for name, (namespace, effect, risk) in _CORE_METADATA.items()
-    )
-    index = FtsCapabilitySearchIndex()
-    index.rebuild(revision="cli-core", documents=documents)
-    return [
-        {
-            "capability_id": hit.capability_id,
-            "namespace_id": hit.namespace_id,
-            "score": hit.score,
-        }
-        for hit in index.search(query, limit=limit)
-    ]
-
-
 async def _runtime_diagnostics(settings: Settings, args: argparse.Namespace) -> int:
     database = Database(settings.database_url)
     try:
@@ -444,15 +405,10 @@ async def _runtime_diagnostics(settings: Settings, args: argparse.Namespace) -> 
         command = str(args.runtime_command)
         if command == "snapshot":
             payload: dict[str, object] = asdict(snapshot)
-        elif command == "memory-session":
+        else:
             payload = {
                 "memory": asdict(snapshot.memory),
                 "conversation": asdict(snapshot.conversation),
-            }
-        else:
-            payload = {
-                "query": str(args.query),
-                "hits": _capability_search_hits(str(args.query), limit=int(args.limit)),
             }
         print(json.dumps(payload, ensure_ascii=False, indent=2))
         return 0
