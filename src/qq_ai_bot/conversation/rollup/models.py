@@ -54,8 +54,6 @@ class RollupPolicyConfig:
         )
         if any(value < 1 for value in positive):
             raise ValueError("positive rollup settings must be at least one")
-        if not self.llm_origins:
-            object.__setattr__(self, "llm_origins", frozenset({"user_message"}))
 
 
 @dataclass(frozen=True, slots=True)
