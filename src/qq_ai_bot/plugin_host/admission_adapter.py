@@ -123,13 +123,7 @@ class PluginAdmissionSignalAdapter:
             normalized = expires.replace(tzinfo=UTC) if expires.tzinfo is None else expires
             if normalized <= datetime.now(UTC):
                 return None
-        return signal.model_copy(
-            update={
-                "source_plugin_id": plugin_id,
-                "score_delta": max(-10, min(10, int(signal.score_delta))),
-                "summary": signal.summary[:300],
-            }
-        )
+        return signal.model_copy(update={"source_plugin_id": plugin_id})
 
     @asynccontextmanager
     async def _scope(
