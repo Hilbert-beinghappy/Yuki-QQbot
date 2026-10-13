@@ -17,7 +17,6 @@ from pydantic import ValidationError
 from sqlalchemy.exc import SQLAlchemyError
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from qq_ai_bot.admin.action_service import ActionRegistry
 from qq_ai_bot.admin.audit import AdminAuditService
 from qq_ai_bot.admin.config_service import RuntimeConfigService
 from qq_ai_bot.admin.models import (
@@ -421,7 +420,6 @@ class MessageProcessor:
         self._permission_catalog = permission_catalog or PermissionCatalogService(
             settings=settings,
             config_registry=self._runtime_config.registry,
-            action_registry=ActionRegistry(),
         )
         self._vision = vision_service
         self._native_images = attachment_inputs

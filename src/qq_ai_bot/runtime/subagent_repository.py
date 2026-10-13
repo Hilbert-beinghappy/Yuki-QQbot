@@ -166,7 +166,12 @@ class SubagentRepository:
                 await session.scalars(
                     select(children.c.work_id)
                     .join(work, work.c.id == children.c.work_id)
+                    .join(
+                        CanonicalConversationModel,
+                        CanonicalConversationModel.id == work.c.conversation_id,
+                    )
                     .where(
+                        work.c.generation == CanonicalConversationModel.generation,
                         work.c.state.in_(
                             ("completed", "failed", "cancelled", "suspended", "waiting_user")
                         ),

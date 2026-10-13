@@ -142,7 +142,6 @@ _PROMPT_SCENARIOS = (
     "direct-text",
     "group-mention",
     "autonomous-group",
-    "admin",
     "web",
     "vision",
     "emoji",
@@ -255,8 +254,6 @@ def _prompt_diagnostic(settings: Settings, scenario: str) -> dict[str, object]:
         "time": {"timezone": "Asia/Shanghai", "local": "2000-01-01T12:00:00+08:00"},
         "scene": {"kind": "group" if "group" in scenario else "private"},
     }
-    if scenario == "admin":
-        dynamic_payloads["authority"] = {"role": "superuser", "source": "real_event"}
     if scenario == "vision":
         dynamic_payloads["vision"] = {"observations": ["synthetic visual observation"]}
     if scenario == "plugin":
@@ -330,7 +327,6 @@ def _scenario_tools(scenario: str) -> tuple[tuple[ChatTool, ...], dict[str, str]
         "direct-text": ("search_memory",),
         "group-mention": ("search_memory",),
         "autonomous-group": (),
-        "admin": ("admin_execute_action", "admin_set_config", "call_onebot_api"),
         "web": ("web_search", "read_webpage"),
         "vision": ("search_memory",),
         "emoji": (),
@@ -338,8 +334,6 @@ def _scenario_tools(scenario: str) -> tuple[tuple[ChatTool, ...], dict[str, str]
     }[scenario]
     group_by_name = {
         "search_memory": "memory",
-        "admin_execute_action": "admin",
-        "admin_set_config": "config",
         "call_onebot_api": "onebot",
         "web_search": "web",
         "read_webpage": "web",
@@ -376,7 +370,6 @@ def _prompt_comparison(settings: Settings) -> dict[str, object]:
         "direct-text": {"total_characters": 22413, "estimated_tokens": 5604},
         "group-mention": {"total_characters": 22422, "estimated_tokens": 5606},
         "autonomous-group": {"total_characters": 4509, "estimated_tokens": 1128},
-        "admin": {"total_characters": 27451, "estimated_tokens": 6863},
         "web": {"total_characters": 22413, "estimated_tokens": 5604},
         "vision": {"total_characters": 22886, "estimated_tokens": 5722},
         "emoji": {"total_characters": 22413, "estimated_tokens": 5604},

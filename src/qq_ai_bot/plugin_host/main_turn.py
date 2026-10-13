@@ -409,7 +409,6 @@ async def _execute_plugin_main_turn(
                 ),
                 gateway=cast(OneBotToolGateway | None, runtime.gateway),
                 allow_generic_onebot=False,
-                allow_admin_actions=False,
                 conversation_key=invocation.conversation_key,
                 execution_id=execution_id,
                 read_scope=scope,
