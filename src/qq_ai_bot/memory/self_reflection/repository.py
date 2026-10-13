@@ -469,50 +469,34 @@ class SelfReflectionRepository:
         self,
         *,
         scheduled_slot: str,
-        local_date: str,
         event_threshold: int,
         character_threshold: int,
         max_wait_seconds: float,
-        max_sessions: int,
-        max_daily_calls: int,
         max_events: int,
         max_characters: int,
         context_events: int = 4,
         force: bool = False,
-        excluded_conversation_keys: frozenset[str] = frozenset(),
         cycle_id: str | None = None,
         bot_display_name: str = "Yuki",
         timezone: str = "Asia/Shanghai",
     ) -> tuple[SelfReflectionBatch, ...]:
-        if max_sessions > 0 and max_daily_calls > 0:
-            from qq_ai_bot.memory.self_reflection.initiative import claim_initiative
+        from qq_ai_bot.memory.self_reflection.initiative import claim_initiative
 
-            initiatives = await claim_initiative(
-                self._database,
-                max_characters=max_characters,
-                excluded_conversation_keys=excluded_conversation_keys,
-                cycle_id=cycle_id,
-            )
-            if initiatives:
-                return initiatives
+        initiatives = await claim_initiative(
+            self._database,
+            max_characters=max_characters,
+            cycle_id=cycle_id,
+        )
+        if initiatives:
+            return initiatives
         now = datetime.now(UTC)
         async with self._database.sessions() as session, session.begin():
             session.autoflush = False
-            used = 0
-            available = min(1, max_sessions, max(0, max_daily_calls - used))
-            if available <= 0:
-                return ()
             waited_before = now - timedelta(seconds=max_wait_seconds)
             state_query = select(MemorySelfReflectionStateModel).where(
                 MemorySelfReflectionStateModel.pending_events > 0,
                 self._xor_owner_state_clause(),
             )
-            if excluded_conversation_keys:
-                state_query = state_query.where(
-                    MemorySelfReflectionStateModel.conversation_key_hash.not_in(
-                        excluded_conversation_keys
-                    )
-                )
             if not force:
                 state_query = state_query.where(
                     or_(
@@ -807,7 +791,7 @@ class SelfReflectionRepository:
                         max_input_characters=max_characters,
                     )
                 )
-                if len(claimed) >= available:
+                if len(claimed) >= 1:
                     break
             return tuple(claimed)
 

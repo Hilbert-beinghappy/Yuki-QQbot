@@ -137,12 +137,9 @@ async def finish(database, run_id):
 async def claim(database, cycle="cycle-1", *, max_characters=16000):
     return await SelfReflectionRepository(database).claim_due(
         scheduled_slot="synthetic",
-        local_date="2026-09-22",
         event_threshold=20,
         character_threshold=16000,
         max_wait_seconds=3600,
-        max_sessions=1,
-        max_daily_calls=96,
         max_events=100,
         max_characters=max_characters,
         cycle_id=cycle,
@@ -284,12 +281,9 @@ async def test_concurrent_reflection_claims_keep_one_original_run(
     repository = SelfReflectionRepository(database)
     options = dict(
         scheduled_slot="race",
-        local_date="2026-10-12",
         event_threshold=1,
         character_threshold=1,
         max_wait_seconds=0,
-        max_sessions=1,
-        max_daily_calls=96,
         max_events=100,
         max_characters=16000,
         force=True,
@@ -457,12 +451,9 @@ async def test_reflection_transition_keeps_original_source_after_unrelated_wal_c
     await repository.scan_new_events()
     options = dict(
         scheduled_slot="wal-transition",
-        local_date="2026-10-12",
         event_threshold=1,
         character_threshold=1,
         max_wait_seconds=0,
-        max_sessions=1,
-        max_daily_calls=96,
         max_events=1,
         max_characters=16000,
         cycle_id="original-cycle",
@@ -605,12 +596,9 @@ async def test_reflection_health_uses_original_oldest_recent_cycle_baseline(data
     await repository.scan_new_events()
     (batch,) = await repository.claim_due(
         scheduled_slot="baseline-health",
-        local_date="2026-10-12",
         event_threshold=1,
         character_threshold=1,
         max_wait_seconds=0,
-        max_sessions=1,
-        max_daily_calls=96,
         max_events=1,
         max_characters=16000,
     )
@@ -687,12 +675,9 @@ async def test_mixed_recovery_prepares_full_tail_before_cursor_write_and_sees_st
     monkeypatch.setattr(audio, "transcript_context", transcript_context)
     (ordinary,) = await repository.claim_due(
         scheduled_slot="mixed-ordinary",
-        local_date="2026-10-12",
         event_threshold=1,
         character_threshold=1,
         max_wait_seconds=0,
-        max_sessions=1,
-        max_daily_calls=96,
         max_events=1,
         max_characters=16000,
     )
@@ -1448,12 +1433,9 @@ async def test_incoming_reflection_keeps_complete_source_without_own_reply(datab
     assert snapshot["actionable"]["events"] == 1
     (batch,) = await repository.claim_due(
         scheduled_slot="incoming",
-        local_date="2026-10-10",
         event_threshold=1,
         character_threshold=100,
         max_wait_seconds=0,
-        max_sessions=1,
-        max_daily_calls=96,
         max_events=100,
         max_characters=100,
         cycle_id="incoming",
@@ -1509,12 +1491,9 @@ async def test_reflection_only_live_source_ranges_block_claim_and_cursor(databas
     await repository.scan_new_events()
     options = dict(
         scheduled_slot="source-range",
-        local_date="2026-10-10",
         event_threshold=1,
         character_threshold=100,
         max_wait_seconds=0,
-        max_sessions=1,
-        max_daily_calls=96,
         max_events=100,
         max_characters=16000,
     )
