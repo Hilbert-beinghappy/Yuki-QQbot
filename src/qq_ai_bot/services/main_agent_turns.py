@@ -6,9 +6,7 @@ import asyncio
 import hashlib
 import json
 from collections.abc import Awaitable, Callable
-from copy import deepcopy
-from dataclasses import fields, is_dataclass, replace
-from enum import Enum
+from dataclasses import replace
 
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -41,37 +39,6 @@ from qq_ai_bot.services.turn_transcript import (
     DispatchOrigin,
     dispatch_request,
 )
-
-
-def _same_request_input(left: object, right: object) -> bool:
-    """Conservative type-sensitive equality for one preparation's estimate.
-
-    Python considers True, 1 and 1.0 equal; their serialized token costs differ.
-    Unknown opaque objects are re-estimated instead of trusting their __eq__.
-    """
-    if type(left) is not type(right):
-        return False
-    if is_dataclass(left) and not isinstance(left, type):
-        return all(
-            _same_request_input(getattr(left, item.name), getattr(right, item.name))
-            for item in fields(left)
-        )
-    if isinstance(left, dict) and isinstance(right, dict):
-        return len(left) == len(right) and all(
-            _same_request_input(a, b) and _same_request_input(left[a], right[b])
-            for a, b in zip(left, right, strict=True)
-        )
-    if isinstance(left, (list, tuple)) and isinstance(right, (list, tuple)):
-        return len(left) == len(right) and all(
-            _same_request_input(a, b) for a, b in zip(left, right, strict=True)
-        )
-    if type(left) is float:
-        return repr(left) == repr(right)  # JSON distinguishes 0.0 and -0.0.
-    if left is None or type(left) in {str, int, bool, bytes}:
-        return left == right
-    if isinstance(left, Enum) and isinstance(right, Enum):
-        return _same_request_input(left.value, right.value)
-    return False
 
 
 class MainAgentTurnService:
@@ -195,9 +162,6 @@ class MainAgentTurnService:
                     native_tools=native_definitions,
                 )
             )
-            fresh_tokens = estimate_request_tokens(prepared_request)
-            fresh_request = deepcopy(prepared_request)
-            collect_phase_metrics(estimate_count=1)
             # The maintenance target may choose an already prepared summary;
             # it cannot require a foreground model while the original fits.
             fixed_request = replace(
@@ -206,30 +170,13 @@ class MainAgentTurnService:
                     replace(context, history_messages=(), rollup_text="")
                 ).messages,
             )
-            fixed_tokens = (
-                fresh_tokens
-                if _same_request_input(fixed_request, fresh_request)
-                else estimate_request_tokens(fixed_request)
-            )
-            collect_phase_metrics(
-                estimate_count=int(not _same_request_input(fixed_request, fresh_request))
-            )
+            fixed_tokens = estimate_request_tokens(fixed_request)
+            collect_phase_metrics(estimate_count=1)
             maintenance_budget = max(planning_budget, fixed_tokens)
-            estimated_request: ChatRequest | None = None
-            estimated_tokens = 0
 
             def request_tokens(request: ChatRequest) -> int:
-                nonlocal estimated_request, estimated_tokens
-                if _same_request_input(request, fresh_request):
-                    return fresh_tokens
-                # One preparation-local complete request, including media,
-                # native declarations, opaque state and settings. Keep a copy
-                # so mutation of a schema/payload cannot reuse a stale estimate.
-                if not _same_request_input(estimated_request, request):
-                    estimated_tokens = estimate_request_tokens(request)
-                    collect_phase_metrics(estimate_count=1)
-                    estimated_request = deepcopy(request)
-                return estimated_tokens
+                collect_phase_metrics(estimate_count=1)
+                return estimate_request_tokens(request)
 
             def history_fits(history: tuple[ChatMessage, ...]) -> bool:
                 return context_hard_fits(replace(context, history_messages=history))
