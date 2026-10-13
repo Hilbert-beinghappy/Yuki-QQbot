@@ -8,7 +8,7 @@ import logging
 import time
 from contextlib import AbstractContextManager, nullcontext
 from dataclasses import replace
-from typing import TYPE_CHECKING, Any, cast
+from typing import TYPE_CHECKING, Any
 
 from qq_ai_bot.capabilities import (
     AuthorityContext,
@@ -39,7 +39,7 @@ from qq_ai_bot.services.agent_tools import ToolRuntime
 from qq_ai_bot.services.turn_coordinator import TurnSupersededError
 
 if TYPE_CHECKING:
-    from qq_ai_bot.services.chat import AdminToolService, ChatService
+    from qq_ai_bot.services.chat import ChatService
 
 logger = logging.getLogger(__name__)
 
@@ -698,12 +698,6 @@ class MainAgentBackend(AgentToolBackend):
             self._catalog.by_model_name(call.function.name) if self._catalog is not None else None
         )
         descriptor = entry.descriptor if entry is not None else None
-        admin_tools = getattr(self._service, "_admin_tools", None)
-        if descriptor is not None and descriptor.provider_id == "admin" and admin_tools is not None:
-            return cast("AdminToolService", admin_tools).is_mutating_call(
-                call.function.name,
-                call.function.arguments,
-            )
         return bool(
             descriptor is not None
             and self._effective_descriptor(call, descriptor).risk is not CapabilityRisk.READ
