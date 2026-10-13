@@ -243,6 +243,8 @@ pause 与压缩尚未完成时不提前换链；媒体、来源与 CAS 在原派
 
 通用 OneBot 操作不另写无人读取的诊断表 `agent_actions`；0117 删除该旧表。授权、Work effect 与实际发送回执继续由各自执行链保存。
 
+WorkspaceStore 的快照沿現行永久保留合同，不再暴露無生產者的 TTL 選項；既有 expires_at 列保留舊資料讀取與首次啟動轉換。物理儲存仍受原 512 MiB 總量、200 MiB 單檔與 1000 個物件容量限制。
+
 ## 合并转发历史读取
 
 固定 `read_conversation_history` schema_version="2"，仍 result_cacheable=false。参数有 event_id
