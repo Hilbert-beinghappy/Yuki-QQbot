@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from qq_ai_bot.conversation.canonical_db_models import CanonicalConversationModel
@@ -35,49 +34,6 @@ async def refuse_legacy_live_event(session: AsyncSession, event: ChatEventModel)
     return False
 
 
-async def refuse_legacy_live_fact(session: AsyncSession, fact_id: int) -> bool:
-    """True when a fact cites a legacy-NULL event or has no v2 owner chain."""
-
-    fact = await session.get(MemoryFactModel, fact_id)
-    if fact is None:
-        return True
-    event_ids = list(
-        await session.scalars(
-            select(ChatEventModel.canonical_event_id).where(
-                ChatEventModel.id.in_(
-                    select(MemoryEvidenceModel.event_id).where(
-                        MemoryEvidenceModel.fact_id == fact_id,
-                        MemoryEvidenceModel.event_id.is_not(None),
-                    )
-                )
-            )
-        )
-    )
-    if any(item is None for item in event_ids):
-        return True
-    tool_ids = list(
-        await session.scalars(
-            select(ChatEventModel.canonical_event_id)
-            .select_from(MemoryToolReceiptModel)
-            .join(
-                ChatEventModel,
-                ChatEventModel.id == MemoryToolReceiptModel.trigger_event_id,
-            )
-            .where(
-                MemoryToolReceiptModel.id.in_(
-                    select(MemoryEvidenceModel.tool_receipt_id).where(
-                        MemoryEvidenceModel.fact_id == fact_id,
-                        MemoryEvidenceModel.tool_receipt_id.is_not(None),
-                    )
-                )
-            )
-        )
-    )
-    if any(item is None for item in tool_ids):
-        return True
-    return not canonical_fact_owner_complete(fact)
-
-
 def _fact_aligns_conversation(
     fact: MemoryFactModel, conversation: CanonicalConversationModel
 ) -> bool:
@@ -93,7 +49,7 @@ def _fact_aligns_conversation(
     )
 
 
-async def refuse_unreadable_v2_evidence_event(session: AsyncSession, event: ChatEventModel) -> bool:
+def refuse_unreadable_v2_evidence_event(event: ChatEventModel) -> bool:
     """True when v2 must not treat this event as readable evidence/history.
 
     Enqueue/worker watermarks (starts_after_event_id / generation) are not a
@@ -115,7 +71,7 @@ async def v2_evidence_event_chain_readable(
 ) -> bool:
     if not canonical_fact_owner_complete(fact):
         return False
-    if await refuse_unreadable_v2_evidence_event(session, event):
+    if refuse_unreadable_v2_evidence_event(event):
         return False
     if not event.canonical_conversation_id:
         return False

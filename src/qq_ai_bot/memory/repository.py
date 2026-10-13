@@ -10,7 +10,7 @@ from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from typing import Any, TypeVar, cast
 
-from sqlalchemy import and_, case, delete, event, func, literal, or_, select, text, true, update
+from sqlalchemy import and_, case, event, func, literal, or_, select, text, true, update
 from sqlalchemy.dialects.sqlite import insert
 from sqlalchemy.engine import CursorResult
 from sqlalchemy.exc import OperationalError
@@ -828,40 +828,6 @@ class MemoryFactRepository:
             )
             return await project_memory_fact_rows(session, rows)
 
-    async def list_explicit_preferences(
-        self,
-        target: MemoryEntityTarget,
-        *,
-        limit: int,
-        temporal: MemoryTemporalIntent | None = None,
-    ) -> tuple[MemoryFact, ...]:
-        if limit <= 0:
-            return ()
-        async with self._database.sessions() as session:
-            rows = await self._execute_facts_with_count(
-                session,
-                [
-                    *strict_time_conditions(temporal),
-                    *(await self._async_target_conditions(session, target)),
-                    MemoryFactModel.kind == "preference",
-                    MemoryFactModel.source_type == "explicit",
-                    MemoryFactModel.status == MemoryStatus.ACTIVE.value,
-                    MemoryFactModel.review_state != "quarantined",
-                    or_(
-                        MemoryFactModel.valid_until.is_(None),
-                        MemoryFactModel.valid_until > datetime.now(UTC),
-                    ),
-                ],
-                order_by=(
-                    MemoryFactModel.importance.desc(),
-                    MemoryFactModel.confidence.desc(),
-                    MemoryFactModel.updated_at.desc(),
-                    MemoryFactModel.id.asc(),
-                ),
-                limit=limit,
-            )
-            return await project_memory_fact_rows(session, rows)
-
     async def mark_injected(self, fact_ids: tuple[int, ...]) -> int:
         unique_ids = tuple(dict.fromkeys(fact_ids))
         if not unique_ids:
@@ -1089,24 +1055,6 @@ class MemoryFactRepository:
         if relation_id is not None and "memory_added_relation_ids" in session.info:
             session.info["memory_added_relation_ids"].append(relation_id)
         return relation_id is not None
-
-    async def refresh_fact(
-        self,
-        fact_id: int,
-        *,
-        importance: int,
-        confidence: float,
-        session: AsyncSession,
-    ) -> None:
-        await session.execute(
-            update(MemoryFactModel)
-            .where(MemoryFactModel.id == fact_id)
-            .values(
-                importance=func.max(MemoryFactModel.importance, importance),
-                confidence=func.max(MemoryFactModel.confidence, confidence),
-                updated_at=datetime.now(UTC),
-            )
-        )
 
     async def prepare_evidence_copy(
         self,
@@ -1577,26 +1525,6 @@ class MemoryFactRepository:
             or 0
         )
 
-    async def delete_orphaned_automatic_facts(
-        self,
-        *,
-        event_ids: tuple[int, ...],
-        exact_text: str,
-        session: AsyncSession,
-    ) -> None:
-        evidence_fact_ids = select(MemoryEvidenceModel.fact_id).where(
-            MemoryEvidenceModel.event_id.in_(event_ids)
-        )
-        await session.execute(
-            delete(MemoryFactModel).where(
-                MemoryFactModel.source_type != "explicit",
-                or_(
-                    MemoryFactModel.content.contains(exact_text),
-                    MemoryFactModel.id.in_(evidence_fact_ids),
-                ),
-            )
-        )
-
     @staticmethod
     def _unmatched_identity() -> tuple[Any, ...]:
         return (MemoryFactModel.id == -1,)
@@ -1815,18 +1743,6 @@ class MemoryJobRepository:
                     event_id,
                 )
             return created, stored_key
-
-    async def pending_count(self) -> int:
-        async with self._database.sessions() as session:
-            value = await session.scalar(
-                select(func.count())
-                .select_from(MemoryJobModel)
-                .where(
-                    MemoryJobModel.status == MemoryJobStatus.PENDING.value,
-                    MemoryJobModel.next_attempt_at <= datetime.now(UTC),
-                )
-            )
-        return int(value or 0)
 
     async def batch_health(
         self, *, trigger_count: int, max_characters: int, max_wait_seconds: float

@@ -58,7 +58,6 @@ from qq_ai_bot.conversation.rollup.prompt_accounting import (
     durable_uncovered_characters,
     prompt_accounting_characters,
     prompt_visible_event_count,
-    source_accounting_characters,
 )
 from qq_ai_bot.conversation.rollup.renderer import (
     serialize_compaction_source_events,
@@ -903,16 +902,15 @@ class ConversationRollupRepository:
         self, operation: Callable[[AsyncSession], Awaitable[RollupCommitResult]]
     ) -> RollupCommitResult:
         """Reprepare only a rolled-back DB plan, retaining the original paid output."""
-        for attempt in range(3):
+        while True:
             try:
                 async with self._database.sessions() as session, session.begin():
                     # Legacy sqlite3 SELECT does not begin a read transaction.
                     await session.execute(text("BEGIN"))
                     return await operation(session)
             except OperationalError as exc:
-                if getattr(exc.orig, "sqlite_errorcode", None) != 517 or attempt == 2:
+                if getattr(exc.orig, "sqlite_errorcode", None) != 517:
                     raise
-        raise AssertionError("unreachable rollup snapshot retry")
 
     async def retry_infrastructure(
         self,
@@ -1328,10 +1326,6 @@ class ConversationRollupRepository:
         batch = take_batch(all_events, self.config)
         if not batch:
             return None
-        characters = source_accounting_characters(
-            batch,
-            timezone=self.config.timezone,
-        )
         fingerprint = source_fingerprint(
             conversation_id=claim.conversation_id,
             generation=claim.generation,
@@ -1347,8 +1341,6 @@ class ConversationRollupRepository:
             source_rollup_revision=revision,
             previous_summary=previous,
             events=batch,
-            event_count=len(batch),
-            projection_characters=characters,
             fingerprint=fingerprint,
         )
 
@@ -1473,10 +1465,8 @@ class ConversationRollupRepository:
                 )
             ).all()
         )
-        events = await _with_proactive_cause_metadata(
-            session,
-            tuple(_event_record(row) for row in rows),
-        )
+        raw_events = tuple(_event_record(row) for row in rows)
+        events = await _with_proactive_cause_metadata(session, raw_events)
         fingerprint = source_fingerprint(
             conversation_id=candidate.conversation_id,
             generation=candidate.generation,
@@ -1494,7 +1484,7 @@ class ConversationRollupRepository:
         remaining_count = conversation.uncovered_event_count - len(events)
         remaining_characters = (
             conversation.uncovered_character_count
-            - durable_uncovered_characters(events, **_prompt_kwargs(self.config))
+            - durable_uncovered_characters(raw_events, **_prompt_kwargs(self.config))
         )
         if min(remaining_count, remaining_characters) < 0:
             raise ConversationCoverageError("rollup uncovered counters changed or drifted")
